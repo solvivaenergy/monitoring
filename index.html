@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Solviva Solar Dashboard</title>
+  <link rel="icon" type="image/png" href="assets/solvivafavicon.png">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --lime: #d2ff1e;
+      --dark-green: #1f522b;
+      --blue: #006ac6;
+      --black: #000000;
+      --white: #ffffff;
+      --bg: #0a0f0a;
+      --card-bg: #111a13;
+      --card-border: #1f522b44;
+      --text: #e0e8e0;
+      --text-dim: #8a9a8a;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      background: linear-gradient(135deg, var(--dark-green), #0d2e14);
+      padding: 1rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 2px solid var(--lime);
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+    }
+    .logo-icon {
+      width: 36px; height: 36px;
+      background: var(--lime);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 900; font-size: 18px; color: var(--dark-green);
+    }
+    .logo h1 { font-size: 1.3rem; font-weight: 700; color: var(--white); }
+    .logo h1 span { color: var(--lime); }
+    header .meta { color: var(--text-dim); font-size: .85rem; }
+
+    .container { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
+
+    /* API config banner */
+    .api-config {
+      background: #1a1a0a;
+      border: 1px solid #ffd60044;
+      border-radius: 8px;
+      padding: .75rem 1rem;
+      margin-bottom: 1rem;
+      display: none;
+      align-items: center;
+      gap: .75rem;
+      font-size: .85rem;
+      color: #ffd600;
+    }
+    .api-config input {
+      flex: 1;
+      padding: .4rem .6rem;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: .85rem;
+    }
+    .api-config button {
+      background: var(--lime);
+      color: var(--dark-green);
+      border: none;
+      padding: .4rem .8rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    /* Summary cards */
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .summary-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1.25rem;
+      text-align: center;
+      transition: border-color .2s;
+    }
+    .summary-card:hover { border-color: var(--lime); }
+    .summary-card .value {
+      font-size: 2rem;
+      font-weight: 800;
+      color: var(--lime);
+      line-height: 1.2;
+    }
+    .summary-card .label {
+      font-size: .85rem;
+      color: var(--text-dim);
+      margin-top: .25rem;
+    }
+
+    /* Station grid */
+    .station-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .station-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1rem;
+      cursor: pointer;
+      transition: all .2s;
+    }
+    .station-card:hover {
+      border-color: var(--lime);
+      transform: translateY(-2px);
+      box-shadow: 0 4px 20px rgba(210,255,30,.08);
+    }
+    .station-card .name {
+      font-weight: 700;
+      font-size: 1rem;
+      color: var(--white);
+      margin-bottom: .5rem;
+    }
+    .station-card .sn { color: var(--text-dim); font-size: .8rem; }
+    .station-card .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: .5rem;
+      margin-top: .75rem;
+    }
+    .station-card .stat-val {
+      font-size: 1.1rem; font-weight: 700; color: var(--lime);
+    }
+    .station-card .stat-lbl {
+      font-size: .7rem; color: var(--text-dim); text-transform: uppercase;
+    }
+    .status-dot {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+    }
+    .status-online { background: #00e676; box-shadow: 0 0 6px #00e676; }
+    .status-offline { background: #ff5252; }
+    .status-alarm { background: #ffd600; }
+
+    /* Detail panel */
+    .detail-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      display: none;
+      margin-bottom: 1.5rem;
+    }
+    .detail-panel.visible { display: block; }
+    .detail-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 1rem;
+    }
+    .detail-header h2 { color: var(--white); font-size: 1.3rem; }
+    .detail-header .close-btn {
+      background: none; border: none; color: var(--text-dim);
+      font-size: 1.5rem; cursor: pointer;
+    }
+    .detail-header .close-btn:hover { color: var(--lime); }
+    .detail-info {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: .75rem;
+      margin-bottom: 1.5rem;
+    }
+    .detail-info .info-item .val {
+      font-size: 1.3rem; font-weight: 700; color: var(--lime);
+    }
+    .detail-info .info-item .lbl {
+      font-size: .75rem; color: var(--text-dim);
+    }
+    .chart-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    .chart-box {
+      background: #0a120b;
+      border-radius: 10px;
+      padding: 1rem;
+      height: 300px;
+      position: relative;
+    }
+    .chart-box h3 {
+      font-size: .85rem;
+      color: var(--text-dim);
+      margin-bottom: .75rem;
+    }
+
+    /* Loading */
+    .loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem;
+      color: var(--text-dim);
+    }
+    .spinner {
+      width: 28px; height: 28px;
+      border: 3px solid var(--card-border);
+      border-top-color: var(--lime);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+      margin-right: .75rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Search */
+    .search-bar { margin-bottom: 1rem; }
+    .search-bar input {
+      width: 100%;
+      max-width: 400px;
+      padding: .6rem 1rem;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: .9rem;
+      outline: none;
+      transition: border-color .2s;
+    }
+    .search-bar input:focus { border-color: var(--lime); }
+    .search-bar input::placeholder { color: var(--text-dim); }
+
+    /* Pagination */
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: .5rem;
+      margin-top: 1rem;
+    }
+    .pagination button {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      padding: .4rem .8rem;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all .2s;
+    }
+    .pagination button:hover { border-color: var(--lime); color: var(--lime); }
+    .pagination button:disabled { opacity: .4; cursor: default; }
+    .pagination .page-info { color: var(--text-dim); font-size: .85rem; }
+
+    /* Error */
+    .error-msg {
+      background: #2a1010;
+      border: 1px solid #ff5252;
+      border-radius: 8px;
+      padding: 1rem;
+      color: #ff8a80;
+      margin-bottom: 1rem;
+    }
+
+    @media (max-width: 768px) {
+      .chart-row { grid-template-columns: 1fr; }
+      .summary { grid-template-columns: repeat(2, 1fr); }
+      header { flex-direction: column; gap: .5rem; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">
+      <img src="assets/solvivalogo2.png" alt="Solviva" style="height:64px;">
+      <h1><span>Solar Dashboard</span></h1>
+    </div>
+    <div class="meta" id="headerMeta">Loading...</div>
+  </header>
+
+  <div class="container">
+    <div id="errorBox" class="error-msg" style="display:none"></div>
+
+    <!-- Summary -->
+    <div class="summary" id="summary">
+      <div class="summary-card">
+        <div class="value" id="totalStations">-</div>
+        <div class="label">Total Stations</div>
+      </div>
+      <div class="summary-card">
+        <div class="value" id="onlineStations">-</div>
+        <div class="label">Online</div>
+      </div>
+      <div class="summary-card">
+        <div class="value" id="totalCapacity">-</div>
+        <div class="label">Total Capacity (kWp)</div>
+      </div>
+      <div class="summary-card">
+        <div class="value" id="totalPower">-</div>
+        <div class="label">Current Power (kW)</div>
+      </div>
+      <div class="summary-card">
+        <div class="value" id="todayEnergy">-</div>
+        <div class="label">Today's Energy (kWh)</div>
+      </div>
+      <div class="summary-card">
+        <div class="value" id="allTimeEnergy">-</div>
+        <div class="label">All-Time Energy (MWh)</div>
+      </div>
+    </div>
+
+    <!-- Detail panel -->
+    <div class="detail-panel" id="detailPanel">
+      <div class="detail-header">
+        <div>
+          <h2 id="detailName">Station Detail</h2>
+          <div style="color:var(--text-dim);font-size:.85rem" id="detailLocation"></div>
+        </div>
+        <button class="close-btn" onclick="closeDetail()">&times;</button>
+      </div>
+      <div class="detail-info" id="detailInfo"></div>
+      <div class="chart-row">
+        <div class="chart-box">
+          <h3>Today's Power Curve</h3>
+          <canvas id="dayChart"></canvas>
+        </div>
+        <div class="chart-box">
+          <h3>Monthly Generation</h3>
+          <canvas id="monthChart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Station list -->
+    <div class="search-bar">
+      <input type="text" id="searchInput" placeholder="Search stations by name or S/N...">
+    </div>
+
+    <div id="stationLoading" class="loading">
+      <div class="spinner"></div> Loading stations...
+    </div>
+
+    <div class="station-grid" id="stationGrid"></div>
+
+    <div class="pagination" id="pagination" style="display:none">
+      <button id="prevBtn" onclick="changePage(-1)">&#8592; Prev</button>
+      <span class="page-info" id="pageInfo"></span>
+      <button id="nextBtn" onclick="changePage(1)">Next &#8594;</button>
+    </div>
+  </div>
+
+<script>
+/**
+ * Solviva Solar Monitoring Dashboard
+ *
+ * Set the API_BASE to point to your deployed backend.
+ * The backend proxies Solis Cloud API requests with HMAC authentication.
+ */
+const API_BASE = 'https://solviva-api.onrender.com';  // ← Update after deploying backend
+
+let allStations = [];
+let filteredStations = [];
+let currentPage = 1;
+const PAGE_SIZE = 20;
+let dayChartInstance = null;
+let monthChartInstance = null;
+
+// ── Fetch helpers ──
+async function apiFetch(path) {
+  const resp = await fetch(`${API_BASE}${path}`);
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+    throw new Error(err.detail || resp.statusText);
+  }
+  return resp.json();
+}
+
+function showError(msg) {
+  const box = document.getElementById('errorBox');
+  box.textContent = msg;
+  box.style.display = 'block';
+  setTimeout(() => box.style.display = 'none', 8000);
+}
+
+// ── Init ──
+async function init() {
+  try {
+    let page = 1;
+    let total = 0;
+    allStations = [];
+    do {
+      const data = await apiFetch(`/solis/stations?page_no=${page}&page_size=100`);
+      const records = data?.page?.records || [];
+      allStations.push(...records);
+      total = data?.page?.total || data?.stationStatusVo?.all || 0;
+      page++;
+    } while (allStations.length < total && page < 50);
+
+    const statusVo = { all: allStations.length, online: 0 };
+    let totalCap = 0, totalPow = 0, totalDay = 0, totalAll = 0;
+    allStations.forEach(s => {
+      if (s.state === 1) statusVo.online++;
+      totalCap += (s.capacity || 0);
+      totalPow += (s.power || 0);
+      totalDay += (s.dayEnergy || 0);
+      totalAll += (s.allEnergy || 0);
+    });
+
+    document.getElementById('totalStations').textContent = allStations.length;
+    document.getElementById('onlineStations').textContent = statusVo.online;
+    document.getElementById('totalCapacity').textContent = totalCap.toFixed(1);
+    document.getElementById('totalPower').textContent = totalPow.toFixed(1);
+    document.getElementById('todayEnergy').textContent = totalDay.toFixed(1);
+    document.getElementById('allTimeEnergy').textContent = (totalAll / 1000).toFixed(2);
+    document.getElementById('headerMeta').textContent =
+      `${allStations.length} stations | Last refresh: ${new Date().toLocaleTimeString()}`;
+
+    filteredStations = [...allStations];
+    currentPage = 1;
+    renderStations();
+  } catch (e) {
+    showError(`Failed to load stations: ${e.message}`);
+    document.getElementById('stationLoading').innerHTML =
+      '<span style="color:#ff5252">Failed to load. Check API connection.</span>';
+  }
+}
+
+// ── Render stations ──
+function renderStations() {
+  document.getElementById('stationLoading').style.display = 'none';
+  const grid = document.getElementById('stationGrid');
+  const start = (currentPage - 1) * PAGE_SIZE;
+  const pageItems = filteredStations.slice(start, start + PAGE_SIZE);
+  const totalPages = Math.ceil(filteredStations.length / PAGE_SIZE) || 1;
+
+  grid.innerHTML = pageItems.map(s => {
+    const statusClass = s.state === 1 ? 'online' : s.state === 3 ? 'alarm' : 'offline';
+    const statusLabel = s.state === 1 ? 'Online' : s.state === 3 ? 'Alarm' : 'Offline';
+    return `
+      <div class="station-card" onclick="openDetail('${s.id}')">
+        <div class="name">
+          <span class="status-dot status-${statusClass}"></span>
+          ${esc(s.stationName || s.sno || 'Unnamed')}
+        </div>
+        <div class="sn">S/N: ${esc(s.sno || '-')} &bull; ${statusLabel}</div>
+        <div class="stats">
+          <div>
+            <div class="stat-val">${(s.capacity || 0).toFixed(1)}</div>
+            <div class="stat-lbl">Capacity kWp</div>
+          </div>
+          <div>
+            <div class="stat-val">${(s.power || 0).toFixed(2)}</div>
+            <div class="stat-lbl">Power kW</div>
+          </div>
+          <div>
+            <div class="stat-val">${(s.dayEnergy || 0).toFixed(1)}</div>
+            <div class="stat-lbl">Today kWh</div>
+          </div>
+          <div>
+            <div class="stat-val">${(s.allEnergy || 0).toFixed(1)}</div>
+            <div class="stat-lbl">All-Time kWh</div>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  const pag = document.getElementById('pagination');
+  if (filteredStations.length > PAGE_SIZE) {
+    pag.style.display = 'flex';
+    document.getElementById('pageInfo').textContent = `Page ${currentPage} of ${totalPages}`;
+    document.getElementById('prevBtn').disabled = currentPage <= 1;
+    document.getElementById('nextBtn').disabled = currentPage >= totalPages;
+  } else {
+    pag.style.display = 'none';
+  }
+}
+
+function changePage(delta) {
+  currentPage += delta;
+  renderStations();
+  window.scrollTo({ top: 300, behavior: 'smooth' });
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── Search ──
+document.getElementById('searchInput').addEventListener('input', (e) => {
+  const q = e.target.value.toLowerCase().trim();
+  filteredStations = q
+    ? allStations.filter(s =>
+        (s.stationName || '').toLowerCase().includes(q) ||
+        (s.sno || '').toLowerCase().includes(q))
+    : [...allStations];
+  currentPage = 1;
+  renderStations();
+});
+
+// ── Station detail ──
+async function openDetail(stationId) {
+  const panel = document.getElementById('detailPanel');
+  panel.classList.add('visible');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  document.getElementById('detailName').textContent = 'Loading...';
+  document.getElementById('detailLocation').textContent = '';
+  document.getElementById('detailInfo').innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+
+  try {
+    const d = await apiFetch(`/solis/stations/${stationId}`);
+
+    document.getElementById('detailName').textContent = d.stationName || d.sno || 'Station';
+    document.getElementById('detailLocation').textContent =
+      [d.cityStr, d.regionStr, d.countryStr].filter(Boolean).join(', ');
+
+    document.getElementById('detailInfo').innerHTML = `
+      <div class="info-item"><div class="val">${(d.capacity || 0).toFixed(1)} kWp</div><div class="lbl">Capacity</div></div>
+      <div class="info-item"><div class="val">${(d.power || 0).toFixed(2)} kW</div><div class="lbl">Current Power</div></div>
+      <div class="info-item"><div class="val">${(d.dayEnergy || 0).toFixed(1)} kWh</div><div class="lbl">Today</div></div>
+      <div class="info-item"><div class="val">${(d.monthEnergy || 0).toFixed(1)} kWh</div><div class="lbl">This Month</div></div>
+      <div class="info-item"><div class="val">${(d.yearEnergy || 0).toFixed(1)} kWh</div><div class="lbl">This Year</div></div>
+      <div class="info-item"><div class="val">${(d.allEnergy || 0).toFixed(1)} kWh</div><div class="lbl">All Time</div></div>
+      <div class="info-item"><div class="val">${d.allInComeUnit || 'PHP'} ${(d.allInCome || 0).toFixed(0)}</div><div class="lbl">Total Income</div></div>
+      <div class="info-item"><div class="val">${d.condTxtD || '-'}</div><div class="lbl">Weather</div></div>
+    `;
+
+    const today = new Date().toISOString().slice(0, 10);
+    const month = today.slice(0, 7);
+    const [dayData, monthData] = await Promise.all([
+      apiFetch(`/solis/stations/${stationId}/day?date=${today}`).catch(() => null),
+      apiFetch(`/solis/stations/${stationId}/month?month=${month}`).catch(() => null),
+    ]);
+
+    renderDayChart(dayData);
+    renderMonthChart(monthData);
+  } catch (e) {
+    document.getElementById('detailInfo').innerHTML =
+      `<div style="color:#ff5252">Error loading detail: ${esc(e.message)}</div>`;
+  }
+}
+
+function closeDetail() {
+  document.getElementById('detailPanel').classList.remove('visible');
+}
+
+// ── Charts ──
+const chartColors = {
+  lime: '#d2ff1e',
+  limeAlpha: 'rgba(210,255,30,0.15)',
+  green: '#1f522b',
+  blue: '#006ac6',
+  blueAlpha: 'rgba(0,106,198,0.15)',
+  grid: '#1f522b44',
+  text: '#8a9a8a',
+};
+
+function renderDayChart(data) {
+  const ctx = document.getElementById('dayChart').getContext('2d');
+  if (dayChartInstance) dayChartInstance.destroy();
+
+  let labels = [];
+  let values = [];
+
+  if (data) {
+    const items = Array.isArray(data) ? data : (data.records || []);
+    const rawLabels = [];
+    const rawValues = [];
+    items.forEach(p => {
+      const ts = p.timeStr || '';
+      const parts = ts.split(':');
+      if (parts.length >= 2) {
+        let h = parseInt(parts[0], 10);
+        const m = parts[1];
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        h = h % 12 || 12;
+        rawLabels.push(h + ':' + m + ' ' + ampm);
+      } else {
+        rawLabels.push(ts);
+      }
+      const pw = p.pow || p.power || p.pac || 0;
+      rawValues.push(+(pw / 1000).toFixed(3));
+    });
+    let first = rawValues.findIndex(v => v > 0);
+    let last = rawValues.length - 1 - [...rawValues].reverse().findIndex(v => v > 0);
+    if (first > 0 && last >= first) {
+      first = Math.max(0, first - 1);
+      last = Math.min(rawValues.length - 1, last + 1);
+      labels = rawLabels.slice(first, last + 1);
+      values = rawValues.slice(first, last + 1);
+    } else {
+      labels = rawLabels;
+      values = rawValues;
+    }
+  }
+
+  if (!labels.length) { labels = ['No data']; values = [0]; }
+
+  dayChartInstance = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Power (kW)',
+        data: values,
+        borderColor: chartColors.lime,
+        backgroundColor: chartColors.limeAlpha,
+        borderWidth: 2,
+        fill: true,
+        tension: .3,
+        pointRadius: 0,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: chartColors.text, maxTicksLimit: 12 }, grid: { color: chartColors.grid } },
+        y: { ticks: { color: chartColors.text }, grid: { color: chartColors.grid }, beginAtZero: true },
+      }
+    }
+  });
+}
+
+function renderMonthChart(data) {
+  const ctx = document.getElementById('monthChart').getContext('2d');
+  if (monthChartInstance) monthChartInstance.destroy();
+
+  let labels = [];
+  let values = [];
+
+  if (data) {
+    const items = Array.isArray(data) ? data : (data.records || []);
+    items.forEach(p => {
+      const dateLabel = p.dateStr || '';
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const dp = dateLabel.split('-');
+      if (dp.length === 3) {
+        const mon = months[parseInt(dp[1], 10) - 1] || dp[1];
+        const day = parseInt(dp[2], 10);
+        labels.push(mon + ' ' + day);
+      } else {
+        labels.push(dateLabel);
+      }
+      values.push(p.energy || p.eg || 0);
+    });
+  }
+
+  if (!labels.length) { labels = ['No data']; values = [0]; }
+
+  monthChartInstance = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Energy (kWh)',
+        data: values,
+        backgroundColor: chartColors.blue,
+        borderColor: chartColors.blue,
+        borderWidth: 1,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: chartColors.text, maxTicksLimit: 15 }, grid: { color: chartColors.grid } },
+        y: { ticks: { color: chartColors.text }, grid: { color: chartColors.grid }, beginAtZero: true },
+      }
+    }
+  });
+}
+
+// ── Auto refresh every 5 minutes ──
+init();
+setInterval(init, 300000);
+</script>
+</body>
+</html>

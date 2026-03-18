@@ -1,0 +1,12 @@
+# Render.com deployment — Web Service for the API backend
+services:
+  - type: web
+    name: solviva-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: SOLIS_CLOUD_KEY_ID
+        sync: false
+      - key: SOLIS_CLOUD_KEY_SECRET
+        sync: false
