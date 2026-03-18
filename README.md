@@ -48,7 +48,7 @@ git push -u origin main
    - **Start Command**: `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
 5. Add environment variables:
    - `SOLIS_CLOUD_KEY_ID` = `1300386381677211099`
-   - `SOLIS_CLOUD_KEY_SECRET` = *(your secret key)*
+   - `SOLIS_CLOUD_KEY_SECRET` = _(your secret key)_
 
 ### 4. Update the dashboard API URL
 
@@ -57,7 +57,7 @@ After deploying on Render, you'll get a URL like `https://solviva-api.onrender.c
 Edit `index.html` line where `API_BASE` is defined:
 
 ```js
-const API_BASE = 'https://solviva-api.onrender.com';
+const API_BASE = "https://solviva-api.onrender.com";
 ```
 
 ## Local Development
@@ -74,12 +74,12 @@ uvicorn api.main:app --port 8000
 
 ## Files
 
-| Path | Purpose |
-|------|---------|
-| `index.html` | Dashboard frontend (GitHub Pages) |
-| `assets/` | Logo, favicon |
-| `api/main.py` | FastAPI app with CORS for GitHub Pages |
-| `api/solis_client.py` | Solis Cloud API client (HMAC-SHA1 auth) |
-| `api/solis_routes.py` | `/solis/*` REST endpoints |
-| `render.yaml` | Render.com deployment config |
-| `.github/workflows/pages.yml` | GitHub Pages auto-deploy |
+| Path                          | Purpose                                 |
+| ----------------------------- | --------------------------------------- |
+| `index.html`                  | Dashboard frontend (GitHub Pages)       |
+| `assets/`                     | Logo, favicon                           |
+| `api/main.py`                 | FastAPI app with CORS for GitHub Pages  |
+| `api/solis_client.py`         | Solis Cloud API client (HMAC-SHA1 auth) |
+| `api/solis_routes.py`         | `/solis/*` REST endpoints               |
+| `render.yaml`                 | Render.com deployment config            |
+| `.github/workflows/pages.yml` | GitHub Pages auto-deploy                |
