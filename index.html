@@ -504,6 +504,16 @@ function esc(s) {
   return d.innerHTML;
 }
 
+function formatIncome(value, unit) {
+  const v = value || 0;
+  // unit from Solis may be "K PHP", "PHP", "K USD", etc.
+  const u = (unit || 'PHP').trim();
+  const match = u.match(/^(K|M)?\s*(.+)$/i);
+  const suffix = match && match[1] ? match[1].toUpperCase() : '';
+  const currency = match ? match[2] : u;
+  return `${currency} ${v.toLocaleString()}${suffix}`;
+}
+
 // ── Search ──
 document.getElementById('searchInput').addEventListener('input', (e) => {
   const q = e.target.value.toLowerCase().trim();
@@ -540,7 +550,7 @@ async function openDetail(stationId) {
       <div class="info-item"><div class="val">${(d.monthEnergy || 0).toFixed(1)} kWh</div><div class="lbl">This Month</div></div>
       <div class="info-item"><div class="val">${(d.yearEnergy || 0).toFixed(1)} kWh</div><div class="lbl">This Year</div></div>
       <div class="info-item"><div class="val">${(d.allEnergy || 0).toFixed(1)} kWh</div><div class="lbl">All Time</div></div>
-      <div class="info-item"><div class="val">${d.allInComeUnit || 'PHP'} ${(d.allInCome || 0).toFixed(0)}</div><div class="lbl">Total Income</div></div>
+      <div class="info-item"><div class="val">${formatIncome(d.allInCome, d.allInComeUnit)}</div><div class="lbl">Total Income</div></div>
       <div class="info-item"><div class="val">${d.condTxtD || '-'}</div><div class="lbl">Weather</div></div>
     `;
 
