@@ -1,5 +1,6 @@
-# Render.com deployment — Web Service for the API backend
+# Render.com deployment — Web Service + Background Worker
 services:
+  # Web API (dashboard, webhooks)
   - type: web
     name: solviva-api
     runtime: docker
@@ -9,4 +10,20 @@ services:
       - key: SOLIS_CLOUD_KEY_ID
         sync: false
       - key: SOLIS_CLOUD_KEY_SECRET
+        sync: false
+
+  # Background sync worker: Solis → Supabase (every 15 min)
+  - type: worker
+    name: solviva-sync
+    runtime: docker
+    plan: starter  # $7/mo — always-on, no spin-down
+    dockerfilePath: ./Dockerfile.worker
+    envVars:
+      - key: SOLIS_CLOUD_KEY_ID
+        sync: false
+      - key: SOLIS_CLOUD_KEY_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
         sync: false

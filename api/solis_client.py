@@ -13,15 +13,19 @@ Authentication flow:
   3. Authorization header: API {KeyId}:{Signature}
 """
 
+import asyncio
 import hashlib
 import hmac
 import base64
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+log = logging.getLogger("solis_client")
 
 SOLIS_BASE_URL = "https://www.soliscloud.com:13333"
 
@@ -69,27 +73,67 @@ class SolisCloudClient:
             "Authorization": f"API {self.key_id}:{signature}",
         }
 
+    # Rate-limit: max 10 requests per second, with retry + exponential backoff
+    _RATE_LIMIT_DELAY = 0.1   # 100ms between requests (~10 req/s)
+    _MAX_RETRIES = 3
+    _BACKOFF_BASE = 2.0       # seconds
+
     async def _request(self, path: str, body: Optional[Dict] = None) -> Any:
-        """Make a signed POST request to the Solis Cloud API."""
+        """Make a signed POST request to the Solis Cloud API with retry logic."""
         body = body or {}
         body_bytes = json.dumps(body).encode("utf-8")
-        headers = self._sign(body_bytes, path)
         url = f"{self.base_url}{path}"
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(url, content=body_bytes, headers=headers)
-            resp.raise_for_status()
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            # Re-sign each attempt (Date header must be fresh)
+            headers = self._sign(body_bytes, path)
 
-        data = resp.json()
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(url, content=body_bytes, headers=headers)
 
-        # Solis API returns {"success": true, "code": "0", "data": {...}}
-        if not data.get("success") and data.get("code") != "0":
-            raise SolisCloudError(
-                code=data.get("code", "unknown"),
-                message=data.get("msg", "Unknown error"),
-                data=data,
-            )
-        return data.get("data")
+                # Rate-limited (429) or server error (5xx) → retry
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    wait = self._BACKOFF_BASE ** attempt
+                    log.warning(
+                        "Solis %s returned %d, retrying in %.1fs (attempt %d/%d)",
+                        path, resp.status_code, wait, attempt, self._MAX_RETRIES,
+                    )
+                    last_exc = httpx.HTTPStatusError(
+                        f"{resp.status_code}", request=resp.request, response=resp,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+                resp.raise_for_status()
+
+            except httpx.TimeoutException as e:
+                wait = self._BACKOFF_BASE ** attempt
+                log.warning(
+                    "Solis %s timed out, retrying in %.1fs (attempt %d/%d)",
+                    path, wait, attempt, self._MAX_RETRIES,
+                )
+                last_exc = e
+                await asyncio.sleep(wait)
+                continue
+
+            data = resp.json()
+
+            # Solis API returns {"success": true, "code": "0", "data": {...}}
+            if not data.get("success") and data.get("code") != "0":
+                raise SolisCloudError(
+                    code=data.get("code", "unknown"),
+                    message=data.get("msg", "Unknown error"),
+                    data=data,
+                )
+
+            # Throttle between successful calls
+            await asyncio.sleep(self._RATE_LIMIT_DELAY)
+            return data.get("data")
+
+        # All retries exhausted
+        raise last_exc or RuntimeError(f"Solis request to {path} failed after {self._MAX_RETRIES} retries")
 
     # ------------------------------------------------------------------
     # Station endpoints
