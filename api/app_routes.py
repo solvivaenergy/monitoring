@@ -9,12 +9,14 @@ Real-time data (current wattage, today's running production) comes from here.
 """
 
 import os
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 
 from fastapi import APIRouter, HTTPException, Header
 from supabase import create_client
 
 from .solis_client import SolisCloudClient, SolisCloudError
+
+PHT = timezone(timedelta(hours=8))
 
 router = APIRouter(prefix="/app", tags=["Mobile App"])
 
@@ -108,6 +110,7 @@ async def get_live_data(authorization: str = Header(...)):
     consumption_kwh = 0.0
     grid_import_kwh = 0.0
     grid_export_kwh = 0.0
+    today_hourly = []
     if day_data and isinstance(day_data, list):
         production_kwh = round(
             sum(float(p.get("power") or 0) for p in day_data) * (5 / 60) / 1000, 4
@@ -121,6 +124,50 @@ async def get_live_data(authorization: str = Header(...)):
         grid_import_kwh = round(
             sum(abs(min(float(p.get("psum") or 0), 0)) for p in day_data) * (5 / 60) / 1000, 4
         )
+
+        # Build 2-hour buckets for the Today chart (5 AM to current hour)
+        now_pht = datetime.now(PHT)
+        current_hour = now_pht.hour
+        buckets: dict[int, dict] = {}
+
+        for p in day_data:
+            # Determine PHT hour from dataTimestamp or timeStr
+            ts_ms = p.get("dataTimestamp")
+            time_str = p.get("timeStr")
+            hour = None
+            if ts_ms:
+                dt = datetime.fromtimestamp(int(ts_ms) / 1000, tz=PHT)
+                hour = dt.hour
+            elif time_str:
+                try:
+                    dt = datetime.fromisoformat(str(time_str))
+                    hour = dt.astimezone(PHT).hour
+                except Exception:
+                    pass
+
+            if hour is None:
+                continue
+
+            # 2-hour bucket starting at 5 AM
+            if hour < 5 or hour > current_hour:
+                continue
+            slot = 5 + ((hour - 5) // 2) * 2
+
+            if slot not in buckets:
+                buckets[slot] = {"prod": 0.0, "cons": 0.0, "count": 0}
+            buckets[slot]["prod"] += float(p.get("power") or 0) * (5 / 60) / 1000
+            buckets[slot]["cons"] += float(p.get("consumeEnergy") or 0) * (5 / 60) / 1000
+            buckets[slot]["count"] += 1
+
+        today_hourly = [
+            {
+                "hour": slot,
+                "production_kwh": round(v["prod"], 4),
+                "consumption_kwh": round(v["cons"], 4),
+            }
+            for slot, v in sorted(buckets.items())
+            if v["count"] > 0
+        ]
 
     return {
         # Real-time power (watts)
@@ -139,4 +186,6 @@ async def get_live_data(authorization: str = Header(...)):
         # All-time totals from Solis (no need to compute from our DB)
         "alltime_production_kwh": float(detail.get("allEnergy") or 0),
         "month_production_kwh": float(detail.get("monthEnergy") or 0),
+        # 2-hour buckets for Today chart (from 5-min Solis intervals)
+        "today_hourly": today_hourly,
     }
