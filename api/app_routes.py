@@ -111,6 +111,7 @@ async def get_live_data(authorization: str = Header(...)):
     grid_import_kwh = 0.0
     grid_export_kwh = 0.0
     today_hourly = []
+    today_readings = []
     if day_data and isinstance(day_data, list):
         production_kwh = round(
             sum(float(p.get("power") or 0) for p in day_data) * (5 / 60) / 1000, 4
@@ -126,6 +127,7 @@ async def get_live_data(authorization: str = Header(...)):
         )
 
         # Build 2-hour buckets for the Today chart (5 AM to current hour)
+        # Labels use end-time: bucket 5-7 AM → labeled "7", bucket 7-9 AM → "9", etc.
         now_pht = datetime.now(PHT)
         current_hour = now_pht.hour
         buckets: dict[int, dict] = {}
@@ -134,19 +136,35 @@ async def get_live_data(authorization: str = Header(...)):
             # Determine PHT hour from dataTimestamp or timeStr
             ts_ms = p.get("dataTimestamp")
             time_str = p.get("timeStr")
+            ts_pht = None
             hour = None
             if ts_ms:
-                dt = datetime.fromtimestamp(int(ts_ms) / 1000, tz=PHT)
-                hour = dt.hour
+                ts_pht = datetime.fromtimestamp(int(ts_ms) / 1000, tz=PHT)
+                hour = ts_pht.hour
             elif time_str:
                 try:
                     dt = datetime.fromisoformat(str(time_str))
-                    hour = dt.astimezone(PHT).hour
+                    ts_pht = dt.astimezone(PHT)
+                    hour = ts_pht.hour
                 except Exception:
                     pass
 
             if hour is None:
                 continue
+
+            # Build 5-min readings list for Today's Readings section
+            power_kw = round(float(p.get("power") or 0) / 1000, 3)
+            consume_kw = round(float(p.get("consumeEnergy") or 0) / 1000, 3)
+            soc_val = p.get("batteryCapacitySoc")
+            reading_battery = round(float(soc_val), 1) if soc_val is not None else None
+
+            if ts_pht and (power_kw > 0 or consume_kw > 0):
+                today_readings.append({
+                    "timestamp": ts_pht.isoformat(),
+                    "production_kw": power_kw,
+                    "consumption_kw": consume_kw,
+                    "battery_level": reading_battery,
+                })
 
             # 2-hour bucket starting at 5 AM
             if hour < 5 or hour > current_hour:
@@ -161,7 +179,7 @@ async def get_live_data(authorization: str = Header(...)):
 
         today_hourly = [
             {
-                "hour": slot,
+                "hour": slot + 2,  # end-time label: 5→7, 7→9, 9→11, etc.
                 "production_kwh": round(v["prod"], 4),
                 "consumption_kwh": round(v["cons"], 4),
             }
@@ -188,4 +206,6 @@ async def get_live_data(authorization: str = Header(...)):
         "month_production_kwh": float(detail.get("monthEnergy") or 0),
         # 2-hour buckets for Today chart (from 5-min Solis intervals)
         "today_hourly": today_hourly,
+        # 5-min interval readings for Today's Readings list
+        "today_readings": today_readings,
     }
