@@ -103,7 +103,7 @@ async def get_live_data(authorization: str = Header(...)):
         raise HTTPException(status_code=502, detail=f"Solis API error: {e.message}")
 
     # Fetch today's 5-min data for battery state and intraday curve
-    today_str = date.today().isoformat()
+    today_str = datetime.now(PHT).strftime("%Y-%m-%d")
     try:
         day_data = await solis.station_day(station_id, today_str)
     except SolisCloudError:
@@ -148,21 +148,14 @@ async def get_live_data(authorization: str = Header(...)):
         buckets: dict[int, dict] = {}
 
         for p in day_data:
-            # Determine PHT hour from dataTimestamp or timeStr
-            ts_ms = p.get("dataTimestamp")
-            time_str = p.get("timeStr")
+            # Determine PHT hour from timestamp fields
+            # Solis uses 'time' (ms epoch) as primary, 'dataTimestamp' as alternate
+            ts_ms = p.get("time") or p.get("dataTimestamp")
             ts_pht = None
             hour = None
             if ts_ms:
                 ts_pht = datetime.fromtimestamp(int(ts_ms) / 1000, tz=PHT)
                 hour = ts_pht.hour
-            elif time_str:
-                try:
-                    dt = datetime.fromisoformat(str(time_str))
-                    ts_pht = dt.astimezone(PHT)
-                    hour = ts_pht.hour
-                except Exception:
-                    pass
 
             if hour is None:
                 continue
@@ -181,10 +174,10 @@ async def get_live_data(authorization: str = Header(...)):
                     "battery_level": reading_battery,
                 })
 
-            # 2-hour bucket starting at 5 AM
+            # 2-hour bucket starting at 5 AM, capped at slot 21 (9-11 PM)
             if hour < 5 or hour > current_hour:
                 continue
-            slot = 5 + ((hour - 5) // 2) * 2
+            slot = min(5 + ((hour - 5) // 2) * 2, 21)
 
             if slot not in buckets:
                 buckets[slot] = {"prod": 0.0, "cons": 0.0, "count": 0}
