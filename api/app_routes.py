@@ -21,6 +21,21 @@ PHT = timezone(timedelta(hours=8))
 router = APIRouter(prefix="/app", tags=["Mobile App"])
 
 
+def _energy_kwh(detail: dict, field: str) -> float:
+    """Convert a Solis energy value to kWh.
+
+    Solis auto-formats large values into MWh/GWh — the raw numeric field
+    changes magnitude and the companion ``{field}Str`` field holds the unit.
+    """
+    val = float(detail.get(field) or 0)
+    unit = (detail.get(f"{field}Str") or "kWh").strip()
+    if unit == "MWh":
+        val *= 1000
+    elif unit == "GWh":
+        val *= 1_000_000
+    return val
+
+
 def _get_solis() -> SolisCloudClient:
     key_id = os.getenv("SOLIS_CLOUD_KEY_ID", "")
     key_secret = os.getenv("SOLIS_CLOUD_KEY_SECRET", "")
@@ -201,9 +216,9 @@ async def get_live_data(authorization: str = Header(...)):
         # Station metadata from Solis
         "capacity_kwp": float(detail.get("capacity") or 0),
         "station_name": detail.get("stationName") or "",
-        # All-time totals from Solis (no need to compute from our DB)
-        "alltime_production_kwh": float(detail.get("allEnergy") or 0),
-        "month_production_kwh": float(detail.get("monthEnergy") or 0),
+        # All-time totals from Solis (unit-aware: Solis auto-formats to MWh/GWh)
+        "alltime_production_kwh": _energy_kwh(detail, "allEnergy"),
+        "month_production_kwh": _energy_kwh(detail, "monthEnergy"),
         # 2-hour buckets for Today chart (from 5-min Solis intervals)
         "today_hourly": today_hourly,
         # 5-min interval readings for Today's Readings list
