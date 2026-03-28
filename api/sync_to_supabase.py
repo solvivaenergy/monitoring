@@ -1,15 +1,18 @@
 """
-Solis → Supabase Sync Service
+Solis → Supabase Daily Sync
 
-Polls Solis Cloud every 15 minutes for all users that have a
-solis_station_id mapped in user_profiles, then writes energy_readings
-to Supabase so the mobile app can read them.
+Runs once daily (11:30 PM PHT via Render cron) for all users that have a
+solis_station_id mapped in user_profiles, then writes one energy_reading
+per user per day to Supabase.
+
+Real-time data (Today chart, current power) comes from /app/live which
+hits Solis on-demand — no need for frequent syncing.
 
 Usage:
-    # One-shot sync
+    # One-shot sync (used by cron)
     python -m api.sync_to_supabase
 
-    # Continuous (every 15 min)
+    # Continuous (legacy, not recommended)
     python -m api.sync_to_supabase --loop
 
 Environment variables:

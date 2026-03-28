@@ -3,4 +3,4 @@ WORKDIR /app
 COPY api/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY api/ ./api/
-CMD ["python", "-m", "api.sync_to_supabase", "--loop"]
+CMD ["python", "-m", "api.sync_to_supabase"]
