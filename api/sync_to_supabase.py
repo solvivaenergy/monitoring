@@ -84,25 +84,61 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
     log.info("Found %d user(s) to sync.", len(users))
     written = 0
 
+    now = datetime.now(timezone(timedelta(hours=8)))  # PHT
+    today_str = now.date().isoformat()
+    # Noon timestamp for today's rolling reading
+    today_noon = datetime(
+        now.year, now.month, now.day, 12, 0, 0,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+
     for user in users:
         user_id: str = user["id"]
         station_id: str = user["solis_station_id"]
         name: str = user.get("full_name", "?")
 
         try:
-            # 2. Fetch station detail from Solis
+            # 2a. Fetch station detail for system metadata
             station = await solis.station_detail(station_id)
-
-            power_kw = float(station.get("power") or 0)
-            day_energy = float(station.get("dayEnergy") or 0)
             capacity_kwp = float(station.get("capacity") or 0)
             station_name = station.get("stationName") or station.get("sno") or station_id
-            state = station.get("state")  # 1=Online, 3=Alarm
 
-            # Convert real-time power (kW) → energy over 15 min interval
-            production_kwh = round(power_kw * (15 / 60), 4)
+            # 2b. Fetch today's 5-min interval data for rich metrics
+            day_data = await solis.station_day(station_id, today_str)
 
-            now = datetime.now(timezone(timedelta(hours=8)))  # PHT
+            if not day_data or not isinstance(day_data, list):
+                log.warning("No station_day data for %s — skipping.", name)
+                continue
+
+            # Aggregate 5-min intervals into daily running totals (values are watts)
+            production_kwh = round(
+                sum(float(p.get("power") or 0) for p in day_data) * (5 / 60) / 1000, 4
+            )
+            consumption_kwh = round(
+                sum(float(p.get("consumeEnergy") or 0) for p in day_data) * (5 / 60) / 1000, 4
+            )
+            grid_export_kwh = round(
+                sum(max(float(p.get("psum") or 0), 0) for p in day_data) * (5 / 60) / 1000, 4
+            )
+            grid_import_kwh = round(
+                sum(abs(min(float(p.get("psum") or 0), 0)) for p in day_data) * (5 / 60) / 1000, 4
+            )
+
+            # Latest battery SOC
+            soc_vals = [
+                float(p.get("batteryCapacitySoc") or 0)
+                for p in day_data
+                if p.get("batteryCapacitySoc") is not None
+            ]
+            battery_level = round(soc_vals[-1], 1) if soc_vals else None
+            if battery_level is None:
+                battery_status = None
+            elif battery_level <= 0:
+                battery_status = None
+            else:
+                # Check latest battery power: positive = charging, negative = discharging
+                last_batt_power = float(day_data[-1].get("batteryPower") or 0)
+                battery_status = "charging" if last_batt_power > 0 else "discharging" if last_batt_power < 0 else "idle"
 
             # 3. Ensure solar_systems row exists
             sys_resp = (
@@ -113,22 +149,47 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                 .limit(1)
                 .execute()
             )
+            # Helper: find the oldest reading timestamp for this user
+            def _oldest_reading_date() -> str:
+                oldest = (
+                    sb.table("energy_readings")
+                    .select("timestamp")
+                    .eq("user_id", user_id)
+                    .order("timestamp", desc=False)
+                    .limit(1)
+                    .execute()
+                )
+                if oldest.data:
+                    return oldest.data[0]["timestamp"][:10]
+                return now.strftime("%Y-%m-%d")
+
             if sys_resp.data:
                 system_id = sys_resp.data[0]["id"]
-                # Update capacity / name from Solis if changed
-                sb.table("solar_systems").update({
+                update_payload = {
                     "system_name": station_name,
                     "capacity_kwp": capacity_kwp,
-                }).eq("id", system_id).execute()
+                }
+                # Backfill installation_date if it was set to a recent placeholder
+                sys_row = (
+                    sb.table("solar_systems")
+                    .select("installation_date")
+                    .eq("id", system_id)
+                    .single()
+                    .execute()
+                )
+                current_install = sys_row.data.get("installation_date") if sys_row.data else None
+                if current_install and current_install >= (now - timedelta(days=30)).strftime("%Y-%m-%d"):
+                    update_payload["installation_date"] = _oldest_reading_date()
+                sb.table("solar_systems").update(update_payload).eq("id", system_id).execute()
             else:
-                # Create new solar_systems row
+                install_date = _oldest_reading_date()
                 insert_resp = (
                     sb.table("solar_systems")
                     .insert({
                         "user_id": user_id,
                         "system_name": station_name,
                         "capacity_kwp": capacity_kwp,
-                        "installation_date": now.strftime("%Y-%m-%d"),
+                        "installation_date": install_date,
                         "address": "—",
                         "status": "active",
                     })
@@ -137,23 +198,39 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                 system_id = insert_resp.data[0]["id"]
                 log.info("Created solar_systems row for %s (system_id=%s)", name, system_id)
 
-            # 4. Write energy_reading
-            sb.table("energy_readings").insert({
+            # 4. Upsert today's energy_reading (one row per user per day)
+            reading = {
                 "user_id": user_id,
                 "system_id": system_id,
-                "timestamp": now.isoformat(),
+                "timestamp": today_noon.isoformat(),
                 "production_kwh": production_kwh,
-                "consumption_kwh": 0,        # Solis doesn't provide consumption
-                "battery_level": None,        # Not available without battery inverter
-                "battery_status": None,
-                "grid_import_kwh": 0,
-                "grid_export_kwh": 0,
-            }).execute()
+                "consumption_kwh": consumption_kwh,
+                "battery_level": battery_level,
+                "battery_status": battery_status,
+                "grid_import_kwh": grid_import_kwh,
+                "grid_export_kwh": grid_export_kwh,
+            }
+
+            # Check if today's reading already exists for this user
+            existing = (
+                sb.table("energy_readings")
+                .select("id")
+                .eq("user_id", user_id)
+                .gte("timestamp", f"{today_str}T00:00:00+08:00")
+                .lt("timestamp", f"{today_str}T23:59:59+08:00")
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                sb.table("energy_readings").update(reading).eq("id", existing.data[0]["id"]).execute()
+            else:
+                sb.table("energy_readings").insert(reading).execute()
 
             written += 1
             log.info(
-                "Synced %s | station=%s | power=%.2f kW | dayEnergy=%.2f kWh | prod_15min=%.4f kWh",
-                name, station_id, power_kw, day_energy, production_kwh,
+                "Synced %s | prod=%.2f cons=%.2f grid_in=%.2f grid_out=%.2f batt=%s kWh",
+                name, production_kwh, consumption_kwh, grid_import_kwh, grid_export_kwh,
+                f"{battery_level}%" if battery_level else "n/a",
             )
 
         except SolisCloudError as e:

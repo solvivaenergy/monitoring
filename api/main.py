@@ -13,17 +13,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Import Solis routes from the same api package
+# Import routes
 from .solis_client import SolisCloudClient  # noqa: F401 — used by routes
 from .solis_routes import router as solis_router
+from .app_routes import router as app_router
 
 app = FastAPI(title="Solviva Monitoring API", docs_url="/docs")
 
-# Allow the GitHub Pages frontend to call this API
+# Allow the GitHub Pages frontend and mobile app to call this API
 ALLOWED_ORIGINS = [
     "https://solvivaenergy.github.io",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
+    "*",  # Mobile app (Expo/React Native)
 ]
 
 app.add_middleware(
@@ -34,6 +36,7 @@ app.add_middleware(
 )
 
 app.include_router(solis_router)
+app.include_router(app_router)
 
 
 @app.get("/health")
