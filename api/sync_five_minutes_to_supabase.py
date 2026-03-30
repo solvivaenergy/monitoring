@@ -14,6 +14,7 @@ Optional flags:
 import asyncio
 import logging
 import os
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -67,6 +68,35 @@ def _to_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _money_multiplier(unit: object, pec: object) -> float:
+    try:
+        pec_decimal = Decimal(str(pec))
+        if pec_decimal != 0:
+            return float(Decimal("1") / pec_decimal)
+    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    unit_text = str(unit or "").upper()
+    if unit_text.startswith("K "):
+        return 1_000.0
+    if unit_text.startswith("M "):
+        return 1_000_000.0
+    return 1.0
+
+
+def _extract_lifetime_earning(station_all: object) -> float:
+    if isinstance(station_all, list) and station_all:
+        payload = station_all[0]
+    elif isinstance(station_all, dict):
+        payload = station_all
+    else:
+        return 0.0
+
+    money = _to_float(payload.get("money"))
+    multiplier = _money_multiplier(payload.get("moneyStr"), payload.get("moneyPec"))
+    return round(money * multiplier, 2)
+
+
 def _parse_timestamp(point: dict) -> Optional[datetime]:
     ts_ms = point.get("time") or point.get("dataTimestamp")
     if ts_ms is None:
@@ -95,7 +125,12 @@ def _battery_status(point: dict) -> Optional[str]:
     return None
 
 
-def _build_row(user_id: str, system_id: str, point: dict) -> Optional[Tuple[int, dict]]:
+def _build_row(
+    user_id: str,
+    system_id: str,
+    point: dict,
+    lifetime_earning: Optional[float] = None,
+) -> Optional[Tuple[int, dict]]:
     ts = _parse_timestamp(point)
     if ts is None:
         return None
@@ -122,6 +157,8 @@ def _build_row(user_id: str, system_id: str, point: dict) -> Optional[Tuple[int,
         "grid_export_kwh": round(max(grid_w, 0.0) * (5 / 60) / 1000, 6),
         "daily_earning": 0,
     }
+    if lifetime_earning is not None:
+        row["lifetime_earning"] = lifetime_earning
     return int(ts.timestamp()), row
 
 
@@ -172,6 +209,14 @@ def _purge_old_rows(sb: Client, day_start: str) -> Optional[int]:
     return resp.count
 
 
+def _has_lifetime_earning_column(sb: Client) -> bool:
+    try:
+        sb.table("energy_readings_five_minutes").select("id, lifetime_earning").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
 async def _ensure_active_system(
     sb: Client,
     solis: SolisCloudClient,
@@ -207,13 +252,18 @@ async def _fetch_station_day(
     sem: asyncio.Semaphore,
     user: dict,
     today_str: str,
-) -> Tuple[dict, Optional[list], Optional[Exception]]:
+) -> Tuple[dict, Optional[list], Optional[float], Optional[Exception]]:
     async with sem:
         try:
-            data = await solis.station_day(user["solis_station_id"], today_str)
-            return user, data if isinstance(data, list) else None, None
+            station_id = user["solis_station_id"]
+            day_data, station_all = await asyncio.gather(
+                solis.station_day(station_id, today_str),
+                solis.station_all(station_id),
+            )
+            lifetime_earning = _extract_lifetime_earning(station_all)
+            return user, day_data if isinstance(day_data, list) else None, lifetime_earning, None
         except Exception as exc:
-            return user, None, exc
+            return user, None, None, exc
 
 
 async def sync_once(dry_run: bool = False) -> int:
@@ -247,6 +297,12 @@ async def sync_once(dry_run: bool = False) -> int:
     deleted_count = _purge_old_rows(sb, day_start)
     log.info("Purged %s old 5-minute row(s) before syncing %s.", deleted_count or 0, today_str)
     existing_by_user = _load_existing_rows(sb, day_start, day_end)
+    has_lifetime_earning = _has_lifetime_earning_column(sb)
+    if not has_lifetime_earning:
+        log.warning(
+            "energy_readings_five_minutes has no lifetime_earning column yet; "
+            "5-minute sync will skip writing lifetime earnings until the column is added."
+        )
 
     prepared_users: List[dict] = []
 
@@ -273,7 +329,7 @@ async def sync_once(dry_run: bool = False) -> int:
     all_inserts: List[dict] = []
     all_updates: List[Tuple[str, dict]] = []
 
-    for user, day_data, error in fetch_results:
+    for user, day_data, lifetime_earning, error in fetch_results:
         user_id = user["id"]
         station_id = user["solis_station_id"]
         system_id = user["system_id"]
@@ -292,7 +348,12 @@ async def sync_once(dry_run: bool = False) -> int:
 
         parsed_rows: List[Tuple[int, dict]] = []
         for point in day_data:
-            built = _build_row(user_id, system_id, point)
+            built = _build_row(
+                user_id,
+                system_id,
+                point,
+                lifetime_earning=lifetime_earning if has_lifetime_earning else None,
+            )
             if built is not None:
                 parsed_rows.append(built)
 
