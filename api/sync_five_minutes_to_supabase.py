@@ -346,7 +346,7 @@ async def sync_once(dry_run: bool = False) -> int:
             log.info("%s: no stationDay data for %s", name, today_str)
             continue
 
-        parsed_rows: List[Tuple[int, dict]] = []
+        parsed_by_ts: Dict[int, dict] = {}
         for point in day_data:
             built = _build_row(
                 user_id,
@@ -355,7 +355,11 @@ async def sync_once(dry_run: bool = False) -> int:
                 lifetime_earning=lifetime_earning if has_lifetime_earning else None,
             )
             if built is not None:
-                parsed_rows.append(built)
+                ts_key, row = built
+                # Solis can occasionally repeat a timestamp; keep the latest copy.
+                parsed_by_ts[ts_key] = row
+
+        parsed_rows = sorted(parsed_by_ts.items())
 
         if not parsed_rows:
             log.info("%s: Solis returned no parseable 5-minute points", name)
@@ -373,6 +377,7 @@ async def sync_once(dry_run: bool = False) -> int:
                     updates.append((existing_id, row))
                 continue
             inserts.append(row)
+            existing_by_ts[ts_key] = "__pending_insert__"
 
         total_written += len(inserts) + len(updates)
         all_inserts.extend(inserts)
@@ -392,7 +397,11 @@ async def sync_once(dry_run: bool = False) -> int:
         return total_written
 
     for batch in _chunked(all_inserts, SUPABASE_BATCH_SIZE):
-        sb.table("energy_readings_five_minutes").insert(batch).execute()
+        (
+            sb.table("energy_readings_five_minutes")
+            .upsert(batch, on_conflict="user_id,timestamp")
+            .execute()
+        )
 
     for row_id, row in all_updates:
         sb.table("energy_readings_five_minutes").update(row).eq("id", row_id).execute()
