@@ -17,8 +17,25 @@ services:
     name: solviva-sync
     runtime: docker
     plan: starter
-    schedule: "55 15 * * *"  # 3:55 PM UTC = 11:55 PM PHT
+    schedule: "5 16 * * *"  # 4:05 PM UTC = 12:05 AM PHT
     dockerfilePath: ./Dockerfile.worker
+    envVars:
+      - key: SOLIS_CLOUD_KEY_ID
+        sync: false
+      - key: SOLIS_CLOUD_KEY_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+
+  # 5-minute interval sync cron: Solis stationDay -> Supabase energy_readings_five_minutes
+  - type: cron
+    name: solviva-five-minute-sync
+    runtime: docker
+    plan: starter
+    schedule: "*/5 * * * *"
+    dockerfilePath: ./Dockerfile.worker.five_minutes
     envVars:
       - key: SOLIS_CLOUD_KEY_ID
         sync: false
