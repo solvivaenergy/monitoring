@@ -86,15 +86,18 @@ def _money_multiplier(unit: object, pec: object) -> float:
 
 def _extract_lifetime_earning(station_all: object) -> float:
     if isinstance(station_all, list) and station_all:
-        payload = station_all[0]
+        total = 0.0
+        for payload in station_all:
+            money = _to_float(payload.get("money"))
+            multiplier = _money_multiplier(payload.get("moneyStr"), payload.get("moneyPec"))
+            total += money * multiplier
+        return round(total, 2)
     elif isinstance(station_all, dict):
-        payload = station_all
+        money = _to_float(station_all.get("money"))
+        multiplier = _money_multiplier(station_all.get("moneyStr"), station_all.get("moneyPec"))
+        return round(money * multiplier, 2)
     else:
         return 0.0
-
-    money = _to_float(payload.get("money"))
-    multiplier = _money_multiplier(payload.get("moneyStr"), payload.get("moneyPec"))
-    return round(money * multiplier, 2)
 
 
 def _parse_timestamp(point: dict) -> Optional[datetime]:
