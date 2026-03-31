@@ -68,34 +68,14 @@ def _to_float(value: object, default: float = 0.0) -> float:
         return default
 
 
-def _money_multiplier(unit: object, pec: object) -> float:
-    try:
-        pec_decimal = Decimal(str(pec))
-        if pec_decimal != 0:
-            return float(Decimal("1") / pec_decimal)
-    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
-        pass
-
-    unit_text = str(unit or "").upper()
-    if unit_text.startswith("K "):
-        return 1_000.0
-    if unit_text.startswith("M "):
-        return 1_000_000.0
-    return 1.0
-
-
 def _extract_lifetime_earning(station_all: object) -> float:
     if isinstance(station_all, list) and station_all:
         total = 0.0
         for payload in station_all:
-            money = _to_float(payload.get("money"))
-            multiplier = _money_multiplier(payload.get("moneyStr"), payload.get("moneyPec"))
-            total += money * multiplier
+            total += _to_float(payload.get("money"))
         return round(total, 2)
     elif isinstance(station_all, dict):
-        money = _to_float(station_all.get("money"))
-        multiplier = _money_multiplier(station_all.get("moneyStr"), station_all.get("moneyPec"))
-        return round(money * multiplier, 2)
+        return round(_to_float(station_all.get("money")), 2)
     else:
         return 0.0
 
