@@ -1,13 +1,12 @@
 """
 Backfill historical Solis data into Supabase.
 
-For each user with a solis_station_id, fetches daily energy data from Solis
-and writes one energy_reading per day.
+For each user with a solis_station_id, fetches monthly summaries from
+stationMonth (pre-computed daily data from Solis) and writes one
+energy_reading per day.
 
 Smart mode (default): uses each station's installation_date from
-solar_systems to determine how far back to fetch — no wasted API calls.
-
-Optimized: fetches days concurrently (semaphore-bounded) and batch-inserts.
+solar_systems to determine how far back to fetch.
 
 Usage:
     cd monitoring
@@ -36,12 +35,14 @@ log = logging.getLogger("backfill")
 
 PHT = timezone(timedelta(hours=8))
 
-# Concurrency for Solis API — 8 of 10 req/sec limit
-SOLIS_CONCURRENCY = 8
-# Batch size for Supabase inserts
+# Concurrency for Solis API — keep low to avoid 429s
+SOLIS_CONCURRENCY = 2
+# Batch size for Supabase upserts
 SUPABASE_BATCH_SIZE = 500
 # How many users to process in parallel
-USER_CONCURRENCY = 3
+USER_CONCURRENCY = 1
+# Delay between Solis API calls (seconds)
+SOLIS_DELAY = 0.5
 
 
 def get_env(key: str) -> str:
@@ -51,63 +52,64 @@ def get_env(key: str) -> str:
     return val
 
 
-def aggregate_day(day_data: list) -> Optional[dict]:
-    """Aggregate 5-min interval list into daily totals. Returns None if no production."""
-    if not day_data or not isinstance(day_data, list):
+def parse_month_day(day: dict) -> Optional[dict]:
+    """Convert a stationMonth day record into an energy_reading row fragment.
+    Returns None if dateStr is missing."""
+    date_str = day.get("dateStr")
+    if not date_str:
         return None
 
-    production_kwh = sum(float(p.get("power") or 0) for p in day_data) * (5 / 60) / 1000
-    if production_kwh <= 0:
-        return None
-
-    consumption_kwh = sum(float(p.get("consumeEnergy") or 0) for p in day_data) * (5 / 60) / 1000
-    grid_export_kwh = sum(max(float(p.get("psum") or 0), 0) for p in day_data) * (5 / 60) / 1000
-    grid_import_kwh = sum(abs(min(float(p.get("psum") or 0), 0)) for p in day_data) * (5 / 60) / 1000
-
-    soc_vals = [float(p.get("batteryCapacitySoc") or 0) for p in day_data if p.get("batteryCapacitySoc") is not None]
-    avg_battery = round(sum(soc_vals) / len(soc_vals), 1) if soc_vals else None
+    production_kwh = float(day.get("energy") or 0)
+    consumption_kwh = float(day.get("consumeEnergy") or 0)
+    grid_import_kwh = float(day.get("gridPurchasedEnergy") or 0)
+    grid_export_kwh = float(day.get("gridSellEnergy") or 0)
+    daily_earning = float(day.get("money") or 0)
 
     return {
+        "date_str": date_str,
         "production_kwh": round(production_kwh, 4),
         "consumption_kwh": round(consumption_kwh, 4),
         "grid_export_kwh": round(grid_export_kwh, 4),
         "grid_import_kwh": round(grid_import_kwh, 4),
-        "battery_level": avg_battery,
-        "battery_status": None if avg_battery is None else ("charging" if avg_battery > 50 else "discharging"),
+        "daily_earning": round(daily_earning, 2),
+        "battery_level": None,
+        "battery_status": None,
     }
 
 
-async def fetch_one_day(solis, sem, station_id, date_str):
-    """Fetch one day's data with concurrency control."""
+async def fetch_one_month(solis, sem, station_id, month_str):
+    """Fetch one month's data with concurrency control and rate-limit delay."""
     async with sem:
+        await asyncio.sleep(SOLIS_DELAY)
         try:
-            data = await solis.station_day(station_id, date_str)
-            return date_str, data
+            data = await solis.station_month(station_id, month_str)
+            return month_str, data
         except SolisCloudError as e:
-            if "no data" in str(e).lower():
-                return date_str, None
-            log.debug("Solis error for station %s date %s: %s", station_id, date_str, e)
-            return date_str, None
+            log.debug("Solis error for station %s month %s: %s", station_id, month_str, e)
+            return month_str, None
         except Exception as e:
-            log.debug("Error for station %s date %s: %s", station_id, date_str, e)
-            return date_str, None
+            log.debug("Error for station %s month %s: %s", station_id, month_str, e)
+            return month_str, None
 
 
-def sb_batch_insert(sb, rows):
-    """Insert rows into Supabase with retry, in batches."""
+def sb_batch_upsert(sb, rows):
+    """Upsert rows into Supabase with retry, in batches.
+    Uses user_id+timestamp as the conflict key so existing rows get updated."""
     for batch_start in range(0, len(rows), SUPABASE_BATCH_SIZE):
         batch = rows[batch_start:batch_start + SUPABASE_BATCH_SIZE]
         for attempt in range(5):
             try:
-                sb.table("energy_readings").insert(batch).execute()
+                sb.table("energy_readings").upsert(
+                    batch, on_conflict="user_id,timestamp"
+                ).execute()
                 break
             except Exception as e:
                 if attempt < 4:
                     wait = 2 ** (attempt + 1)
-                    log.warning("Supabase batch insert failed (attempt %d/5), retrying in %ds: %s", attempt + 1, wait, str(e)[:120])
+                    log.warning("Supabase batch upsert failed (attempt %d/5), retrying in %ds: %s", attempt + 1, wait, str(e)[:120])
                     time.sleep(wait)
                 else:
-                    log.error("Supabase batch insert failed after 5 attempts: %s", str(e)[:200])
+                    log.error("Supabase batch upsert failed after 5 attempts: %s", str(e)[:200])
                     raise
 
 
@@ -162,34 +164,13 @@ async def main():
         if row.get("installation_date"):
             install_dates[row["user_id"]] = row["installation_date"]
 
-    # Pre-load ALL existing reading dates (paginated)
-    all_existing = {}  # user_id → set of date strings
-    offset = 0
-    while True:
-        batch = (
-            sb.table("energy_readings")
-            .select("user_id, timestamp")
-            .range(offset, offset + 999)
-            .execute()
-        ).data
-        if not batch:
-            break
-        for r in batch:
-            uid = r["user_id"]
-            if uid not in all_existing:
-                all_existing[uid] = set()
-            all_existing[uid].add(r["timestamp"][:10])
-        if len(batch) < 1000:
-            break
-        offset += 1000
-
     log.info(
-        "Pre-loaded: %d users, %d solar systems, %d existing readings.",
-        len(users), len(system_ids), sum(len(v) for v in all_existing.values()),
+        "Pre-loaded: %d users, %d solar systems.",
+        len(users), len(system_ids),
     )
 
     today = datetime.now(PHT).date()
-    counters = {"written": 0, "skipped": 0, "errors": 0, "api_calls": 0, "done": 0}
+    counters = {"written": 0, "errors": 0, "api_calls": 0, "done": 0}
     start_time = time.time()
     total_users = len(users)
 
@@ -241,47 +222,51 @@ async def main():
                 else:
                     system_id = "DRY-RUN"
 
-            # Dates needed from pre-loaded existing readings
-            existing = all_existing.get(uid, set())
-            dates_needed = []
-            for d in range(user_days, 0, -1):
-                target_date = today - timedelta(days=d)
-                if target_date.isoformat() not in existing:
-                    dates_needed.append(target_date)
+            # Determine start date for backfill
+            start_date = today - timedelta(days=user_days)
 
-            user_skipped = user_days - len(dates_needed)
+            # Determine which months to fetch
+            months_needed = set()
+            d = start_date
+            while d < today:
+                months_needed.add(d.strftime("%Y-%m"))
+                if d.month == 12:
+                    d = d.replace(year=d.year + 1, month=1, day=1)
+                else:
+                    d = d.replace(month=d.month + 1, day=1)
 
-            if not dates_needed:
-                if user_skipped > 0:
-                    log.info("[%d/%d] %s: fully backfilled, %d days skipped", idx, total_users, name, user_skipped)
-                counters["skipped"] += user_skipped
-                counters["done"] += 1
-                return
-
-            # Fetch all needed days concurrently (shared Solis semaphore)
+            # Fetch all needed months concurrently (shared Solis semaphore)
             tasks = [
-                fetch_one_day(solis, solis_sem, station_id, d.isoformat())
-                for d in dates_needed
+                fetch_one_month(solis, solis_sem, station_id, m)
+                for m in sorted(months_needed)
             ]
             results = await asyncio.gather(*tasks)
             counters["api_calls"] += len(tasks)
 
-            # Aggregate and build insert rows
+            # Parse and build upsert rows
             rows = []
-            for target_date, (date_str, day_data) in zip(dates_needed, results):
-                agg = aggregate_day(day_data)
-                if agg is None:
+            for month_str, month_data in results:
+                if not month_data or not isinstance(month_data, list):
                     continue
-                reading_ts = datetime(
-                    target_date.year, target_date.month, target_date.day,
-                    12, 0, 0, tzinfo=PHT,
-                )
-                rows.append({
-                    "user_id": uid,
-                    "system_id": system_id,
-                    "timestamp": reading_ts.isoformat(),
-                    **agg,
-                })
+                for day in month_data:
+                    parsed = parse_month_day(day)
+                    if parsed is None:
+                        continue
+                    ds = parsed.pop("date_str")
+                    # Only include days within the backfill window
+                    if ds < start_date.isoformat() or ds >= today.isoformat():
+                        continue
+                    parts = ds.split("-")
+                    noon = datetime(
+                        int(parts[0]), int(parts[1]), int(parts[2]),
+                        12, 0, 0, tzinfo=PHT,
+                    )
+                    rows.append({
+                        "user_id": uid,
+                        "system_id": system_id,
+                        "timestamp": noon.isoformat(),
+                        **parsed,
+                    })
 
             if dry_run:
                 for row in rows[:3]:
@@ -295,22 +280,21 @@ async def main():
             else:
                 if rows:
                     try:
-                        sb_batch_insert(sb, rows)
+                        sb_batch_upsert(sb, rows)
                     except Exception:
                         counters["errors"] += len(rows)
                         rows = []
 
             user_written = len(rows)
             counters["written"] += user_written
-            counters["skipped"] += user_skipped
             counters["done"] += 1
 
             elapsed = time.time() - start_time
             rate = counters["written"] / elapsed * 60 if elapsed > 0 and counters["written"] > 0 else 0
 
             log.info(
-                "[%d/%d] %s: %d written, %d skipped, range=%dd | elapsed=%.0fs, rate=%.0f/min, done=%d/%d",
-                idx, total_users, name, user_written, user_skipped, user_days,
+                "[%d/%d] %s: %d upserted, range=%dd (%d months) | elapsed=%.0fs, rate=%.0f/min, done=%d/%d",
+                idx, total_users, name, user_written, user_days, len(months_needed),
                 elapsed, rate, counters["done"], total_users,
             )
 
@@ -329,7 +313,7 @@ async def main():
     print(f"  Users processed:     {total_users}")
     print(f"  Solis API calls:     {counters['api_calls']}")
     print(f"  Readings written:    {counters['written']}")
-    print(f"  Readings skipped:    {counters['skipped']} (already existed)")
+    print(f"  Readings upserted:   {counters['written']}")
     print(f"  Errors:              {counters['errors']}")
     print(f"  Elapsed:             {elapsed:.0f}s ({elapsed/60:.1f} min)")
     eff_rate = counters['api_calls'] / elapsed if elapsed > 0 else 0
