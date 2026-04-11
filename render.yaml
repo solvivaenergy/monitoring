@@ -12,12 +12,12 @@ services:
       - key: SOLIS_CLOUD_KEY_SECRET
         sync: false
 
-  # Daily sync cron: Solis → Supabase (10:00 AM PHT via Render cron)
+  # Daily sync cron: Solis → Supabase (2:00 AM PHT via Render cron)
   - type: cron
     name: solviva-sync
     runtime: docker
     plan: starter
-    schedule: "0 2 * * *"  # 2:00 AM UTC = 10:00 AM PHT
+    schedule: "0 18 * * *"  # 6:00 PM UTC = 2:00 AM PHT
     dockerfilePath: ./Dockerfile.worker
     envVars:
       - key: SOLIS_CLOUD_KEY_ID
