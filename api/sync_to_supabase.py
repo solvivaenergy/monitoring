@@ -253,6 +253,14 @@ async def main() -> None:
         count = await sync_once(solis, sb)
         log.info("Done — %d reading(s) written.", count)
 
+        # Sync referral codes from Odoo → user_profiles
+        try:
+            from api.sync_referral_codes import sync_referral_codes
+            log.info("Starting referral code sync from Odoo…")
+            sync_referral_codes(sb)
+        except Exception as e:
+            log.error("Referral code sync failed: %s", e)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

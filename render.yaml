@@ -28,6 +28,14 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_KEY
         sync: false
+      - key: ODOO_URL
+        sync: false
+      - key: ODOO_DB
+        sync: false
+      - key: ODOO_USER
+        sync: false
+      - key: ODOO_API_KEY
+        sync: false
 
   # 5-minute interval sync cron: Solis stationDay -> Supabase energy_readings_five_minutes
   - type: cron
