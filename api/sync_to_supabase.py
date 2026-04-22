@@ -69,6 +69,67 @@ def build_solis() -> SolisCloudClient:
     )
 
 
+async def _fetch_battery_capacity_kwh(
+    solis: SolisCloudClient, station_id: str
+) -> Optional[float]:
+    """Best-effort lookup of the battery pack's rated capacity in kWh.
+
+    Tries the first inverter on the station and inspects several Solis fields
+    that may carry capacity info. Returns None if the station has no battery
+    or the value can't be determined.
+    """
+    try:
+        inv_list = await solis.list_inverters(station_id, page_size=1)
+    except Exception as e:
+        log.debug("list_inverters failed for station %s: %s", station_id, e)
+        return None
+
+    records = None
+    if isinstance(inv_list, dict):
+        page = inv_list.get("page")
+        if isinstance(page, dict):
+            records = page.get("records")
+        if not records:
+            records = inv_list.get("records")
+    if not records:
+        return None
+
+    inverter_id = records[0].get("id") or records[0].get("sn")
+    if not inverter_id:
+        return None
+
+    try:
+        detail = await solis.inverter_detail(str(inverter_id))
+    except Exception as e:
+        log.debug("inverter_detail failed for %s: %s", inverter_id, e)
+        return None
+
+    if not isinstance(detail, dict):
+        return None
+
+    # 1) Direct kWh fields some Solis firmwares expose
+    for key in ("batteryCapacityKwh", "batteryCapacityEnergy", "batteryTotalCapacity"):
+        val = detail.get(key)
+        if val not in (None, "", 0, "0"):
+            try:
+                return round(float(val), 2)
+            except (TypeError, ValueError):
+                pass
+
+    # 2) Derive from Ah * V (most common)
+    ah = detail.get("storageBatteryCapacity") or detail.get("batteryCapacity")
+    v = detail.get("storageBatteryVoltage") or detail.get("batteryVoltage")
+    try:
+        if ah and v:
+            kwh = float(ah) * float(v) / 1000.0
+            if kwh > 0:
+                return round(kwh, 2)
+    except (TypeError, ValueError):
+        pass
+
+    return None
+
+
 async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
     """Run one sync cycle. Returns number of readings written."""
 
@@ -101,6 +162,9 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
             station = await solis.station_detail(station_id)
             capacity_kwp = float(station.get("capacity") or 0)
             station_name = station.get("stationName") or station.get("sno") or station_id
+
+            # 2a-bis. Best-effort battery capacity from inverterDetail (kWh)
+            battery_capacity_kwh = await _fetch_battery_capacity_kwh(solis, station_id)
 
             # 2b. Fetch current month's daily summaries (1 API call, all days)
             month_data = await solis.station_month(station_id, current_month)
@@ -138,6 +202,8 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                     "system_name": station_name,
                     "capacity_kwp": capacity_kwp,
                 }
+                if battery_capacity_kwh is not None:
+                    update_payload["battery_capacity_kwh"] = battery_capacity_kwh
                 # Backfill installation_date if it was set to a recent placeholder
                 sys_row = (
                     sb.table("solar_systems")
@@ -152,16 +218,19 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                 sb.table("solar_systems").update(update_payload).eq("id", system_id).execute()
             else:
                 install_date = _oldest_reading_date()
+                insert_payload = {
+                    "user_id": user_id,
+                    "system_name": station_name,
+                    "capacity_kwp": capacity_kwp,
+                    "installation_date": install_date,
+                    "address": "—",
+                    "status": "active",
+                }
+                if battery_capacity_kwh is not None:
+                    insert_payload["battery_capacity_kwh"] = battery_capacity_kwh
                 insert_resp = (
                     sb.table("solar_systems")
-                    .insert({
-                        "user_id": user_id,
-                        "system_name": station_name,
-                        "capacity_kwp": capacity_kwp,
-                        "installation_date": install_date,
-                        "address": "—",
-                        "status": "active",
-                    })
+                    .insert(insert_payload)
                     .execute()
                 )
                 system_id = insert_resp.data[0]["id"]
@@ -175,7 +244,14 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                     continue
 
                 production_kwh = float(day.get("energy") or 0)
-                consumption_kwh = float(day.get("consumeEnergy") or 0)
+                # Solis UI "Daily Grid Load" = homeGridEnergy (non-backup grid-side loads).
+                # Fall back to consumeEnergy (total home load incl. backup + battery
+                # round-trip) only if homeGridEnergy is missing.
+                consumption_kwh = float(
+                    day.get("homeGridEnergy")
+                    if day.get("homeGridEnergy") is not None
+                    else (day.get("consumeEnergy") or 0)
+                )
                 grid_import_kwh = float(day.get("gridPurchasedEnergy") or 0)
                 grid_export_kwh = float(day.get("gridSellEnergy") or 0)
                 daily_earning = float(day.get("money") or 0)

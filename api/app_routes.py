@@ -132,7 +132,7 @@ async def get_live_data(authorization: str = Header(...)):
             sum(float(p.get("power") or 0) for p in day_data) * (5 / 60) / 1000, 4
         )
         consumption_kwh = round(
-            sum(float(p.get("consumeEnergy") or 0) for p in day_data) * (5 / 60) / 1000, 4
+            sum(float(p.get("familyLoadPower") or 0) for p in day_data) * (5 / 60) / 1000, 4
         )
         grid_export_kwh = round(
             sum(max(float(p.get("psum") or 0), 0) for p in day_data) * (5 / 60) / 1000, 4
@@ -162,7 +162,7 @@ async def get_live_data(authorization: str = Header(...)):
 
             # Build 5-min readings list for Today's Readings section
             power_kw = round(float(p.get("power") or 0) / 1000, 3)
-            consume_kw = round(float(p.get("consumeEnergy") or 0) / 1000, 3)
+            consume_kw = round(float(p.get("familyLoadPower") or 0) / 1000, 3)
             soc_val = p.get("batteryCapacitySoc")
             reading_battery = round(float(soc_val), 1) if soc_val is not None else None
 
@@ -182,7 +182,7 @@ async def get_live_data(authorization: str = Header(...)):
             if slot not in buckets:
                 buckets[slot] = {"prod": 0.0, "cons": 0.0, "count": 0}
             buckets[slot]["prod"] += float(p.get("power") or 0) * (5 / 60) / 1000
-            buckets[slot]["cons"] += float(p.get("consumeEnergy") or 0) * (5 / 60) / 1000
+            buckets[slot]["cons"] += float(p.get("familyLoadPower") or 0) * (5 / 60) / 1000
             buckets[slot]["count"] += 1
 
         today_hourly = [

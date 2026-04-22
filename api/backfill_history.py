@@ -60,7 +60,12 @@ def parse_month_day(day: dict) -> Optional[dict]:
         return None
 
     production_kwh = float(day.get("energy") or 0)
-    consumption_kwh = float(day.get("consumeEnergy") or 0)
+    # Solis UI "Daily Grid Load" = homeGridEnergy; fall back to consumeEnergy.
+    consumption_kwh = float(
+        day.get("homeGridEnergy")
+        if day.get("homeGridEnergy") is not None
+        else (day.get("consumeEnergy") or 0)
+    )
     grid_import_kwh = float(day.get("gridPurchasedEnergy") or 0)
     grid_export_kwh = float(day.get("gridSellEnergy") or 0)
     daily_earning = float(day.get("money") or 0)

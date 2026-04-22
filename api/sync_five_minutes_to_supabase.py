@@ -119,7 +119,11 @@ def _build_row(
         return None
 
     production_w = _to_float(point.get("power"))
-    consumption_w = _to_float(point.get("consumeEnergy"))
+    # Household consumption (household load), in watts.
+    # NOTE: `consumeEnergy` on a stationDay curve point is NOT instantaneous power
+    # (it ends up double-counting grid import). `familyLoadPower` is the correct
+    # instantaneous household load in W.
+    consumption_w = _to_float(point.get("familyLoadPower"))
     grid_w = _to_float(point.get("psum"))
     battery_level_raw = point.get("batteryCapacitySoc")
     battery_level = (
