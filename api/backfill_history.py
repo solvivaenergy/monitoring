@@ -273,6 +273,15 @@ async def main():
                         **parsed,
                     })
 
+            # Dedup rows on (user_id, timestamp): Solis occasionally returns the
+            # same date under two adjacent months. Upsert rejects the whole batch
+            # if a duplicate is present, so keep the last occurrence.
+            if rows:
+                seen: dict[tuple, dict] = {}
+                for r in rows:
+                    seen[(r["user_id"], r["timestamp"])] = r
+                rows = list(seen.values())
+
             if dry_run:
                 for row in rows[:3]:
                     log.info(
