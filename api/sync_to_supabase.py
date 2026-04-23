@@ -255,6 +255,8 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                 grid_import_kwh = float(day.get("gridPurchasedEnergy") or 0)
                 grid_export_kwh = float(day.get("gridSellEnergy") or 0)
                 daily_earning = float(day.get("money") or 0)
+                battery_charge_kwh = float(day.get("batteryChargeEnergy") or 0)
+                battery_discharge_kwh = float(day.get("batteryDischargeEnergy") or 0)
 
                 # Build noon timestamp for this date
                 parts = date_str.split("-")
@@ -274,6 +276,8 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                     "grid_import_kwh": round(grid_import_kwh, 4),
                     "grid_export_kwh": round(grid_export_kwh, 4),
                     "daily_earning": round(daily_earning, 2),
+                    "battery_charge_kwh": round(battery_charge_kwh, 4),
+                    "battery_discharge_kwh": round(battery_discharge_kwh, 4),
                 }
 
                 # Check if this day's reading already exists
