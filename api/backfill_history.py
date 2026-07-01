@@ -16,10 +16,12 @@ Usage:
 """
 
 import asyncio
+import argparse
 import os
 import sys
 import logging
 import time
+import csv
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -52,6 +54,38 @@ def get_env(key: str) -> str:
     return val
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Backfill daily history into Supabase energy_readings")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write to Supabase. Default is dry-run.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Fixed number of days to backfill for all selected users.",
+    )
+    parser.add_argument(
+        "--station-csv",
+        default=None,
+        help="Optional CSV path to filter users by station IDs (columns: station_id or solis_station_id).",
+    )
+    return parser.parse_args()
+
+
+def load_station_ids_from_csv(csv_path: str) -> set[str]:
+    station_ids: set[str] = set()
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sid = str(row.get("station_id") or row.get("solis_station_id") or "").strip()
+            if sid:
+                station_ids.add(sid)
+    return station_ids
+
+
 def parse_month_day(day: dict) -> Optional[dict]:
     """Convert a stationMonth day record into an energy_reading row fragment.
     Returns None if dateStr is missing."""
@@ -59,13 +93,23 @@ def parse_month_day(day: dict) -> Optional[dict]:
     if not date_str:
         return None
 
+    def _to_float(value: object, default: float = 0.0) -> float:
+        try:
+            if value is None or value == "":
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     production_kwh = float(day.get("energy") or 0)
-    # Solis UI "Daily Grid Load" = homeGridEnergy; fall back to consumeEnergy.
-    consumption_kwh = float(
-        day.get("homeGridEnergy")
-        if day.get("homeGridEnergy") is not None
-        else (day.get("consumeEnergy") or 0)
-    )
+    # Preferred: total grid load + backup load.
+    total_grid_load = _to_float(day.get("homeGridEnergy"))
+    backup_load = _to_float(day.get("backUpEnergy")) + _to_float(day.get("backup2Energy"))
+    consumption_kwh = total_grid_load + backup_load
+    if consumption_kwh <= 0:
+        consumption_kwh = _to_float(day.get("homeLoadEnergy"))
+    if consumption_kwh <= 0:
+        consumption_kwh = _to_float(day.get("consumeEnergy"))
     grid_import_kwh = float(day.get("gridPurchasedEnergy") or 0)
     grid_export_kwh = float(day.get("gridSellEnergy") or 0)
     daily_earning = float(day.get("money") or 0)
@@ -123,14 +167,10 @@ def sb_batch_upsert(sb, rows):
 
 
 async def main():
-    dry_run = "--apply" not in sys.argv
-
-    # Parse --days N (overrides smart mode with a fixed window)
-    fixed_days = None
-    if "--days" in sys.argv:
-        idx = sys.argv.index("--days")
-        if idx + 1 < len(sys.argv):
-            fixed_days = int(sys.argv[idx + 1])
+    args = parse_args()
+    dry_run = not args.apply
+    fixed_days = args.days
+    station_csv = args.station_csv
 
     mode_label = f"fixed {fixed_days} days" if fixed_days else "smart (per-station install date)"
 
@@ -162,6 +202,19 @@ async def main():
         .execute()
     )
     users = resp.data or []
+
+    if station_csv:
+        if not os.path.exists(station_csv):
+            raise FileNotFoundError(f"station csv not found: {station_csv}")
+        station_ids = load_station_ids_from_csv(station_csv)
+        before = len(users)
+        users = [u for u in users if str(u.get("solis_station_id") or "").strip() in station_ids]
+        log.info(
+            "Filtered users by station CSV: %d -> %d users (csv station ids=%d)",
+            before,
+            len(users),
+            len(station_ids),
+        )
 
     # Pre-load ALL solar_systems (id + user_id + installation_date)
     ss_resp = sb.table("solar_systems").select("id, user_id, installation_date, status").execute()

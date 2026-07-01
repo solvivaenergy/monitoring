@@ -69,6 +69,36 @@ def build_solis() -> SolisCloudClient:
     )
 
 
+def _to_float(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _daily_consumption_kwh(day: dict) -> float:
+    """Compute daily consumption from Solis monthly summary fields.
+
+    Preferred formula: total grid load + backup load.
+    Solis commonly exposes this as homeGridEnergy + backUpEnergy (+ backup2Energy).
+    Fall back to homeLoadEnergy / consumeEnergy when explicit split fields are absent.
+    """
+    total_grid_load = _to_float(day.get("homeGridEnergy"))
+    backup_load = _to_float(day.get("backUpEnergy")) + _to_float(day.get("backup2Energy"))
+    from_grid_plus_backup = total_grid_load + backup_load
+
+    if from_grid_plus_backup > 0:
+        return from_grid_plus_backup
+
+    home_load_energy = _to_float(day.get("homeLoadEnergy"))
+    if home_load_energy > 0:
+        return home_load_energy
+
+    return _to_float(day.get("consumeEnergy"))
+
+
 async def _fetch_battery_capacity_kwh(
     solis: SolisCloudClient, station_id: str
 ) -> Optional[float]:
@@ -244,14 +274,7 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                     continue
 
                 production_kwh = float(day.get("energy") or 0)
-                # Solis UI "Daily Grid Load" = homeGridEnergy (non-backup grid-side loads).
-                # Fall back to consumeEnergy (total home load incl. backup + battery
-                # round-trip) only if homeGridEnergy is missing.
-                consumption_kwh = float(
-                    day.get("homeGridEnergy")
-                    if day.get("homeGridEnergy") is not None
-                    else (day.get("consumeEnergy") or 0)
-                )
+                consumption_kwh = _daily_consumption_kwh(day)
                 grid_import_kwh = float(day.get("gridPurchasedEnergy") or 0)
                 grid_export_kwh = float(day.get("gridSellEnergy") or 0)
                 daily_earning = float(day.get("money") or 0)
