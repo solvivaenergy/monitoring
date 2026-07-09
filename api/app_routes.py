@@ -8,7 +8,9 @@ Historical data (charts, weekly/monthly trends) stays in Supabase.
 Real-time data (current wattage, today's running production) comes from here.
 """
 
+import asyncio
 import os
+import logging
 from datetime import date, datetime, timezone, timedelta
 
 from fastapi import APIRouter, HTTPException, Header
@@ -19,6 +21,7 @@ from .solis_client import SolisCloudClient, SolisCloudError
 PHT = timezone(timedelta(hours=8))
 
 router = APIRouter(prefix="/app", tags=["Mobile App"])
+log = logging.getLogger(__name__)
 
 
 def _energy_kwh(detail: dict, field: str) -> float:
@@ -52,23 +55,59 @@ def _get_supabase():
     return create_client(url, key)
 
 
-async def _resolve_station_id(user_id: str) -> str:
-    """Look up the Solis station ID for a Supabase user."""
+def _is_retryable_supabase_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "522" in message:
+        return True
+
+    status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    return status_code == 522
+
+
+async def _query_user_profile_station_id(user_id: str) -> str:
     sb = _get_supabase()
-    resp = (
-        sb.table("user_profiles")
-        .select("solis_station_id")
-        .eq("id", user_id)
-        .limit(1)
-        .execute()
-    )
-    if not resp.data or not resp.data[0].get("solis_station_id"):
-        raise HTTPException(status_code=404, detail="No Solis station mapped for this user")
-    return resp.data[0]["solis_station_id"]
+    last_exc: Exception | None = None
+
+    for attempt in range(3):
+        try:
+            resp = (
+                sb.table("user_profiles")
+                .select("solis_station_id")
+                .eq("id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if not resp.data or not resp.data[0].get("solis_station_id"):
+                raise HTTPException(status_code=404, detail="No Solis station mapped for this user")
+            return resp.data[0]["solis_station_id"]
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable_supabase_error(exc) or attempt == 2:
+                break
+            log.warning("Supabase user_profiles lookup failed for %s on attempt %d: %s", user_id, attempt + 1, exc)
+            await asyncio.sleep(0.5 * (attempt + 1))
+
+    raise HTTPException(status_code=503, detail="Supabase user profile lookup temporarily unavailable") from last_exc
 
 
-async def _authenticate(authorization: str = Header(...)) -> str:
-    """Validate the Supabase JWT and return the user ID."""
+def _station_id_from_auth_metadata(user: dict) -> str:
+    metadata = user.get("user_metadata") or {}
+    station_id = metadata.get("solis_station_id")
+    return str(station_id).strip() if station_id else ""
+
+
+async def _resolve_station_id(user: dict) -> str:
+    """Look up the Solis station ID for a Supabase user."""
+    station_id = _station_id_from_auth_metadata(user)
+    if station_id:
+        return station_id
+    return await _query_user_profile_station_id(str(user["id"]))
+
+
+async def _authenticate(authorization: str = Header(...)) -> dict:
+    """Validate the Supabase JWT and return the Supabase user payload."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
 
@@ -78,7 +117,11 @@ async def _authenticate(authorization: str = Header(...)) -> str:
         user_resp = sb.auth.get_user(token)
         if not user_resp or not user_resp.user:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return user_resp.user.id
+        user = user_resp.user
+        return {
+            "id": user.id,
+            "user_metadata": getattr(user, "user_metadata", {}) or {},
+        }
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
@@ -92,8 +135,9 @@ async def get_live_data(authorization: str = Header(...)):
     The mobile app calls this on Home screen load and pull-to-refresh.
     Historical data (week/month charts) continues to come from Supabase directly.
     """
-    user_id = await _authenticate(authorization)
-    station_id = await _resolve_station_id(user_id)
+    user = await _authenticate(authorization)
+    user_id = str(user["id"])
+    station_id = await _resolve_station_id(user)
     solis = _get_solis()
 
     try:

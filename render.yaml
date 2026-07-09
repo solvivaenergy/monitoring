@@ -37,12 +37,12 @@ services:
       - key: ODOO_API_KEY
         sync: false
 
-  # 5-minute interval sync cron: Solis stationDay -> Supabase energy_readings_five_minutes
+  # 15-minute interval sync cron: Solis stationDay -> Supabase energy_readings_five_minutes
   - type: cron
     name: solviva-five-minute-sync
     runtime: docker
     plan: starter
-    schedule: "*/5 * * * *"
+    schedule: "*/15 * * * *"
     dockerfilePath: ./Dockerfile.worker.five_minutes
     envVars:
       - key: SOLIS_CLOUD_KEY_ID

@@ -1,8 +1,9 @@
 """
-Solis -> Supabase 5-minute interval sync.
+Solis -> Supabase interval sync.
 
-Fetches today's stationDay curve for every mapped Solis station and stores each
-5-minute interval in the energy_readings_five_minutes table.
+Runs every 15 minutes and fetches today's stationDay curve for every mapped
+Solis station, storing each 5-minute interval in the energy_readings_five_minutes
+table.
 
 Designed for Render cron:
     python -m api.sync_five_minutes_to_supabase
