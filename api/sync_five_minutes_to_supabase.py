@@ -15,6 +15,7 @@ Optional flags:
 import asyncio
 import logging
 import os
+import time
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -67,6 +68,38 @@ def _to_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _is_retryable_supabase_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "522" in message:
+        return True
+
+    status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    return status_code == 522
+
+
+def _execute_with_retry(action_name: str, factory):
+    last_exc: Exception | None = None
+
+    for attempt in range(3):
+        try:
+            return factory().execute()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable_supabase_error(exc) or attempt == 2:
+                raise
+            delay_seconds = 0.5 * (attempt + 1)
+            log.warning(
+                "%s failed on attempt %d; retrying in %.1fs: %s",
+                action_name,
+                attempt + 1,
+                delay_seconds,
+                exc,
+            )
+            time.sleep(delay_seconds)
+
+    raise RuntimeError(f"{action_name} failed after retries") from last_exc
 
 
 def _extract_lifetime_earning(station_all: object) -> float:
@@ -166,13 +199,15 @@ def _load_existing_rows(
     offset = 0
 
     while True:
-        batch = (
-            sb.table("energy_readings_five_minutes")
-            .select("id, user_id, timestamp")
-            .gte("timestamp", day_start)
-            .lt("timestamp", day_end)
-            .range(offset, offset + SUPABASE_PAGE_SIZE - 1)
-            .execute()
+        batch = _execute_with_retry(
+            "load existing five-minute rows",
+            lambda: (
+                sb.table("energy_readings_five_minutes")
+                .select("id, user_id, timestamp")
+                .gte("timestamp", day_start)
+                .lt("timestamp", day_end)
+                .range(offset, offset + SUPABASE_PAGE_SIZE - 1)
+            ),
         ).data or []
 
         if not batch:
@@ -191,18 +226,19 @@ def _load_existing_rows(
 
 
 def _purge_old_rows(sb: Client, day_start: str) -> Optional[int]:
-    resp = (
-        sb.table("energy_readings_five_minutes")
-        .delete(count="exact")
-        .lt("timestamp", day_start)
-        .execute()
+    resp = _execute_with_retry(
+        "purge old five-minute rows",
+        lambda: sb.table("energy_readings_five_minutes").delete(count="exact").lt("timestamp", day_start),
     )
     return resp.count
 
 
 def _has_lifetime_earning_column(sb: Client) -> bool:
     try:
-        sb.table("energy_readings_five_minutes").select("id, lifetime_earning").limit(1).execute()
+        _execute_with_retry(
+            "check lifetime earning column",
+            lambda: sb.table("energy_readings_five_minutes").select("id, lifetime_earning").limit(1),
+        )
         return True
     except Exception:
         return False
@@ -220,17 +256,16 @@ async def _ensure_active_system(
         return existing
 
     station = await solis.station_detail(station_id)
-    insert_resp = (
-        sb.table("solar_systems")
-        .insert({
+    insert_resp = _execute_with_retry(
+        "create active solar system",
+        lambda: sb.table("solar_systems").insert({
             "user_id": user_id,
             "system_name": station.get("stationName") or station_id,
             "capacity_kwp": _to_float(station.get("capacity")),
             "installation_date": datetime.now(PHT).date().isoformat(),
             "address": "-",
             "status": "active",
-        })
-        .execute()
+        }),
     )
     system_id = insert_resp.data[0]["id"]
     system_ids[user_id] = system_id
@@ -261,11 +296,9 @@ async def sync_once(dry_run: bool = False) -> int:
     sb = build_supabase()
     solis = build_solis()
 
-    users_resp = (
-        sb.table("user_profiles")
-        .select("id, full_name, solis_station_id")
-        .not_.is_("solis_station_id", "null")
-        .execute()
+    users_resp = _execute_with_retry(
+        "load mapped user profiles",
+        lambda: sb.table("user_profiles").select("id, full_name, solis_station_id").not_.is_("solis_station_id", "null"),
     )
     users = users_resp.data or []
 
@@ -273,11 +306,9 @@ async def sync_once(dry_run: bool = False) -> int:
         log.info("No users with solis_station_id mapped. Nothing to sync.")
         return 0
 
-    systems_resp = (
-        sb.table("solar_systems")
-        .select("id, user_id, status")
-        .eq("status", "active")
-        .execute()
+    systems_resp = _execute_with_retry(
+        "load active solar systems",
+        lambda: sb.table("solar_systems").select("id, user_id, status").eq("status", "active"),
     )
     system_ids = {row["user_id"]: row["id"] for row in (systems_resp.data or [])}
 
@@ -395,7 +426,17 @@ async def sync_once(dry_run: bool = False) -> int:
         )
 
     for row_id, row in all_updates:
-        sb.table("energy_readings_five_minutes").update(row).eq("id", row_id).execute()
+        _execute_with_retry(
+            "update latest five-minute row",
+            lambda: sb.table("energy_readings_five_minutes").update(row).eq("id", row_id),
+        )
+
+    if all_inserts:
+        for batch in _chunked(all_inserts, SUPABASE_BATCH_SIZE):
+            _execute_with_retry(
+                f"upsert batch of {len(batch)} five-minute rows",
+                lambda batch=batch: sb.table("energy_readings_five_minutes").upsert(batch, on_conflict="user_id,timestamp"),
+            )
 
     return total_written
 
