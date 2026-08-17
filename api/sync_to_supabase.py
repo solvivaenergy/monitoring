@@ -353,6 +353,16 @@ async def main() -> None:
     if "--loop" in sys.argv:
         await run_loop(solis, sb)
     else:
+        # Pre-step: onboard any Odoo lead that has a Solis station id so its
+        # readings are included in this same sync run.
+        if "--no-onboard" not in sys.argv:
+            try:
+                from api.onboard_from_odoo import auto_onboard_from_odoo
+                log.info("Starting Odoo → Supabase auto-onboarding…")
+                await auto_onboard_from_odoo(sb, solis)
+            except Exception as e:
+                log.error("Odoo auto-onboarding failed: %s", e)
+
         count = await sync_once(solis, sb)
         log.info("Done — %d reading(s) written.", count)
 

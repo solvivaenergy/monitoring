@@ -36,6 +36,22 @@ services:
         sync: false
       - key: ODOO_API_KEY
         sync: false
+      - key: DEFAULT_USER_PASSWORD
+        sync: false
+      - key: ALERT_WEBHOOK_URL
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: ALERT_EMAIL_FROM
+        sync: false
+      - key: ALERT_EMAIL_TO
+        sync: false
 
   # 15-minute interval sync cron: Solis stationDay -> Supabase energy_readings_five_minutes
   - type: cron
