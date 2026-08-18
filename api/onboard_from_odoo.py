@@ -244,6 +244,32 @@ async def onboard(
     if candidates:
         counts, results = run_onboarding(sb, candidates, apply)
 
+    # Backfill recent daily history for freshly onboarded stations (apply only).
+    # Scoped to a short, env-configurable window (default 2 months) so the daily
+    # cron stays fast. Idempotent (upsert-by-date) and only touches users with
+    # zero existing readings.
+    backfill_days = int(os.getenv("ONBOARD_BACKFILL_DAYS", "60"))
+    backfill: Dict[str, int] = {"users": 0, "api_calls": 0, "rows": 0, "errors": 0}
+    if apply and candidates and backfill_days > 0:
+        try:
+            from api.backfill_newly_onboarded import backfill_station_ids
+
+            backfill = await backfill_station_ids(
+                sb,
+                solis,
+                {c.station_id for c in candidates},
+                days=backfill_days,
+                apply=True,
+            )
+            log.info(
+                "Onboarding backfill: %d user(s), %d row(s) over %d day(s).",
+                backfill["users"],
+                backfill["rows"],
+                backfill_days,
+            )
+        except Exception as exc:  # never let backfill block onboarding
+            log.error("Onboarding backfill failed: %s", exc)
+
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "apply_mode": apply,
@@ -254,6 +280,8 @@ async def onboard(
         "counts": counts,
         "skipped": skipped,
         "results": results,
+        "backfill_days": backfill_days,
+        "backfill": backfill,
     }
 
     finalize_run(sb, report)

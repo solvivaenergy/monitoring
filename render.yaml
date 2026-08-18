@@ -38,6 +38,8 @@ services:
         sync: false
       - key: DEFAULT_USER_PASSWORD
         sync: false
+      - key: ONBOARD_BACKFILL_DAYS
+        value: "60"
       - key: ALERT_WEBHOOK_URL
         sync: false
       - key: SMTP_HOST
