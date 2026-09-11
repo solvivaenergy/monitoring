@@ -638,6 +638,15 @@ class BearerAuthMiddleware:
         headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
 
         if self.restrict_ips and not _from_anthropic(headers, scope):
+            # Log the chain: getting the proxy-hop depth wrong here silently
+            # rejects every legitimate request, and the header is the only way
+            # to see what the platform actually forwarded.
+            print(
+                f"[auth] rejected {scope['path']} — resolved client "
+                f"{_client_ip(headers, scope)} not in {ANTHROPIC_EGRESS}; "
+                f"x-forwarded-for={headers.get('x-forwarded-for', '(none)')!r}",
+                flush=True,
+            )
             await _send_json(send, 403, {"error": "forbidden"})
             return
 
@@ -655,24 +664,34 @@ class BearerAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-def _from_anthropic(headers: Dict[str, str], scope) -> bool:
-    """Is the caller inside Anthropic's egress range?
+def _client_ip(headers: Dict[str, str], scope) -> Optional[ipaddress._BaseAddress]:
+    """The caller's real public IP, as seen through Render's proxy chain.
 
-    Takes the LAST X-Forwarded-For entry, not the first. Anything a client sends
-    in that header is preserved and appended to by each proxy, so the leading
-    entries are attacker-controlled; only the final entry — the one Render's edge
-    appended — reflects the socket it actually saw. Reading the first entry would
-    let anyone bypass this check with a forged header.
+    X-Forwarded-For is client-supplied first, then appended to by each proxy, so
+    neither end of the list is reliable on its own: the first entries are forged
+    by whoever wants, and the last entries are Render's own internal hops. Walk
+    from the right and take the first PUBLIC address — everything to its right is
+    infrastructure, and anything a client forges sits to its left, behind the
+    real address Render's edge recorded.
     """
-    forwarded = headers.get("x-forwarded-for", "")
-    if forwarded:
-        candidate = forwarded.split(",")[-1].strip()
-    else:
-        candidate = (scope.get("client") or ("",))[0]
-    try:
-        return ipaddress.ip_address(candidate) in ANTHROPIC_EGRESS
-    except ValueError:
-        return False
+    chain = [p.strip() for p in headers.get("x-forwarded-for", "").split(",") if p.strip()]
+    if not chain:
+        chain = [(scope.get("client") or ("",))[0]]
+
+    for raw in reversed(chain):
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            continue
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            continue
+        return addr
+    return None
+
+
+def _from_anthropic(headers: Dict[str, str], scope) -> bool:
+    addr = _client_ip(headers, scope)
+    return addr is not None and addr in ANTHROPIC_EGRESS
 
 
 async def _send_json(send, status: int, body: Dict[str, Any], extra_headers=None) -> None:
@@ -721,7 +740,13 @@ def main() -> None:
         stateless_http=True,  # No session affinity needed, so a restart drops nothing.
         transport_security=security,
     )
-    app = BearerAuthMiddleware(app, token=token, restrict_ips=not args.allow_any_ip)
+    # Escape hatch: the IP allowlist is defence-in-depth behind the token, so it
+    # must never be the thing that blocks a working deploy. Set
+    # MCP_RESTRICT_IPS=false if the platform's proxy chain defeats it.
+    restrict = not args.allow_any_ip and os.getenv("MCP_RESTRICT_IPS", "true").lower() != "false"
+    if not restrict:
+        print("[auth] IP allowlist DISABLED — bearer token is the only control.", flush=True)
+    app = BearerAuthMiddleware(app, token=token, restrict_ips=restrict)
 
     _start_cache_warmer()
     uvicorn.run(app, host="0.0.0.0", port=args.port)
