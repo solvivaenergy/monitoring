@@ -1,0 +1,8 @@
+# Self-contained deps for solviva_mcp.py. Deliberately NOT layered on top of
+# api/requirements.txt: that file pins uvicorn==0.30.6 for the FastAPI service,
+# while mcp needs uvicorn>=0.31.1, and pip cannot satisfy both. The MCP server
+# imports nothing from FastAPI, so it takes uvicorn from mcp instead.
+mcp[cli]==2.2.0
+supabase==2.13.0
+httpx==0.27.2
+python-dotenv==1.0.0

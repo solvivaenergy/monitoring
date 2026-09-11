@@ -71,3 +71,33 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_KEY
         sync: false
+
+  # Cross-system MCP server for Claude Teams (read-only, shared service token).
+  # Must NOT be plan: free — a cold start blows Claude's 10s connector timeout.
+  - type: web
+    name: solviva-mcp
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile.mcp
+    healthCheckPath: /healthz
+    envVars:
+      - key: MCP_SERVICE_TOKEN
+        sync: false
+      - key: MCP_PUBLIC_HOST
+        sync: false
+      - key: SOLIS_CLOUD_KEY_ID
+        sync: false
+      - key: SOLIS_CLOUD_KEY_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: ODOO_SH_URL
+        sync: false
+      - key: ODOO_SH_DB
+        sync: false
+      - key: ODOO_SH_USER
+        sync: false
+      - key: ODOO_SH_API_KEY
+        sync: false

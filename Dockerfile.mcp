@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements-mcp.txt .
+RUN pip install --no-cache-dir -r requirements-mcp.txt
+COPY api/ ./api/
+COPY solviva_mcp.py .
+EXPOSE 8081
+CMD ["python", "solviva_mcp.py", "--http"]
