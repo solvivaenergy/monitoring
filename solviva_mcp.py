@@ -657,7 +657,21 @@ class BearerAuthMiddleware:
         # do not serve, and the connector would fail with "Couldn't reach the MCP
         # server". This server uses a fixed shared credential, which Claude sends
         # as a configured request header rather than discovering.
-        if not hmac.compare_digest(headers.get("authorization", ""), self.expected):
+        supplied = headers.get("authorization", "")
+        if not hmac.compare_digest(supplied, self.expected):
+            # Distinguish "the client sent no credential" from "the credential is
+            # wrong" — the two have completely different fixes, and from outside
+            # both look like an identical 401. Never log the token itself.
+            if not supplied:
+                detail = "no Authorization header sent"
+            elif not supplied.startswith("Bearer "):
+                detail = f"Authorization header missing 'Bearer ' prefix (starts {supplied[:8]!r})"
+            else:
+                detail = (
+                    f"token mismatch: got {len(supplied) - 7} chars, "
+                    f"expected {len(self.expected) - 7}"
+                )
+            print(f"[auth] 401 on {scope['path']} — {detail}", flush=True)
             await _send_json(send, 401, {"error": "invalid_token"})
             return
 
