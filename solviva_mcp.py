@@ -667,13 +667,24 @@ class BearerAuthMiddleware:
 def _client_ip(headers: Dict[str, str], scope) -> Optional[ipaddress._BaseAddress]:
     """The caller's real public IP, as seen through Render's proxy chain.
 
-    X-Forwarded-For is client-supplied first, then appended to by each proxy, so
-    neither end of the list is reliable on its own: the first entries are forged
-    by whoever wants, and the last entries are Render's own internal hops. Walk
-    from the right and take the first PUBLIC address — everything to its right is
-    infrastructure, and anything a client forges sits to its left, behind the
-    real address Render's edge recorded.
+    Render fronts every service with Cloudflare, which sets CF-Connecting-IP to
+    the true client address and overwrites whatever the client sent — so that
+    header is both authoritative and unforgeable here, and it is checked first.
+
+    The X-Forwarded-For fallback exists for running behind some other proxy. It
+    walks from the right and takes the first PUBLIC address, because leading
+    entries are client-supplied and trailing entries are internal hops. Note this
+    fallback is exactly what fails on Cloudflare: its edge IPs (172.64.0.0/13 and
+    friends) are public, so the walk stops at Cloudflare instead of the caller.
     """
+    for header in ("cf-connecting-ip", "true-client-ip"):
+        raw = headers.get(header, "").strip()
+        if raw:
+            try:
+                return ipaddress.ip_address(raw)
+            except ValueError:
+                pass
+
     chain = [p.strip() for p in headers.get("x-forwarded-for", "").split(",") if p.strip()]
     if not chain:
         chain = [(scope.get("client") or ("",))[0]]
