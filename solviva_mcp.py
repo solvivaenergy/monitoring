@@ -43,7 +43,12 @@ from api.onboard_from_station_csv import (
     get_existing_station_ids,
     load_environment,
 )
-from api.onboard_from_odoo import DEFAULT_FIELD_NAME, fetch_leads_with_station_id
+from api.onboard_from_odoo import (
+    DEFAULT_FIELD_NAME,
+    _build_odoo_config,
+    _connect_odoo,
+    fetch_leads_with_station_id,
+)
 from api.sync_to_supabase import _daily_consumption_kwh, _to_float
 
 load_environment()
@@ -151,6 +156,181 @@ def _station_summary(rec: Dict[str, Any], onboarded: Set[str]) -> Dict[str, Any]
     }
 
 
+# --------------------------------------------------------------------------
+# Generic Odoo reads.
+#
+# Open by default: ODOO_ALLOWED_MODELS is unset, so any model the credential can
+# read is readable here. Odoo's own record rules still apply — under the current
+# `admin` user that already denies hr.contract, hr.payslip and mail.message.
+#
+# To narrow it later, set ODOO_ALLOWED_MODELS to a comma-separated list, e.g.
+#   ODOO_ALLOWED_MODELS=crm.lead,res.partner,sale.order
+# That becomes the whole boundary again without a code change. The suggested
+# starting list is kept below for whenever that happens.
+# --------------------------------------------------------------------------
+ALLOW_ALL_MODELS = "*"
+SUGGESTED_ALLOWED_MODELS = (
+    "crm.lead,res.partner,sale.order,project.project,"
+    "helpdesk.ticket,product.template,crm.stage,crm.team"
+)
+MAX_ODOO_ROWS = 200
+
+_odoo_session: Optional[tuple] = None
+
+
+def _allowed_models() -> Set[str]:
+    """Empty set means unrestricted — every model the credential can read."""
+    raw = os.getenv("ODOO_ALLOWED_MODELS", ALLOW_ALL_MODELS).strip()
+    if raw in ("", ALLOW_ALL_MODELS):
+        return set()
+    return {m.strip() for m in raw.split(",") if m.strip()}
+
+
+def _odoo() -> tuple:
+    """(config, uid, models proxy), authenticating once per process."""
+    global _odoo_session
+    if _odoo_session is None:
+        cfg = _build_odoo_config()
+        uid, models = _connect_odoo(cfg)
+        _odoo_session = (cfg, uid, models)
+    return _odoo_session
+
+
+def _check_model(model: str) -> Optional[Dict[str, Any]]:
+    allowed = _allowed_models()
+    if allowed and model not in allowed:
+        return {
+            "error": "model_not_allowed",
+            "model": model,
+            "allowed_models": sorted(allowed),
+            "detail": (
+                "This server exposes a fixed allow-list of Odoo models. Ask an "
+                "administrator to add it to ODOO_ALLOWED_MODELS if it is needed."
+            ),
+        }
+    return None
+
+
+@mcp.tool(
+    description=(
+        "List the Odoo models this server is allowed to read, with a record count "
+        "for each. Call this first when you need Odoo data and are unsure what is "
+        "available — querying a model outside the list is refused."
+    ),
+    annotations=READ_ONLY,
+)
+def odoo_list_models() -> Dict[str, Any]:
+    cfg, uid, models = _odoo()
+    allowed = _allowed_models()
+
+    if not allowed:
+        # Unrestricted: report what Odoo itself exposes, so the caller sees the
+        # real surface rather than a curated one.
+        installed = models.execute_kw(
+            cfg.db, uid, cfg.auth, "ir.model", "search_read",
+            [[["transient", "=", False]]], {"fields": ["model", "name"], "order": "model"},
+        )
+        return {
+            "restriction": "none — every model the Odoo credential can read",
+            "note": (
+                "Odoo's own access rules still apply; some models will refuse on query. "
+                "Call odoo_model_fields before odoo_search_read to get real field names."
+            ),
+            "model_count": len(installed),
+            "models": [{"model": m["model"], "name": m["name"]} for m in installed],
+            "max_rows_per_query": MAX_ODOO_ROWS,
+        }
+
+    out = []
+    for model in sorted(allowed):
+        try:
+            count = models.execute_kw(cfg.db, uid, cfg.auth, model, "search_count", [[]])
+            out.append({"model": model, "records": count})
+        except Exception as exc:
+            out.append({"model": model, "error": str(exc)[:120]})
+    return {
+        "restriction": "ODOO_ALLOWED_MODELS is set",
+        "allowed_models": out,
+        "max_rows_per_query": MAX_ODOO_ROWS,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Describe the fields of an allowed Odoo model — name, type, label and "
+        "relation. Use this before odoo_search_read so you request real field names "
+        "rather than guessing, and to discover the x_studio_* custom fields."
+    ),
+    annotations=READ_ONLY,
+)
+def odoo_model_fields(model: str) -> Dict[str, Any]:
+    blocked = _check_model(model)
+    if blocked:
+        return blocked
+    cfg, uid, models = _odoo()
+    meta = models.execute_kw(
+        cfg.db, uid, cfg.auth, model, "fields_get", [],
+        {"attributes": ["string", "type", "relation", "required"]},
+    )
+    fields = [
+        {
+            "name": name,
+            "label": info.get("string"),
+            "type": info.get("type"),
+            "relation": info.get("relation"),
+            "required": info.get("required", False),
+        }
+        for name, info in sorted(meta.items())
+    ]
+    return {"model": model, "field_count": len(fields), "fields": fields}
+
+
+@mcp.tool(
+    description=(
+        "Read records from an allowed Odoo model. `domain` is an Odoo search domain "
+        "as a list of [field, operator, value] triples, e.g. "
+        "[[\"stage_id.name\", \"=\", \"Installed\"]] — omit it to match everything. "
+        "`fields` is required: name the columns you need, since models have hundreds. "
+        "Read-only; there is no way to create, update or delete through this server."
+    ),
+    annotations=READ_ONLY,
+)
+def odoo_search_read(
+    model: str,
+    fields: List[str],
+    domain: Optional[List] = None,
+    limit: int = 50,
+    offset: int = 0,
+    order: Optional[str] = None,
+) -> Dict[str, Any]:
+    blocked = _check_model(model)
+    if blocked:
+        return blocked
+    if not fields:
+        return {"error": "fields_required", "detail": "Name the fields you need; call odoo_model_fields to discover them."}
+
+    capped = max(1, min(int(limit), MAX_ODOO_ROWS))
+    cfg, uid, models = _odoo()
+    opts: Dict[str, Any] = {"fields": list(fields), "limit": capped, "offset": max(0, int(offset))}
+    if order:
+        opts["order"] = order
+
+    try:
+        rows = models.execute_kw(cfg.db, uid, cfg.auth, model, "search_read", [domain or []], opts)
+        total = models.execute_kw(cfg.db, uid, cfg.auth, model, "search_count", [domain or []])
+    except Exception as exc:
+        return {"error": "odoo_query_failed", "model": model, "detail": str(exc)[:300]}
+
+    return {
+        "model": model,
+        "matched": total,
+        "returned": len(rows),
+        "limit_applied": capped,
+        "truncated": total > (opts["offset"] + len(rows)),
+        "records": rows,
+    }
+
+
 @mcp.tool(
     description=(
         "Search the Solis Cloud fleet by station name, owner email, station id or "
@@ -238,6 +418,11 @@ async def client_360(query: str) -> Dict[str, Any]:
     sb = build_supabase()
     stations = await _fetch_all_solis_stations(build_solis())
 
+    # user_profiles has no email column — the account email lives in auth.users,
+    # so it takes an admin lookup. Invert the email->id map once per call (~0.8s
+    # for the whole tenant) rather than querying per matched station.
+    email_by_user_id = {uid: email for email, uid in get_auth_users_by_email(sb).items()}
+
     matched = [
         rec
         for rec in stations
@@ -281,6 +466,8 @@ async def client_360(query: str) -> Dict[str, Any]:
                 {
                     "user_id": uid,
                     "full_name": profile[0].get("full_name"),
+                    "email": email_by_user_id.get(uid),
+                    "phone": profile[0].get("phone"),
                     "address": profile[0].get("address"),
                     "last_7_readings": [
                         {
