@@ -195,18 +195,27 @@ def _load_existing_rows(
     day_start: str,
     day_end: str,
 ) -> Dict[str, Dict[int, str]]:
-    existing_by_user: Dict[str, Dict[int, str]] = {}
+    # Keyed on system_id, NOT user_id.
+    #
+    # This index decides whether a Solis data point is already stored. Keyed on
+    # user_id, a customer's second station found the FIRST station's row at the
+    # same timestamp, concluded the point was already present and `continue`d —
+    # so the second station's readings were silently discarded all day, except
+    # its latest timestamp, which overwrote the first station's. The failure was
+    # invisible: no error, and the log line still reported intervals parsed.
+    existing_by_system: Dict[str, Dict[int, str]] = {}
     offset = 0
 
     while True:
+        start = offset
         batch = _execute_with_retry(
             "load existing five-minute rows",
-            lambda: (
+            lambda s=start: (
                 sb.table("energy_readings_five_minutes")
-                .select("id, user_id, timestamp")
+                .select("id, system_id, timestamp")
                 .gte("timestamp", day_start)
                 .lt("timestamp", day_end)
-                .range(offset, offset + SUPABASE_PAGE_SIZE - 1)
+                .range(s, s + SUPABASE_PAGE_SIZE - 1)
             ),
         ).data or []
 
@@ -214,15 +223,15 @@ def _load_existing_rows(
             break
 
         for row in batch:
-            user_rows = existing_by_user.setdefault(row["user_id"], {})
-            user_rows[_normalize_timestamp_key(row["timestamp"])] = row["id"]
+            system_rows = existing_by_system.setdefault(row["system_id"], {})
+            system_rows[_normalize_timestamp_key(row["timestamp"])] = row["id"]
 
         if len(batch) < SUPABASE_PAGE_SIZE:
             break
 
         offset += SUPABASE_PAGE_SIZE
 
-    return existing_by_user
+    return existing_by_system
 
 
 def _purge_old_rows(sb: Client, day_start: str) -> Optional[int]:
@@ -251,26 +260,15 @@ async def _ensure_active_system(
     user_id: str,
     station_id: str,
 ) -> str:
-    existing = system_ids.get(user_id)
-    if existing:
-        return existing
-
-    station = await solis.station_detail(station_id)
-    insert_resp = _execute_with_retry(
-        "create active solar system",
-        lambda: sb.table("solar_systems").insert({
-            "user_id": user_id,
-            "system_name": station.get("stationName") or station_id,
-            "capacity_kwp": _to_float(station.get("capacity")),
-            "installation_date": datetime.now(PHT).date().isoformat(),
-            "address": "-",
-            "status": "active",
-        }),
+    raise NotImplementedError(
+        "Removed. This created a solar_systems row when its user_id lookup "
+        "missed, with address '-'. Together with the daily sync's '—' insert "
+        "it produced the 104 duplicate pairs of 2026-08-10 and 2026-08-20: "
+        "both crons ran 'find an active row for this user, else INSERT', they "
+        "overlap at 18:00 UTC, and there was no unique constraint to stop them. "
+        "A sync job must never create a station. Onboarding does that, and "
+        "migration 04's UNIQUE(user_id, solis_station_id) now enforces it."
     )
-    system_id = insert_resp.data[0]["id"]
-    system_ids[user_id] = system_id
-    log.info("Created active solar_systems row for user %s", user_id)
-    return system_id
 
 
 async def _fetch_station_day(
@@ -296,21 +294,52 @@ async def sync_once(dry_run: bool = False) -> int:
     sb = build_supabase()
     solis = build_solis()
 
-    users_resp = _execute_with_retry(
-        "load mapped user profiles",
-        lambda: sb.table("user_profiles").select("id, full_name, solis_station_id").not_.is_("solis_station_id", "null"),
-    )
-    users = users_resp.data or []
+    # The unit of work is a STATION, not a user. This was two queries joined by
+    # a dict keyed on user_id:
+    #     system_ids = {row["user_id"]: row["id"] for row in ...}
+    # which is last-wins — a customer with two systems silently collapsed to
+    # whichever row PostgREST returned last, and BOTH stations' 5-minute points
+    # were then written against it. solar_systems.solis_station_id (migration
+    # 04) makes the station the primary record, so the join is unnecessary.
+    #
+    # Paginated: an unbounded PostgREST select silently truncates at 1000 rows.
+    stations: List[dict] = []
+    page_size = 1000
+    offset = 0
+    while True:
+        start = offset
+        page = _execute_with_retry(
+            "load active stations",
+            lambda s=start: (
+                sb.table("solar_systems")
+                .select("id, user_id, solis_station_id, system_name")
+                .not_.is_("solis_station_id", "null")
+                .eq("status", "active")
+                .order("id")
+                .range(s, s + page_size - 1)
+            ),
+        ).data or []
+        stations.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
 
-    if not users:
-        log.info("No users with solis_station_id mapped. Nothing to sync.")
+    if not stations:
+        log.info("No active stations with a solis_station_id. Nothing to sync.")
         return 0
 
-    systems_resp = _execute_with_retry(
-        "load active solar systems",
-        lambda: sb.table("solar_systems").select("id, user_id, status").eq("status", "active"),
-    )
-    system_ids = {row["user_id"]: row["id"] for row in (systems_resp.data or [])}
+    # Shape each station like the old `user` dict so downstream code (which
+    # reads user["id"], user["solis_station_id"], user["full_name"]) is
+    # unchanged, but carry system_id explicitly rather than deriving it.
+    users = [
+        {
+            "id": s["user_id"],
+            "full_name": s.get("system_name") or s["solis_station_id"],
+            "solis_station_id": s["solis_station_id"],
+            "system_id": s["id"],
+        }
+        for s in stations
+    ]
 
     today = datetime.now(PHT).date()
     day_start = f"{today.isoformat()}T00:00:00+08:00"
@@ -318,7 +347,7 @@ async def sync_once(dry_run: bool = False) -> int:
     today_str = today.isoformat()
     deleted_count = _purge_old_rows(sb, day_start)
     log.info("Purged %s old 5-minute row(s) before syncing %s.", deleted_count or 0, today_str)
-    existing_by_user = _load_existing_rows(sb, day_start, day_end)
+    existing_by_system = _load_existing_rows(sb, day_start, day_end)
     has_lifetime_earning = _has_lifetime_earning_column(sb)
     if not has_lifetime_earning:
         log.warning(
@@ -328,18 +357,12 @@ async def sync_once(dry_run: bool = False) -> int:
 
     prepared_users: List[dict] = []
 
-    for user in users:
-        user_id = user["id"]
-        station_id = user["solis_station_id"]
-
-        try:
-            system_id = await _ensure_active_system(sb, solis, system_ids, user_id, station_id)
-            prepared_users.append({**user, "system_id": system_id})
-
-        except SolisCloudError as exc:
-            log.error("Solis API error for %s (station %s): %s", user_id, station_id, exc)
-        except Exception as exc:
-            log.error("Sync failed for %s (station %s): %s", user_id, station_id, exc)
+    # Every station already carries its system_id, so there is nothing to
+    # resolve and nothing to create. _ensure_active_system used to INSERT a
+    # solar_systems row here when its user_id lookup missed — the '-' half of
+    # the 104 duplicate pairs, racing the daily cron's '—' insert at 18:00 UTC.
+    # Station creation belongs to onboarding; this cron only reads.
+    prepared_users = users
 
     fetch_sem = asyncio.Semaphore(SOLIS_CONCURRENCY)
     fetch_results = await asyncio.gather(*[
@@ -387,7 +410,8 @@ async def sync_once(dry_run: bool = False) -> int:
             log.info("%s: Solis returned no parseable 5-minute points", name)
             continue
 
-        existing_by_ts = existing_by_user.get(user_id, {})
+        # Look up THIS STATION's already-stored points, not the customer's.
+        existing_by_ts = existing_by_system.get(system_id, {})
         latest_ts = max(ts_key for ts_key, _ in parsed_rows)
         inserts: List[dict] = []
         updates: List[Tuple[str, dict]] = []
@@ -421,7 +445,7 @@ async def sync_once(dry_run: bool = False) -> int:
     for batch in _chunked(all_inserts, SUPABASE_BATCH_SIZE):
         (
             sb.table("energy_readings_five_minutes")
-            .upsert(batch, on_conflict="user_id,timestamp")
+            .upsert(batch, on_conflict="system_id,timestamp")
             .execute()
         )
 
@@ -435,7 +459,7 @@ async def sync_once(dry_run: bool = False) -> int:
         for batch in _chunked(all_inserts, SUPABASE_BATCH_SIZE):
             _execute_with_retry(
                 f"upsert batch of {len(batch)} five-minute rows",
-                lambda batch=batch: sb.table("energy_readings_five_minutes").upsert(batch, on_conflict="user_id,timestamp"),
+                lambda batch=batch: sb.table("energy_readings_five_minutes").upsert(batch, on_conflict="system_id,timestamp"),
             )
 
     return total_written

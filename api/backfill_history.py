@@ -86,7 +86,7 @@ def load_station_ids_from_csv(csv_path: str) -> set[str]:
     return station_ids
 
 
-def parse_month_day(day: dict) -> Optional[dict]:
+def parse_month_day(day: dict, capacity_kwp: float = 0.0) -> Optional[dict]:
     """Convert a stationMonth day record into an energy_reading row fragment.
     Returns None if dateStr is missing."""
     date_str = day.get("dateStr")
@@ -115,6 +115,10 @@ def parse_month_day(day: dict) -> Optional[dict]:
     daily_earning = float(day.get("money") or 0)
     battery_charge_kwh = float(day.get("batteryChargeEnergy") or 0)
     battery_discharge_kwh = float(day.get("batteryDischargeEnergy") or 0)
+    # Solis-provided full load hours (dailyYield / rated capacity); fall back to a manual calc.
+    full_load_hours = _to_float(day.get("fullHour"))
+    if full_load_hours <= 0 and capacity_kwp > 0:
+        full_load_hours = production_kwh / capacity_kwp
 
     return {
         "date_str": date_str,
@@ -125,6 +129,7 @@ def parse_month_day(day: dict) -> Optional[dict]:
         "daily_earning": round(daily_earning, 2),
         "battery_charge_kwh": round(battery_charge_kwh, 4),
         "battery_discharge_kwh": round(battery_discharge_kwh, 4),
+        "full_load_hours": round(full_load_hours, 4),
         "battery_level": None,
         "battery_status": None,
     }
@@ -152,8 +157,23 @@ def sb_batch_upsert(sb, rows):
         batch = rows[batch_start:batch_start + SUPABASE_BATCH_SIZE]
         for attempt in range(5):
             try:
+                # Must match the unique index created by migration 05,
+                # energy_readings_system_ts_uk (system_id, "timestamp").
+                #
+                # Was "user_id,timestamp", which made a second station for the
+                # same customer collide with the first on every shared day and
+                # silently overwrite it. system_id functionally determines
+                # user_id (0 cross-linked rows in 114,858), so user_id adds
+                # nothing to the key and would re-introduce the collision if a
+                # station is ever reassigned — which is exactly what the back
+                # office exists to do.
+                #
+                # DEPLOY ORDER: migration 05 adds this index and MUST be applied
+                # before this code ships. Migration 06 drops the old key and
+                # MUST be applied after. Running 06 early makes every upsert
+                # here fail with 42P10 (no matching ON CONFLICT specification).
                 sb.table("energy_readings").upsert(
-                    batch, on_conflict="user_id,timestamp"
+                    batch, on_conflict="system_id,timestamp"
                 ).execute()
                 break
             except Exception as e:
@@ -195,40 +215,79 @@ async def main():
     # ── Pre-load all data upfront (2 queries instead of 532) ──────────
     log.info("Pre-loading user profiles, solar systems, and existing readings...")
 
-    resp = (
-        sb.table("user_profiles")
-        .select("id, full_name, solis_station_id")
-        .not_.is_("solis_station_id", "null")
-        .execute()
-    )
-    users = resp.data or []
+    # The unit of work is a STATION. This used to read user_profiles (one
+    # scalar station per customer) and then resolve the system through:
+    #     system_ids = {}                      # user_id -> system UUID
+    #     for row in ss_resp.data:
+    #         if row["status"] == "active":
+    #             system_ids[row["user_id"]] = row["id"]
+    # an unordered last-wins dict. For the 104 duplicate-pair users it picked a
+    # row that was NOT the one holding their latest reading in 100 of 104 cases,
+    # so the backfill wrote against the half-history row. That was invisible
+    # only because the old conflict key (user_id, timestamp) ignored system_id;
+    # under the new (system_id, timestamp) key it would create a duplicate row
+    # per station per day. Iterating solar_systems directly removes the
+    # ambiguity rather than trying to resolve it.
+    #
+    # Paginated: an unbounded PostgREST select caps at 1000 rows and truncates
+    # SILENTLY. At 719 systems that is invisible today; past 1000 stations would
+    # simply vanish from the backfill with no error.
+    stations = []
+    page_size = 1000
+    offset = 0
+    while True:
+        page = (
+            sb.table("solar_systems")
+            .select("id, user_id, solis_station_id, system_name, installation_date")
+            .not_.is_("solis_station_id", "null")
+            .eq("status", "active")
+            .order("id")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        ).data or []
+        stations.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    # Shape as the downstream code expects, but carry system_id explicitly so
+    # nothing has to be looked up by user_id again.
+    users = [
+        {
+            "id": s["user_id"],
+            "full_name": s.get("system_name") or s["solis_station_id"],
+            "solis_station_id": str(s["solis_station_id"]).strip(),
+            "system_id": s["id"],
+            "installation_date": s.get("installation_date"),
+        }
+        for s in stations
+    ]
 
     if station_csv:
         if not os.path.exists(station_csv):
             raise FileNotFoundError(f"station csv not found: {station_csv}")
         station_ids = load_station_ids_from_csv(station_csv)
         before = len(users)
-        users = [u for u in users if str(u.get("solis_station_id") or "").strip() in station_ids]
+        users = [u for u in users if u["solis_station_id"] in station_ids]
         log.info(
-            "Filtered users by station CSV: %d -> %d users (csv station ids=%d)",
+            "Filtered stations by CSV: %d -> %d stations (csv station ids=%d)",
             before,
             len(users),
             len(station_ids),
         )
 
-    # Pre-load ALL solar_systems (id + user_id + installation_date)
-    ss_resp = sb.table("solar_systems").select("id, user_id, installation_date, status").execute()
-    system_ids = {}      # user_id → system UUID
-    install_dates = {}   # user_id → install date string
-    for row in (ss_resp.data or []):
-        if row.get("status") == "active":
-            system_ids[row["user_id"]] = row["id"]
-        if row.get("installation_date"):
-            install_dates[row["user_id"]] = row["installation_date"]
+    # Per-STATION install dates. Keyed on user_id this returned one customer's
+    # other property's install date, backdating the range for the wrong station.
+    system_ids = {u["system_id"]: u["system_id"] for u in users}
+    install_dates = {
+        u["system_id"]: u["installation_date"]
+        for u in users
+        if u.get("installation_date")
+    }
 
     log.info(
-        "Pre-loaded: %d users, %d solar systems.",
-        len(users), len(system_ids),
+        "Pre-loaded: %d station(s) across %d customer(s).",
+        len(users), len({u["id"] for u in users}),
     )
 
     today = datetime.now(PHT).date()
@@ -243,11 +302,14 @@ async def main():
             station_id = user["solis_station_id"]
             name = user.get("full_name", "?")
 
-            # Determine how many days to backfill
+            # Determine how many days to backfill, from THIS station's own
+            # install date. Read via install_dates.get(uid) this returned the
+            # customer's other property's date, so a station installed last
+            # month could be backfilled from a sibling's 2024 commissioning.
             if fixed_days:
                 user_days = fixed_days
             else:
-                install_str = install_dates.get(uid)
+                install_str = user.get("installation_date")
                 if install_str:
                     install_dt = datetime.fromisoformat(install_str).date()
                     user_days = (today - install_dt).days
@@ -258,8 +320,8 @@ async def main():
                 counters["done"] += 1
                 return
 
-            # System ID from pre-loaded data
-            system_id = system_ids.get(uid)
+            # Carried on the row itself — no user_id lookup, so no last-wins.
+            system_id = user["system_id"]
             if not system_id:
                 try:
                     detail = await solis.station_detail(station_id)

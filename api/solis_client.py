@@ -78,6 +78,18 @@ class SolisCloudClient:
     _MAX_RETRIES = 3
     _BACKOFF_BASE = 2.0       # seconds
 
+    # Application-level errors (code != '0') are retried separately from HTTP
+    # 5xx/429, and far more cheaply. They must be retried at all, because code
+    # '1' covers genuine transient outages — but the SAME code is returned for
+    # a station that does not exist, and those never recover. Using the 2/4/8s
+    # HTTP backoff here would spend 14s per unknown station: the last full
+    # backfill logged 1,084 errors over 4,583 calls, which at SOLIS_CONCURRENCY=2
+    # would have added roughly two hours to a 140-minute run. One quick retry
+    # catches the transients (which nearly always clear immediately) without
+    # paying that on every dead station.
+    _API_ERROR_RETRIES = 1
+    _API_ERROR_DELAY = 1.5    # seconds
+
     async def _request(self, path: str, body: Optional[Dict] = None) -> Any:
         """Make a signed POST request to the Solis Cloud API with retry logic."""
         body = body or {}
@@ -120,13 +132,49 @@ class SolisCloudClient:
 
             data = resp.json()
 
-            # Solis API returns {"success": true, "code": "0", "data": {...}}
-            if not data.get("success") and data.get("code") != "0":
-                raise SolisCloudError(
-                    code=data.get("code", "unknown"),
+            # Solis signals success as {"success": true, "code": "0", "data": {...}}.
+            #
+            # This guard used to be `and`:
+            #     if not data.get("success") and data.get("code") != "0":
+            # which never fired for the most common failure, because Solis
+            # returns success=true ALONGSIDE code='1'. Measured live against
+            # /v1/api/stationDetail, all HTTP 200:
+            #     valid id     -> success=True  code='0' data={...}
+            #     unknown id   -> success=True  code='1' data=null
+            #     garbage id   -> success=True  code='1' data=null
+            #     empty id     -> success=False code='1' data=''
+            # `not True` is False, so the two middle rows short-circuited the
+            # whole condition and fell through to `return data.get("data")`,
+            # i.e. None. Callers could not distinguish a failed call from an
+            # empty result, so a Solis outage presented as "this station does
+            # not exist" — precisely the error most likely to make someone
+            # delete a correct station mapping.
+            #
+            # code '1' is irreducibly ambiguous: its msg is "Communication
+            # error. Please refresh and try again later" for BOTH an unknown
+            # station and a genuine outage, and the two payloads are identical
+            # byte for byte. Solis gives us no way to separate them, so we do
+            # not pretend to. It is retried like a 5xx and then raised.
+            #
+            # NEVER infer that a station does not exist from this error. To
+            # answer that question, check the account's station roster
+            # (userStationList / list_stations), which is authoritative.
+            if not data.get("success") or str(data.get("code")) != "0":
+                api_exc = SolisCloudError(
+                    code=str(data.get("code", "unknown")),
                     message=data.get("msg", "Unknown error"),
                     data=data,
                 )
+                if attempt <= self._API_ERROR_RETRIES:
+                    log.warning(
+                        "Solis %s returned code=%s (%s), retrying in %.1fs (attempt %d/%d)",
+                        path, api_exc.code, api_exc.message[:60],
+                        self._API_ERROR_DELAY, attempt, self._API_ERROR_RETRIES + 1,
+                    )
+                    last_exc = api_exc
+                    await asyncio.sleep(self._API_ERROR_DELAY)
+                    continue
+                raise api_exc
 
             # Throttle between successful calls
             await asyncio.sleep(self._RATE_LIMIT_DELAY)

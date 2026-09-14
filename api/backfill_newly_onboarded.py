@@ -139,15 +139,23 @@ async def backfill_station_ids(
     if not target_users:
         return counters
 
+    # Keyed on solis_station_id, NOT user_id. `{str(r["user_id"]): r}` is
+    # last-wins: a customer with two stations collapsed to whichever row
+    # PostgREST returned last, so this backfill wrote one station's history
+    # against the other's system_id. Station id is unique per row (migration
+    # 04's UNIQUE(user_id, solis_station_id)), so this mapping is exact.
     systems = (
         sb.table("solar_systems")
-        .select("id,user_id,installation_date,status")
+        .select("id,user_id,solis_station_id,installation_date,status")
+        .not_.is_("solis_station_id", "null")
         .eq("status", "active")
         .execute()
         .data
         or []
     )
-    sys_by_user: Dict[str, Dict] = {str(r["user_id"]): r for r in systems}
+    sys_by_station: Dict[str, Dict] = {
+        str(r["solis_station_id"]).strip(): r for r in systems
+    }
 
     if skip_users_with_readings:
         with_readings: Set[str] = set()
@@ -183,7 +191,7 @@ async def backfill_station_ids(
         uid = str(user["id"])
         station_id = str(user["solis_station_id"])
         name = user.get("full_name") or uid
-        system = sys_by_user.get(uid)
+        system = sys_by_station.get(station_id)
         system_id = system.get("id") if system else None
 
         if not system_id:
@@ -299,15 +307,23 @@ async def main() -> None:
         print("No user_profiles mapped to CSV station IDs.")
         return
 
+    # Keyed on solis_station_id, NOT user_id. `{str(r["user_id"]): r}` is
+    # last-wins: a customer with two stations collapsed to whichever row
+    # PostgREST returned last, so this backfill wrote one station's history
+    # against the other's system_id. Station id is unique per row (migration
+    # 04's UNIQUE(user_id, solis_station_id)), so this mapping is exact.
     systems = (
         sb.table("solar_systems")
-        .select("id,user_id,installation_date,status")
+        .select("id,user_id,solis_station_id,installation_date,status")
+        .not_.is_("solis_station_id", "null")
         .eq("status", "active")
         .execute()
         .data
         or []
     )
-    sys_by_user: Dict[str, Dict] = {str(r["user_id"]): r for r in systems}
+    sys_by_station: Dict[str, Dict] = {
+        str(r["solis_station_id"]).strip(): r for r in systems
+    }
 
     existing_daily_users: Set[str] = set()
     page_size = 1000
@@ -354,7 +370,7 @@ async def main() -> None:
             station_id = str(user["solis_station_id"])
             name = user.get("full_name") or uid
 
-            system = sys_by_user.get(uid)
+            system = sys_by_station.get(station_id)
             system_id = system.get("id") if system else None
             install_date = None
             if system and system.get("installation_date"):

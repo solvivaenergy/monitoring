@@ -163,29 +163,51 @@ async def _fetch_battery_capacity_kwh(
 async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
     """Run one sync cycle. Returns number of readings written."""
 
-    # 1. Get all users with a mapped Solis station
-    resp = (
-        sb.table("user_profiles")
-        .select("id, full_name, solis_station_id")
-        .not_.is_("solis_station_id", "null")
-        .execute()
-    )
-    users = resp.data or []
+    # 1. Get every active station. The unit of work is a STATION, not a user:
+    #    a customer can own several (Arnel Cipriano Chavez has 3). Sourcing
+    #    from user_profiles.solis_station_id — a single scalar column — made a
+    #    second station structurally unreachable, and picking the system with
+    #    an unordered .limit(1) per user wrote every station's data onto
+    #    whichever row Postgres happened to return first.
+    #
+    #    Paginated deliberately: PostgREST caps an unbounded select at 1000
+    #    rows and truncates SILENTLY. At 719 systems today that is invisible;
+    #    it would start dropping stations from the nightly sync with no error
+    #    the moment the fleet passes 1000.
+    stations = []
+    page_size = 1000
+    offset = 0
+    while True:
+        page = (
+            sb.table("solar_systems")
+            .select("id, user_id, solis_station_id, system_name, capacity_kwp")
+            .not_.is_("solis_station_id", "null")
+            .eq("status", "active")
+            .order("id")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        ).data or []
+        stations.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
 
-    if not users:
-        log.info("No users with solis_station_id mapped — nothing to sync.")
+    if not stations:
+        log.info("No active stations with a solis_station_id — nothing to sync.")
         return 0
 
-    log.info("Found %d user(s) to sync.", len(users))
+    owners = {s["user_id"] for s in stations}
+    log.info("Found %d station(s) across %d customer(s) to sync.", len(stations), len(owners))
     written = 0
 
     now = datetime.now(timezone(timedelta(hours=8)))  # PHT
     current_month = now.strftime("%Y-%m")
 
-    for user in users:
-        user_id: str = user["id"]
-        station_id: str = user["solis_station_id"]
-        name: str = user.get("full_name", "?")
+    for station_row in stations:
+        system_id: str = station_row["id"]
+        user_id: str = station_row["user_id"]
+        station_id: str = str(station_row["solis_station_id"]).strip()
+        name: str = station_row.get("system_name") or station_id
 
         try:
             # 2a. Fetch station detail for system metadata
@@ -203,68 +225,55 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                 log.warning("No stationMonth data for %s — skipping.", name)
                 continue
 
-            # 3. Ensure solar_systems row exists
-            sys_resp = (
+            # 3. Refresh this station's metadata from Solis.
+            #
+            # This block used to be "find an active solar_systems row for this
+            # user, else INSERT one". It no longer creates anything, for two
+            # reasons. First, we are iterating solar_systems, so the row is
+            # guaranteed to exist. Second, that INSERT was half of a live race:
+            # this cron fires at 18:00 UTC and the 15-minute cron at 18:00 and
+            # 18:15, both ran "find, else INSERT" with no unique constraint, and
+            # both won. It produced 104 duplicate rows on 2026-08-20 and
+            # 2026-08-10 — every pair identifiable by its address placeholder,
+            # '-' from the 15-minute sync and '—' from this line. Creating
+            # stations is now the job of onboarding alone, and migration 04's
+            # UNIQUE(user_id, solis_station_id) makes a double-insert impossible
+            # rather than merely unlikely.
+            update_payload = {
+                "system_name": station_name,
+                "capacity_kwp": capacity_kwp,
+                "solis_plant_name": station_name,
+            }
+            if battery_capacity_kwh is not None:
+                update_payload["battery_capacity_kwh"] = battery_capacity_kwh
+
+            # Correct a placeholder installation_date using this STATION's own
+            # oldest reading. Keyed on system_id: for a multi-station customer,
+            # the user's oldest reading may belong to a different station and
+            # would backdate this one to before it was installed.
+            sys_row = (
                 sb.table("solar_systems")
-                .select("id")
-                .eq("user_id", user_id)
-                .eq("status", "active")
-                .limit(1)
+                .select("installation_date")
+                .eq("id", system_id)
+                .single()
                 .execute()
             )
-            # Helper: find the oldest reading timestamp for this user
-            def _oldest_reading_date() -> str:
+            current_install = sys_row.data.get("installation_date") if sys_row.data else None
+            if current_install and current_install >= (now - timedelta(days=30)).strftime("%Y-%m-%d"):
                 oldest = (
                     sb.table("energy_readings")
                     .select("timestamp")
-                    .eq("user_id", user_id)
+                    .eq("system_id", system_id)
                     .order("timestamp", desc=False)
                     .limit(1)
                     .execute()
                 )
-                if oldest.data:
-                    return oldest.data[0]["timestamp"][:10]
-                return now.strftime("%Y-%m-%d")
+                update_payload["installation_date"] = (
+                    oldest.data[0]["timestamp"][:10] if oldest.data
+                    else now.strftime("%Y-%m-%d")
+                )
 
-            if sys_resp.data:
-                system_id = sys_resp.data[0]["id"]
-                update_payload = {
-                    "system_name": station_name,
-                    "capacity_kwp": capacity_kwp,
-                }
-                if battery_capacity_kwh is not None:
-                    update_payload["battery_capacity_kwh"] = battery_capacity_kwh
-                # Backfill installation_date if it was set to a recent placeholder
-                sys_row = (
-                    sb.table("solar_systems")
-                    .select("installation_date")
-                    .eq("id", system_id)
-                    .single()
-                    .execute()
-                )
-                current_install = sys_row.data.get("installation_date") if sys_row.data else None
-                if current_install and current_install >= (now - timedelta(days=30)).strftime("%Y-%m-%d"):
-                    update_payload["installation_date"] = _oldest_reading_date()
-                sb.table("solar_systems").update(update_payload).eq("id", system_id).execute()
-            else:
-                install_date = _oldest_reading_date()
-                insert_payload = {
-                    "user_id": user_id,
-                    "system_name": station_name,
-                    "capacity_kwp": capacity_kwp,
-                    "installation_date": install_date,
-                    "address": "—",
-                    "status": "active",
-                }
-                if battery_capacity_kwh is not None:
-                    insert_payload["battery_capacity_kwh"] = battery_capacity_kwh
-                insert_resp = (
-                    sb.table("solar_systems")
-                    .insert(insert_payload)
-                    .execute()
-                )
-                system_id = insert_resp.data[0]["id"]
-                log.info("Created solar_systems row for %s (system_id=%s)", name, system_id)
+            sb.table("solar_systems").update(update_payload).eq("id", system_id).execute()
 
             # 4. Upsert each day's reading from stationMonth data
             user_written = 0
@@ -280,6 +289,10 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                 daily_earning = float(day.get("money") or 0)
                 battery_charge_kwh = float(day.get("batteryChargeEnergy") or 0)
                 battery_discharge_kwh = float(day.get("batteryDischargeEnergy") or 0)
+                # Solis-provided full load hours (dailyYield / rated capacity); fall back to a manual calc.
+                full_load_hours = _to_float(day.get("fullHour"))
+                if full_load_hours <= 0 and capacity_kwp > 0:
+                    full_load_hours = production_kwh / capacity_kwp
 
                 # Build noon timestamp for this date
                 parts = date_str.split("-")
@@ -301,13 +314,22 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
                     "daily_earning": round(daily_earning, 2),
                     "battery_charge_kwh": round(battery_charge_kwh, 4),
                     "battery_discharge_kwh": round(battery_discharge_kwh, 4),
+                    "full_load_hours": round(full_load_hours, 4),
                 }
 
-                # Check if this day's reading already exists
+                # Check if this day's reading already exists FOR THIS STATION.
+                #
+                # This filter was .eq("user_id", user_id) with no system_id,
+                # so for a customer with two stations the second station's day
+                # matched the first station's row and UPDATED it — one
+                # station's production silently replaced by the other's, with
+                # no error and nothing in the logs. Keying on system_id is the
+                # whole fix; user_id is redundant once system_id is used, since
+                # system_id functionally determines the owner.
                 existing = (
                     sb.table("energy_readings")
                     .select("id")
-                    .eq("user_id", user_id)
+                    .eq("system_id", system_id)
                     .gte("timestamp", f"{date_str}T00:00:00+08:00")
                     .lt("timestamp", f"{date_str}T23:59:59+08:00")
                     .limit(1)
