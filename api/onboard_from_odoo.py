@@ -238,6 +238,7 @@ async def onboard(
         "created_auth_users": 0,
         "used_existing_auth_users": 0,
         "upserted_profiles": 0,
+        "skipped_would_repoint": 0,
         "failed": 0,
     }
     results: List[Dict[str, str]] = []
@@ -296,6 +297,11 @@ def exception_count(report: Dict) -> int:
         + len(skipped.get("duplicate_email", []))
         + len(skipped.get("duplicate_station", []))
         + report.get("counts", {}).get("failed", 0)
+        # A skipped repoint means a customer owns a station we cannot yet model:
+        # actionable, and the multi-station merge worklist. Counting it here
+        # routes it to the existing ALERT_WEBHOOK_URL / ALERT_EMAIL_TO path
+        # rather than inventing a second notification channel.
+        + report.get("counts", {}).get("skipped_would_repoint", 0)
     )
 
 

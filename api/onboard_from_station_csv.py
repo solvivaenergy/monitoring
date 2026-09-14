@@ -118,6 +118,34 @@ def read_csv_rows(csv_path: str) -> List[CsvRow]:
     return rows
 
 
+def get_profile_station_ids(sb: Client) -> Dict[str, str]:
+    """Map user_id -> the solis_station_id currently on that profile.
+
+    Used by run_onboarding to refuse to repoint an existing profile. See the
+    guard there for why.
+    """
+    mapping: Dict[str, str] = {}
+    page_size = 1000
+    offset = 0
+    while True:
+        page = (
+            sb.table("user_profiles")
+            .select("id, solis_station_id")
+            .not_.is_("solis_station_id", "null")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        ).data or []
+        for row in page:
+            sid = str(row.get("solis_station_id") or "").strip()
+            uid = str(row.get("id") or "").strip()
+            if sid and uid:
+                mapping[uid] = sid
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return mapping
+
+
 def get_existing_station_ids(sb: Client) -> Set[str]:
     existing: Set[str] = set()
     page_size = 1000
@@ -327,6 +355,7 @@ def run_onboarding(
         "created_auth_users": 0,
         "used_existing_auth_users": 0,
         "upserted_profiles": 0,
+        "skipped_would_repoint": 0,
         "failed": 0,
     }
     results: List[Dict[str, str]] = []
@@ -338,6 +367,7 @@ def run_onboarding(
         )
 
     email_to_user_id = get_auth_users_by_email(sb)
+    profile_station_ids = get_profile_station_ids(sb)
 
     for c in candidates:
         try:
@@ -385,6 +415,42 @@ def run_onboarding(
             else:
                 counts["used_existing_auth_users"] += 1
 
+            # GUARD — never repoint an existing profile at a different station.
+            #
+            # This upsert is keyed on the primary key, so it REPLACES full_name,
+            # phone and solis_station_id on any profile that already exists.
+            # Candidates are leads whose station is not yet in Supabase, but a
+            # candidate's email can still resolve to an auth user who already
+            # owns a different station. That is exactly the multi-station case:
+            # the second station is a candidate, its email matches the existing
+            # customer, and the upsert silently moves that customer onto it.
+            # The next run sees the first station unmapped and moves them back.
+            #
+            # Observed live on the 18:02 UTC cron of 2026-09-12 — Lynman Bacolor,
+            # Arnel Cipriano Chavez and Nanay Itengs Meter 2 were all repointed,
+            # and `onboarding_runs` shows duplicate_email=1 on 12 consecutive
+            # runs. It also silently reverts any back-office correction.
+            #
+            # Until solar_systems carries solis_station_id (migration 04) and a
+            # customer can hold several stations, the only safe action is to
+            # leave the profile alone and report it. These rows then surface as
+            # skipped_would_repoint and are the multi-station merge worklist.
+            prior_station = profile_station_ids.get(user_id or "")
+            if prior_station and prior_station != c.station_id:
+                counts["skipped_would_repoint"] += 1
+                results.append(
+                    {
+                        "station_id": c.station_id,
+                        "email": c.email,
+                        "full_name": c.station_name,
+                        "phone": c.phone,
+                        "status": "skipped_would_repoint",
+                        "auth_action": action,
+                        "existing_station_id": prior_station,
+                    }
+                )
+                continue
+
             profile_payload = {
                 "id": user_id or "<dry-run-user-id>",
                 "full_name": c.station_name,
@@ -394,6 +460,8 @@ def run_onboarding(
 
             if apply and user_id:
                 sb.table("user_profiles").upsert(profile_payload).execute()
+                if user_id:
+                    profile_station_ids[user_id] = c.station_id
 
             counts["upserted_profiles"] += 1
             results.append(
@@ -448,6 +516,7 @@ def print_summary(
         print(f"Auth users to create:     {counts['created_auth_users']}")
         print(f"Use existing auth users:  {counts['used_existing_auth_users']}")
         print(f"Profiles to upsert:       {counts['upserted_profiles']}")
+        print(f"Skipped (would repoint):  {counts.get('skipped_would_repoint', 0)}")
         print(f"Failed:                   {counts['failed']}")
     print("=" * 72)
 
