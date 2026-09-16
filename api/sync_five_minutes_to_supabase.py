@@ -542,25 +542,23 @@ async def sync_once(dry_run: bool = False) -> int:
     if dry_run:
         return total_written
 
+    # One upsert pass, with retry. Until 2026-09-16 the inserts were upserted
+    # TWICE — a retry-less loop here and the retrying loop below, identical
+    # batches — and the "latest point" refresh was a separate UPDATE per
+    # station, ~520 sequential round-trips. On a full table (~125k rows) that
+    # write phase took ~11 minutes of a run that has a 15-minute slot. When a
+    # run overruns, Render skips the next one, and the feed measured on
+    # 2026-09-16 was landing every ~40 minutes instead of every 15.
+    #
+    # The refreshed latest rows go through the same upsert: ON CONFLICT
+    # (system_id, "timestamp") updates them in place, which is exactly what
+    # update(row).eq("id", ...) did, in 1/500th of the requests.
+    all_inserts.extend(row for _, row in all_updates)
     for batch in _chunked(all_inserts, SUPABASE_BATCH_SIZE):
-        (
-            sb.table("energy_readings_five_minutes")
-            .upsert(batch, on_conflict="system_id,timestamp")
-            .execute()
-        )
-
-    for row_id, row in all_updates:
         _execute_with_retry(
-            "update latest five-minute row",
-            lambda: sb.table("energy_readings_five_minutes").update(row).eq("id", row_id),
+            f"upsert batch of {len(batch)} five-minute rows",
+            lambda batch=batch: sb.table("energy_readings_five_minutes").upsert(batch, on_conflict="system_id,timestamp"),
         )
-
-    if all_inserts:
-        for batch in _chunked(all_inserts, SUPABASE_BATCH_SIZE):
-            _execute_with_retry(
-                f"upsert batch of {len(batch)} five-minute rows",
-                lambda batch=batch: sb.table("energy_readings_five_minutes").upsert(batch, on_conflict="system_id,timestamp"),
-            )
 
     return total_written
 
