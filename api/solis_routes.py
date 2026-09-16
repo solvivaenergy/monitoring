@@ -5,15 +5,60 @@ All endpoints require SOLIS_CLOUD_KEY_ID and SOLIS_CLOUD_KEY_SECRET
 to be set in the .env file.
 """
 
+import hmac
+import logging
 import os
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from .solis_client import SolisCloudClient, SolisCloudError
 
-router = APIRouter(prefix="/solis", tags=["Solis Cloud"])
+log = logging.getLogger(__name__)
+
+
+async def _require_token(authorization: str = Header(default="")) -> None:
+    """Gate every /solis/* route behind a shared token.
+
+    These 16 routes had no authentication of any kind. Verified live on
+    2026-09-15: an anonymous GET to /solis/stations returned HTTP 200 with the
+    whole fleet — 648 stations, every customer's name, station id, installer and
+    data-logger serial. They proxy our Solis credentials, so they are effectively
+    a public read API over the entire customer base.
+
+    A shared token is the minimum that closes it without rewriting the callers.
+    It is NOT per-user authorisation: anyone holding the token still sees the
+    whole fleet, so it must not be embedded in the customer-facing dashboard or
+    the mobile bundle. Customer-scoped data belongs on /app/*, which
+    authenticates the Supabase JWT and resolves that user's own stations.
+
+    Set SOLIS_API_TOKEN in the Render environment. If it is unset the routes
+    refuse to serve rather than falling open — an unset secret must never mean
+    "no authentication required".
+    """
+    expected = os.getenv("SOLIS_API_TOKEN", "")
+    if not expected:
+        log.error("SOLIS_API_TOKEN is not configured; refusing all /solis/* requests")
+        raise HTTPException(
+            status_code=503,
+            detail="This endpoint is not configured for access.",
+        )
+
+    supplied = ""
+    if authorization.startswith("Bearer "):
+        supplied = authorization[7:]
+
+    # compare_digest, not ==, so a wrong token cannot be recovered by timing.
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+router = APIRouter(
+    prefix="/solis",
+    tags=["Solis Cloud"],
+    dependencies=[Depends(_require_token)],
+)
 
 
 def _get_client() -> SolisCloudClient:

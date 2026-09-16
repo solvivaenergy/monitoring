@@ -11,6 +11,17 @@ services:
         sync: false
       - key: SOLIS_CLOUD_KEY_SECRET
         sync: false
+      # Shared bearer token gating /solis/*. Those 16 routes proxy our Solis
+      # credentials and return the whole 648-station fleet with customer names;
+      # until 2026-09-15 they had no authentication at all. The routes fail
+      # CLOSED (503) when this is unset, so it must be set in the Render
+      # dashboard before the next deploy or /solis/* stops serving.
+      #
+      # It is a fleet-wide credential, not per-customer authorisation. Never
+      # ship it in a browser bundle or a mobile app; customer-scoped data
+      # belongs on /app/*, which authenticates the Supabase JWT.
+      - key: SOLIS_API_TOKEN
+        sync: false
 
   # Daily sync cron: Solis → Supabase (2:00 AM PHT via Render cron)
   - type: cron

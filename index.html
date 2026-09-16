@@ -383,8 +383,36 @@ let dayChartInstance = null;
 let monthChartInstance = null;
 
 // ── Fetch helpers ──
+// INTERNAL TOOL — NOT FOR PUBLIC HOSTING.
+//
+// This page was published to GitHub Pages at solvivaenergy.github.io/monitoring
+// until 2026-09-15. Because the Pages workflow uploaded the whole repo root
+// (`path: .`), it served the entire fleet view AND every tracked source file —
+// including api/provision_users.py, which carried a hardcoded customer password.
+// Pages has been retired; do not re-publish this file to any public host.
+//
+// /solis/* now requires SOLIS_API_TOKEN. That token grants fleet-wide access to
+// every customer's data, so it is prompted for and kept in this browser only.
+// If you ever need a customer-facing dashboard, build it against /app/*, which
+// authenticates a Supabase JWT and returns only that user's own stations.
+function solisToken() {
+  let t = localStorage.getItem('SOLIS_API_TOKEN');
+  if (!t) {
+    t = window.prompt('Enter the Solis API token (internal use only):') || '';
+    if (t) localStorage.setItem('SOLIS_API_TOKEN', t);
+  }
+  return t;
+}
+
 async function apiFetch(path) {
-  const resp = await fetch(`${API_BASE}${path}`);
+  const headers = {};
+  const token = solisToken();
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const resp = await fetch(`${API_BASE}${path}`, { headers });
+  if (resp.status === 401) {
+    localStorage.removeItem('SOLIS_API_TOKEN');
+    throw new Error('Unauthorized — the Solis API token was rejected. Reload to re-enter it.');
+  }
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }));
     throw new Error(err.detail || resp.statusText);

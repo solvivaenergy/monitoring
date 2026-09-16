@@ -34,7 +34,16 @@ from supabase import create_client, Client
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("provision")
 
-DEFAULT_PASSWORD = "solviva$upremacy2026"
+# The password every provisioned account starts with. This was a hardcoded
+# literal in this file from 2026-03-26 until 2026-09-16, in a public repo that
+# GitHub Pages also served as static content — so every account this script
+# created shares a password that anyone could read. Rotation is handled by
+# api/rotate_leaked_passwords.py.
+#
+# It now comes from the environment and there is deliberately no fallback:
+# provisioning must fail loudly rather than quietly mint accounts on a known
+# password. Same env var as api/onboard_from_station_csv.py.
+DEFAULT_PASSWORD_ENV = "DEFAULT_USER_PASSWORD"
 REPORT_PATH = os.path.join(_here, "..", "odoo_solis_match_report.json")
 
 
@@ -184,6 +193,11 @@ def main():
         return
 
     # 5. Create users in Supabase
+    default_password = os.getenv(DEFAULT_PASSWORD_ENV)
+    if not default_password:
+        raise RuntimeError(
+            f"{DEFAULT_PASSWORD_ENV} env var is required to create Supabase auth users."
+        )
     sb = build_supabase()
     created = 0
     failed = 0
@@ -194,7 +208,7 @@ def main():
             # Create auth user via admin API
             res = sb.auth.admin.create_user({
                 "email": u["email"],
-                "password": DEFAULT_PASSWORD,
+                "password": default_password,
                 "email_confirm": True,  # mark email as confirmed
                 "user_metadata": {"full_name": u["full_name"]},
             })

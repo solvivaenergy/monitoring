@@ -3,3 +3,35 @@ __pycache__/
 .env
 *.egg-info/
 .venv/
+
+# Any .env variant, not just the bare one. render_env_import.env holds a live
+# ODOO_API_KEY and was committable until 2026-09-16.
+*.env
+!.env.example
+
+# One-off audit / reconciliation output. These are generated artifacts, and
+# several carry customer names, addresses and station ids — they do not belong
+# in a repo that has been public.
+*.log
+*.xlsx
+odoo_*_report_*.csv
+odoo_*_report_*.json
+odoo_prod_vs_xlsx_*.csv
+odoo_prod_vs_xlsx_*.json
+odoo_sh_station_*.csv
+july_aug_solis_*.csv
+july_aug_solis_*.json
+onboarding_from_*_report*.json
+onboarding_from_odoo_auto_report.json
+reconcile_odoo_vs_supabase_*.csv
+solis_*_diagnosis_*.csv
+solis_clients_installed_date_report_*.csv
+solis_odoo_mapping_*.csv
+station_ids_for_repair_*.csv
+station_master_reconciliation_*.csv
+supabase_logs.csv
+supabase_xlsx_coverage_report_*.json
+backfill_retry_station_ids_*.csv
+client_solar_report_*.xlsx
+merge_plan_candidate.json
+"Supabase Snippet"*.csv
