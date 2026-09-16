@@ -17,26 +17,43 @@ load_dotenv()
 from .solis_client import SolisCloudClient  # noqa: F401 — used by routes
 from .solis_routes import router as solis_router
 from .app_routes import router as app_router
+from .validation_routes import router as validation_router
 
 app = FastAPI(title="Solviva Monitoring API", docs_url="/docs")
 
-# Allow the GitHub Pages frontend and mobile app to call this API
+# Browser origins allowed to call this API.
+#
+# The "*" entry was removed with the back-office routes. It was commented
+# "Mobile app (Expo/React Native)", but React Native's fetch does not enforce
+# CORS at all — native apps were never relying on it, and it made every
+# endpoint callable from any web page on the internet.
+#
+# allow_credentials stays False: the back office authenticates with a bearer
+# token in the Authorization header, which browsers do not attach automatically,
+# so CSRF is not reachable regardless of origin. Do NOT set it True alongside a
+# wildcard origin — Starlette then reflects the caller's origin verbatim.
 ALLOWED_ORIGINS = [
     "https://solvivaenergy.github.io",
+    os.getenv("BACKOFFICE_ORIGIN", "https://backoffice.solviva.ph"),
     "http://localhost:8000",
     "http://127.0.0.1:8000",
-    "*",  # Mobile app (Expo/React Native)
+    "http://localhost:5173",   # Vite dev server for the back office
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET"],
-    allow_headers=["*"],
+    # POST is required by /admin/validate/*; without it the browser preflight
+    # fails and every validate button is dead.
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["authorization", "content-type", "apikey"],
+    allow_credentials=False,
+    max_age=600,
 )
 
 app.include_router(solis_router)
 app.include_router(app_router)
+app.include_router(validation_router)
 
 
 @app.get("/health")
