@@ -35,3 +35,6 @@ backfill_retry_station_ids_*.csv
 client_solar_report_*.xlsx
 merge_plan_candidate.json
 "Supabase Snippet"*.csv
+
+# Hand-off reports for sales/engineering: customer names + emails, never commit.
+odoo_data_fixes_*.md
