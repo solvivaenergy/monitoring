@@ -18,36 +18,49 @@ that is written continuously; do not work around 25001 by deleting the keyword.
 | 04a identity columns + seed | **applied** | 2026-09-15 |
 | 04b identity indexes (9) | **applied**, all concurrent, none invalid | 2026-09-15 |
 | 04c primary flag + triggers | **applied** — 4 triggers live | 2026-09-15 |
-| 05 new conflict key | **applied** — both keys coexist | 2026-09-16 |
-| 06 drop old conflict key | not run — **requires the code deploy first** | |
-| 07 foreign keys | not run | |
-| 08 staff and audit | not run | |
-| 09 backfill jobs | not run | |
-| 10 station-scoped RLS | not run | |
-| 11 view security | not run — **needs `monthly_energy_sync_views_ASBUILT.sql`, which does not exist yet; the DDL lives only in the DB (file 00 query dumps it)** | |
-| 12 legacy timestamp quarantine (optional) | not run | |
+| 05 new conflict key | **applied** | 2026-09-16 |
+| — code deploy — | `main` = `b05a30b`, live on Render | 2026-09-16 |
+| 06 drop old conflict key | **applied** — old `(user_id,timestamp)` keys gone, `user_id` indexes rebuilt | 2026-09-16 |
+| 07 foreign keys | **applied — as corrected**; file rewritten to match (see its header) | 2026-09-16 |
+| 08 staff and audit | **applied** — `staff_users`, `audit_log`, 3 audit triggers | 2026-09-16 |
+| 09 backfill jobs | **applied** — `backfill_jobs` + one-live-job guard | 2026-09-16 |
+| 10 station-scoped RLS | **applied** — old policies recorded in `rls_policies_ASBUILT_2026-09-16.sql`; verified as a real customer, a stranger, and anon | 2026-09-16 |
+| 11 view security | **applied** — six views: anon/authenticated revoked, `security_invoker=on`; `system_metrics` created. As-built DDL in `monthly_energy_sync_views_ASBUILT.sql` | 2026-09-16 |
+| 12 legacy timestamp quarantine (optional) | not run — see below | |
 
-## The order is load-bearing
-
-```
-04 → 05 → DEPLOY CODE → 06 → merge_customer_accounts --apply → 07…11
-```
-
-The deployed syncs upsert with `on_conflict="system_id,timestamp"`, which needs
-05's index. 05 leaves **both** the old `(user_id, timestamp)` and the new
-`(system_id, timestamp)` keys in place, so old and new code both work and the
-deploy has no outage — that is the whole reason 06 is a separate file. Running
-06 before the deploy breaks every upsert with `42P10`.
-
-`api/merge_customer_accounts.py` refuses to run before 06: it detects real
-`(user_id, timestamp)` collisions, and 4 of the 6 planned merges would otherwise
-fail halfway through moving rows.
-
-## State after 05 (verified 2026-09-16)
+## Verified state after 11 (2026-09-16 ~15:40 UTC)
 
 ```
-energy_readings                116,096 rows   0 duplicate (system_id, timestamp)
-energy_readings_five_minutes   160,788 rows   0 duplicate (system_id, timestamp)
-orphaned readings                    0        invalid indexes: none
-solar_systems                      625 rows   619 with a station id, 619 distinct
+energy_readings                116,121 rows   0 duplicate keys, 0 orphans, 0 owner mismatches
+energy_readings_five_minutes   ~156k rows     rolling one Manila day; cron writes every 15 min
+solar_systems                      625 rows   625 customers, 619 station ids all distinct
+user_profiles                      627        auth.users 630 (2 internal logins banned 2026-09-16)
+anon → monthly_energy_sync*        401        service key → still reads (n8n MARKETING workflow unaffected)
 ```
+
+## Gap backfill (api/backfill_gaps.py), 2026-09-16
+
+4,413 days missing inside stations' own histories. Solis has data for **25** of
+them (inserted, 5 stations, all Aug-2026); the other **4,388 are days Solis
+itself has no data for** — genuine downtime, not sync loss. 3,545 existing days
+were compared with Solis at the same time: 21 mismatches (0.59%), all explained
+— 12 are today's zero placeholder rows (filled by tonight's 18:00 UTC sync), 7
+are yesterday revised by Solis by ≤0.6 kWh, 2 are legacy wall-clock rows holding
+a partial-morning value. Full reports kept outside the repo (customer names).
+
+## On file 12
+
+The two legacy mismatches above are why 12 exists: the 405 rows with insert-time
+timestamps are partial-day snapshots, not day totals. 12 quarantines them; the
+gap filler would then re-insert the correct noon rows from Solis. Run it when
+the back office can show what changed — it is a data edit, not a schema one.
+
+## Not yet done
+
+- `api/merge_customer_accounts.py --apply` (6 merges) — **needs a decision**:
+  merged customers see only one system until the portal has a station selector.
+- The back office itself; the backfill worker that drains `backfill_jobs`;
+  staff accounts in `staff_users` (none exist — the table is empty).
+- Render: `SOLIS_API_TOKEN` still unset (`/solis/*` returns 503 to everyone).
+- GitHub: Settings → Pages → Source: None.
+- Password rotation for the 565 never-signed-in accounts.

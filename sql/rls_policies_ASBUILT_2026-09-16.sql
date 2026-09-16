@@ -1,0 +1,65 @@
+-- AS-BUILT row-level-security policies on every public table, dumped from
+-- production (kzsocvzhbgtfyksrjmvk) on 2026-09-16 immediately BEFORE migration 10,
+-- which drops and replaces the SELECT policies on energy_readings,
+-- energy_readings_five_minutes, solar_systems and user_profiles.
+-- Restore any of these with CREATE POLICY using the recorded qual/with_check.
+
+-- ===== public.audit_log   rls_enabled=True
+--   audit_log_staff_read  [SELECT, PERMISSIVE, roles={authenticated}]
+--     using: is_staff()
+-- ===== public.backfill_jobs   rls_enabled=True
+--   backfill_jobs_staff_read  [SELECT, PERMISSIVE, roles={authenticated}]
+--     using: is_staff()
+-- ===== public.billing_records   rls_enabled=True
+--   Users can view their billing records  [SELECT, PERMISSIVE, roles={public}]
+--     using: (auth.uid() = user_id)
+-- ===== public.electricity_providers   rls_enabled=True
+--   Allow public read access to electricity_providers  [SELECT, PERMISSIVE, roles={public}]
+--     using: true
+-- ===== public.electricity_rates   rls_enabled=True
+--   Allow public read access to electricity_rates  [SELECT, PERMISSIVE, roles={public}]
+--     using: true
+-- ===== public.energy_readings   rls_enabled=True
+--   Users can view their energy readings  [SELECT, PERMISSIVE, roles={public}]
+--     using: (auth.uid() = user_id)
+-- ===== public.energy_readings_five_minutes   rls_enabled=True
+--   Enable users to view their own data only  [SELECT, PERMISSIVE, roles={authenticated}]
+--     using: (auth.uid() = user_id)
+-- ===== public.energy_tips   rls_enabled=True
+--   Users can update their energy tips  [UPDATE, PERMISSIVE, roles={public}]
+--     using: (auth.uid() = user_id)
+--   Users can view their energy tips  [SELECT, PERMISSIVE, roles={public}]
+--     using: (auth.uid() = user_id)
+-- ===== public.referrals   rls_enabled=True
+--   Users can create referrals  [INSERT, PERMISSIVE, roles={public}]
+--     using: None
+--     with check: (auth.uid() = referrer_user_id)
+--   Users can view their referrals  [SELECT, PERMISSIVE, roles={public}]
+--     using: (auth.uid() = referrer_user_id)
+-- ===== public.solar_systems   rls_enabled=True
+--   Users can view their solar systems  [SELECT, PERMISSIVE, roles={public}]
+--     using: (auth.uid() = user_id)
+-- ===== public.support_tickets   rls_enabled=True
+--   Users can create support tickets  [INSERT, PERMISSIVE, roles={public}]
+--     using: None
+--     with check: (auth.uid() = user_id)
+--   Users can view their support tickets  [SELECT, PERMISSIVE, roles={public}]
+--     using: (auth.uid() = user_id)
+-- ===== public.ticket_messages   rls_enabled=True
+--   Users can create ticket messages  [INSERT, PERMISSIVE, roles={public}]
+--     using: None
+--     with check: (auth.uid() = user_id)
+--   Users can view ticket messages  [SELECT, PERMISSIVE, roles={public}]
+--     using: (EXISTS ( SELECT 1
+   FROM support_tickets
+  WHERE ((support_tickets.id = ticket_messages.ticket_id) AND (support_tickets.user_id = auth.uid()))))
+-- ===== public.user_profiles   rls_enabled=True
+--   Users can update their own profile  [UPDATE, PERMISSIVE, roles={public}]
+--     using: (auth.uid() = id)
+--   Users can view their own profile  [SELECT, PERMISSIVE, roles={public}]
+--     using: (auth.uid() = id)
+
+-- Tables with RLS enabled but NO policies (deny-all for anon/authenticated):
+--   cleaned_data
+--   onboarding_runs
+--   staff_users
