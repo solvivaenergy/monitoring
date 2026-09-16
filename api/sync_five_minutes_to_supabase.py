@@ -39,6 +39,14 @@ SUPABASE_BATCH_SIZE = 500
 SUPABASE_PAGE_SIZE = 1000
 SOLIS_CONCURRENCY = 8
 
+# Purge sizing. PostgREST connects as `authenticator`, whose statement_timeout is
+# 8s, so every DELETE has to fit inside that. 5,000 ids per statement runs in
+# well under a second; 60 batches clears 300,000 rows, comfortably more than the
+# ~165,000 this rolling table holds for a full day of ~574 stations. Anything
+# left over is picked up by the next run 15 minutes later.
+PURGE_BATCH_ROWS = 5_000
+PURGE_MAX_BATCHES = 60
+
 
 def get_env(key: str) -> str:
     value = os.getenv(key)
@@ -235,11 +243,71 @@ def _load_existing_rows(
 
 
 def _purge_old_rows(sb: Client, day_start: str) -> Optional[int]:
-    resp = _execute_with_retry(
-        "purge old five-minute rows",
-        lambda: sb.table("energy_readings_five_minutes").delete(count="exact").lt("timestamp", day_start),
-    )
-    return resp.count
+    """Drop rows older than the current Asia/Manila day, in bounded batches.
+
+    This used to be one unbounded DELETE. It deadlocked the whole feed on
+    2026-09-15: at Manila midnight the cutoff advances a full day, so every row
+    in this rolling table — 160,788 of them, 79 MB — becomes eligible at once,
+    and PostgREST runs as `authenticator`, whose statement_timeout is 8s. The
+    delete could not finish, raised 57014, and because the purge runs before any
+    write and its exception aborted the run, NOTHING was ever written. The
+    backlog therefore never shrank and every subsequent run failed the same way.
+    The feed was dead for ~19.5 hours (roughly 78 missed runs) until it was
+    cleared by hand.
+
+    Two independent guards, because either alone would have left the outage
+    possible:
+
+    1. Batching. Each DELETE is capped at PURGE_BATCH_ROWS ids, which comfortably
+       fits 8s, and we loop until the backlog is gone. Deleting by explicit id
+       rather than by predicate keeps each statement's work proportional to the
+       batch, not to the size of the backlog.
+
+    2. Never fatal. A purge failure returns None instead of propagating. Purging
+       is housekeeping — the table is a rolling one-day cache, and carrying a
+       stale day costs disk. Writing today's curve is the actual job. Letting
+       housekeeping abort the job is what turned a slow query into an outage.
+
+    Returns the number of rows deleted, or None if the purge could not complete
+    (the caller only logs it).
+    """
+    deleted = 0
+    try:
+        for _ in range(PURGE_MAX_BATCHES):
+            stale = _execute_with_retry(
+                "select stale five-minute rows",
+                lambda: sb.table("energy_readings_five_minutes")
+                .select("id")
+                .lt("timestamp", day_start)
+                .limit(PURGE_BATCH_ROWS),
+            ).data or []
+
+            if not stale:
+                return deleted
+
+            ids = [row["id"] for row in stale]
+            _execute_with_retry(
+                "purge old five-minute rows",
+                lambda ids=ids: sb.table("energy_readings_five_minutes")
+                .delete()
+                .in_("id", ids),
+            )
+            deleted += len(ids)
+
+        log.warning(
+            "Purge stopped after %d batches with rows still older than %s; "
+            "the rest will go on the next run.",
+            PURGE_MAX_BATCHES,
+            day_start,
+        )
+        return deleted
+    except Exception as exc:
+        log.warning(
+            "Purge failed after deleting %d row(s); continuing with the sync: %s",
+            deleted,
+            exc,
+        )
+        return None
 
 
 def _has_lifetime_earning_column(sb: Client) -> bool:
@@ -345,8 +413,21 @@ async def sync_once(dry_run: bool = False) -> int:
     day_start = f"{today.isoformat()}T00:00:00+08:00"
     day_end = f"{(today + timedelta(days=1)).isoformat()}T00:00:00+08:00"
     today_str = today.isoformat()
-    deleted_count = _purge_old_rows(sb, day_start)
-    log.info("Purged %s old 5-minute row(s) before syncing %s.", deleted_count or 0, today_str)
+    # --dry-run used to purge anyway: the flag is documented as "without writing
+    # to Supabase", but the purge ran unconditionally, so a dry run deleted a
+    # day of five-minute data. Deleting is writing.
+    if dry_run:
+        stale = _execute_with_retry(
+            "count stale five-minute rows",
+            lambda: sb.table("energy_readings_five_minutes")
+            .select("id", count="exact")
+            .lt("timestamp", day_start)
+            .limit(1),
+        )
+        log.info("Would purge %s old 5-minute row(s) [dry-run].", stale.count or 0)
+    else:
+        deleted_count = _purge_old_rows(sb, day_start)
+        log.info("Purged %s old 5-minute row(s) before syncing %s.", deleted_count or 0, today_str)
     existing_by_system = _load_existing_rows(sb, day_start, day_end)
     has_lifetime_earning = _has_lifetime_earning_column(sb)
     if not has_lifetime_earning:
