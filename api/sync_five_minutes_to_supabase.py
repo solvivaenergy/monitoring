@@ -40,12 +40,18 @@ SUPABASE_PAGE_SIZE = 1000
 SOLIS_CONCURRENCY = 8
 
 # Purge sizing. PostgREST connects as `authenticator`, whose statement_timeout is
-# 8s, so every DELETE has to fit inside that. 5,000 ids per statement runs in
-# well under a second; 60 batches clears 300,000 rows, comfortably more than the
-# ~165,000 this rolling table holds for a full day of ~574 stations. Anything
-# left over is picked up by the next run 15 minutes later.
-PURGE_BATCH_ROWS = 5_000
-PURGE_MAX_BATCHES = 60
+# 8s, so every DELETE has to fit inside that. Rows go one hour-window at a
+# time: an hour of ~574 stations at 5-minute resolution is ~7,000 rows, which
+# deletes in well under a second with the "timestamp" index from migration 01.
+# 168 windows is a week of backlog per run; anything older waits for the next
+# run 15 minutes later.
+#
+# Windows by timestamp, NOT lists of ids. PostgREST filters travel in the URL,
+# and measured on 2026-09-16: 500 UUIDs works, 1,000 gets HTTP 400 from the
+# gateway, 5,000 is refused by the HTTP client before it is even sent. The first
+# version of this fix batched 5,000 ids and failed on its first request.
+PURGE_WINDOW = timedelta(hours=1)
+PURGE_MAX_WINDOWS = 24 * 7
 
 
 def get_env(key: str) -> str:
@@ -258,10 +264,12 @@ def _purge_old_rows(sb: Client, day_start: str) -> Optional[int]:
     Two independent guards, because either alone would have left the outage
     possible:
 
-    1. Batching. Each DELETE is capped at PURGE_BATCH_ROWS ids, which comfortably
-       fits 8s, and we loop until the backlog is gone. Deleting by explicit id
-       rather than by predicate keeps each statement's work proportional to the
-       batch, not to the size of the backlog.
+    1. Bounded windows. Each DELETE covers one PURGE_WINDOW of "timestamp"
+       (an hour, ~7,000 rows) so its work is proportional to the window, never
+       to the size of the backlog, and we walk windows from the oldest row up
+       to the cutoff. The filter is a timestamp range, not a list of ids —
+       PostgREST filters travel in the URL and a few hundred UUIDs is already
+       the limit (see PURGE_WINDOW above).
 
     2. Never fatal. A purge failure returns None instead of propagating. Purging
        is housekeeping — the table is a rolling one-day cache, and carrying a
@@ -272,39 +280,50 @@ def _purge_old_rows(sb: Client, day_start: str) -> Optional[int]:
     (the caller only logs it).
     """
     deleted = 0
+    windows = 0
     try:
-        for _ in range(PURGE_MAX_BATCHES):
-            stale = _execute_with_retry(
-                "select stale five-minute rows",
-                lambda: sb.table("energy_readings_five_minutes")
-                .select("id")
-                .lt("timestamp", day_start)
-                .limit(PURGE_BATCH_ROWS),
-            ).data or []
+        oldest = _execute_with_retry(
+            "find oldest five-minute row",
+            lambda: sb.table("energy_readings_five_minutes")
+            .select("timestamp")
+            .lt("timestamp", day_start)
+            .order("timestamp")
+            .limit(1),
+        ).data or []
+        if not oldest:
+            return 0
 
-            if not stale:
-                return deleted
+        cutoff = datetime.fromisoformat(day_start)
+        window_start = datetime.fromisoformat(
+            str(oldest[0]["timestamp"]).replace("Z", "+00:00")
+        ).replace(minute=0, second=0, microsecond=0)
 
-            ids = [row["id"] for row in stale]
-            _execute_with_retry(
+        while window_start < cutoff and windows < PURGE_MAX_WINDOWS:
+            window_end = min(window_start + PURGE_WINDOW, cutoff)
+            resp = _execute_with_retry(
                 "purge old five-minute rows",
-                lambda ids=ids: sb.table("energy_readings_five_minutes")
-                .delete()
-                .in_("id", ids),
+                lambda ws=window_start, we=window_end: sb.table("energy_readings_five_minutes")
+                .delete(count="exact")
+                .gte("timestamp", ws.isoformat())
+                .lt("timestamp", we.isoformat()),
             )
-            deleted += len(ids)
+            deleted += resp.count or 0
+            window_start = window_end
+            windows += 1
 
-        log.warning(
-            "Purge stopped after %d batches with rows still older than %s; "
-            "the rest will go on the next run.",
-            PURGE_MAX_BATCHES,
-            day_start,
-        )
+        if window_start < cutoff:
+            log.warning(
+                "Purge stopped after %d hour-window(s) with rows still older than %s; "
+                "the rest will go on the next run.",
+                windows,
+                day_start,
+            )
         return deleted
     except Exception as exc:
         log.warning(
-            "Purge failed after deleting %d row(s); continuing with the sync: %s",
+            "Purge failed after deleting %d row(s) in %d window(s); continuing with the sync: %s",
             deleted,
+            windows,
             exc,
         )
         return None
