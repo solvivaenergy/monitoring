@@ -22,7 +22,10 @@
   .who{color:var(--muted);font-size:13px}
   .who b{color:var(--text)}
   main{padding:16px 20px;max-width:1600px;margin:0 auto}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px;overflow-x:auto}
+  /* Cells default to nowrap so tables stay scannable; opt specific columns into wrapping. */
+  td.wrap{white-space:normal;min-width:220px;max-width:440px}
+  .tag.sig{white-space:nowrap;margin:1px 3px 1px 0;cursor:help}
   .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
   input,select,textarea{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--text)}
   input[type=search]{min-width:280px}
@@ -527,6 +530,23 @@ function summarizeVerdict(v){
 /* ------------------------------------------------------------------ */
 /* unresolved / jobs / audit / staff                                    */
 /* ------------------------------------------------------------------ */
+// Signals arrive as full sentences from the API; show a short label, keep the
+// sentence as the tooltip. Green = points to a wrong PROFILE NAME (mapping ok);
+// amber = points to a wrong STATION.
+const SIGNAL_LABELS = [
+  [/shares no word/i,          'plant ≠ customer name', 'warn'],
+  [/Odoo name also differs/i,  'Odoo name ≠ customer',  'warn'],
+  [/plant email differs/i,     'Solis email ≠ login',   'warn'],
+  [/MATCHES the login/i,       'Solis email = login ✓', 'ok'],
+  [/matches the ODOO name/i,   'plant = Odoo name ✓',   'ok'],
+  [/login email contains/i,    'same household ✓',      'ok'],
+  [/organisation/i,            'organisation plant ✓',  'ok'],
+];
+function sigTag(x){
+  const hit = SIGNAL_LABELS.find(([re]) => re.test(x));
+  return `<span class="tag sig ${hit ? hit[2] : ''}" title="${esc(x)}">${esc(hit ? hit[1] : x)}</span>`;
+}
+
 async function loadUnresolved(){
   const el = $('#view-unresolved'); el.innerHTML = '<p class="muted">Loading…</p>';
   try {
@@ -546,7 +566,7 @@ async function loadUnresolved(){
       <div class="card sect"><h3 style="margin-top:0">Possible wrong station <span class="muted">— the Solis plant name shares no word with the customer's name</span></h3>
         <p class="hint">Two different problems look like this. <b>Wrong station id on the Odoo lead</b>: the plant is named after someone else AND its Solis email differs from the customer's login → the days recorded here are another plant's production. Use <i>Remap</i> with the correct id, then send the lead to sales. <b>Wrong profile name</b> (nickname, an email typed as the name): the Solis email matches the login, or the plant name matches the Odoo name → just edit the name. <i>Check data vs Solis</i> does not decide this — it only confirms our rows match Solis for whatever id we hold. Sorted by strength of signal, then by how many days are at stake.</p>
         <table><thead><tr><th>Customer (profile)</th><th>Plant (Solis)</th><th>Name (Odoo)</th><th>Login email</th><th>Solis email</th><th>Days recorded</th><th>Signals</th><th>Unassigned plant named after this customer</th><th></th></tr></thead><tbody>
-        ${(u.suspect_mappings||[]).map(s => `<tr><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${s.readings}</td><td class="muted" style="white-space:normal;max-width:300px">${s.signals.map(x => `<span class="tag ${/probably/.test(x)?'ok':'warn'}" style="margin:1px 2px 1px 0">${esc(x)}</span>`).join('')}</td><td style="white-space:normal;max-width:300px" data-sugg="${s.system_id}"><span class="muted">looking up the Solis roster…</span></td><td><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=9 class="muted">none</td></tr>'}
+        ${(u.suspect_mappings||[]).map(s => `<tr><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${s.readings}</td><td class="wrap">${s.signals.map(sigTag).join('')}</td><td class="wrap" data-sugg="${s.system_id}"><span class="muted">looking up the Solis roster…</span></td><td><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=9 class="muted">none</td></tr>'}
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Nightly onboarding failures <span class="muted">— last run ${fmtTs(o.ran_at)} · ${o.candidates??'?'} candidates, ${o.created??'?'} created</span></h3>
@@ -614,7 +634,7 @@ async function loadAudit(){
   try {
     const {audit} = await api('/backoffice/api/audit?limit=300');
     el.innerHTML = `<div class="card"><table><thead><tr><th>When</th><th>Who</th><th>Kind</th><th>Table</th><th>Row</th><th>Op</th><th>Field</th><th>Old → New</th><th>Reason</th><th>Source</th></tr></thead><tbody>
-      ${audit.map(a => `<tr><td>${fmtTs(a.occurred_at)}</td><td>${esc(a.actor_email||'—')}</td><td><span class="tag ${a.actor_kind==='staff'?'ok':''}">${esc(a.actor_kind)}</span></td><td>${esc(a.table_name)}</td><td class="mono">${esc(String(a.row_pk).slice(0,8))}…</td><td>${esc(a.operation)}</td><td class="mono">${esc(a.field_name||'')}</td><td>${a.field_name?`<s>${esc(a.old_value)}</s> → ${esc(a.new_value)}`:'<span class="muted">whole row</span>'}</td><td class="muted">${esc(a.reason||'')}</td><td class="muted">${esc(a.source)}</td></tr>`).join('')}
+      ${audit.map(a => `<tr><td>${fmtTs(a.occurred_at)}</td><td>${esc(a.actor_email||'—')}</td><td><span class="tag ${a.actor_kind==='staff'?'ok':''}">${esc(a.actor_kind)}</span></td><td>${esc(a.table_name)}</td><td class="mono">${esc(String(a.row_pk).slice(0,8))}…</td><td>${esc(a.operation)}</td><td class="mono">${esc(a.field_name||'')}</td><td class="wrap">${a.field_name?`<s>${esc(a.old_value)}</s> → ${esc(a.new_value)}`:'<span class="muted">whole row</span>'}</td><td class="wrap muted">${esc(a.reason||'')}</td><td class="muted">${esc(a.source)}</td></tr>`).join('')}
       </tbody></table></div>`;
   } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
 }
