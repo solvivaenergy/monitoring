@@ -9,6 +9,9 @@
 <style>
   :root{--bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--text:#1d2430;--muted:#66707d;--brand:#0f7a4e;--brand-2:#0a5d3b;--warn:#b7791f;--bad:#b42318;--ok:#0f7a4e;--chip:#eef1f4;--radius:10px}
   *{box-sizing:border-box}
+  /* Our `header{display:flex}` outranks the browser's default `[hidden]{display:none}`,
+     which showed the tab bar on the login screen. Make hidden mean hidden. */
+  [hidden]{display:none!important}
   body{margin:0;font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:var(--text);background:var(--bg)}
   header{display:flex;align-items:center;gap:16px;padding:10px 20px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
   header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
