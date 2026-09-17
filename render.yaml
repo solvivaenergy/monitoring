@@ -108,6 +108,28 @@ services:
       - key: SUPABASE_SERVICE_KEY
         sync: false
 
+  # Backfill worker: drains backfill_jobs, which the back office enqueues.
+  # Nothing else runs those jobs. 15-minute cron, 12-minute budget per run.
+  - type: cron
+    name: solviva-backfill-worker
+    runtime: docker
+    plan: starter
+    schedule: "*/15 * * * *"
+    dockerfilePath: ./Dockerfile.worker.backfill
+    envVars:
+      - key: SOLIS_CLOUD_KEY_ID
+        sync: false
+      - key: SOLIS_CLOUD_KEY_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_DB_POOLER_URL
+        sync: false
+
   # Cross-system MCP server for Claude Teams (read-only, shared service token).
   # Must NOT be plan: free — a cold start blows Claude's 10s connector timeout.
   - type: web
