@@ -117,9 +117,15 @@ def connect(autocommit: bool = False) -> Iterator[psycopg.Connection]:
         try:
             yield conn
         finally:
-            # psycopg_pool resets the connection on return; autocommit is not
-            # part of that reset, so put it back explicitly.
-            conn.autocommit = False
+            # Put autocommit back so the next borrower starts from the default.
+            # ONLY after an autocommit block: psycopg refuses to change the flag
+            # while a transaction is open, and in a transactional block the
+            # caller's writes are still uncommitted at this point — the first
+            # version reset unconditionally, raised, and the pool rolled the
+            # whole transaction back. Every audited write returned "Database
+            # error" (2026-09-17) while reads worked.
+            if autocommit:
+                conn.autocommit = False
 
 
 @contextlib.contextmanager
