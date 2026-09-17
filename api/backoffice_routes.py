@@ -672,6 +672,152 @@ async def remap_station(system_id: uuid.UUID, body: RemapRequest, authorization:
 
 
 # ---------------------------------------------------------------------------
+# retire an account: a duplicate login, or test data, or another plant's data
+# ---------------------------------------------------------------------------
+
+class RetireRequest(BaseModel):
+    reason: str = ""
+    # The live account of the same customer, when this one is a duplicate. With
+    # a twin, the account may only be retired if the twin already holds every
+    # day this one holds — otherwise it is a MERGE, not a retirement.
+    twin_user_id: Optional[uuid.UUID] = None
+    # False: ban the login (reversible — the person keeps their other login).
+    # True: delete it (test data, or a login that never had a plant of its own).
+    delete_login: bool = False
+    dry_run: bool = True
+
+
+@router.post("/api/customers/{user_id}/retire")
+async def retire_customer(user_id: uuid.UUID, body: RetireRequest, authorization: str = Header(None)):
+    """Remove a customer account that should not exist: a second login for a
+    customer who already has a working one, seed/test data, or a login that
+    was given another plant's station. Readings go to quarantine (recoverable),
+    the system and profile rows are deleted, the login is banned or deleted.
+    Refuses staff accounts, accounts that still own a station (remap or detach
+    first), and — when a twin is named — accounts holding days the twin lacks."""
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "engineer")
+    with db.connect(autocommit=True) as conn:
+        login = conn.execute("select email, last_sign_in_at from auth.users where id = %s", (user_id,)).fetchone()
+        if not login:
+            raise HTTPException(404, "No such login")
+        if conn.execute("select 1 from public.staff_users where user_id = %s", (user_id,)).fetchone():
+            raise HTTPException(400, "That is a staff account — manage it in the Staff tab")
+        if str(user_id) == staff["id"]:
+            raise HTTPException(400, "You cannot retire yourself")
+        profile = conn.execute("select full_name from public.user_profiles where id = %s", (user_id,)).fetchone()
+        systems = conn.execute(
+            "select id, system_name, solis_station_id from public.solar_systems where user_id = %s", (user_id,)).fetchall()
+        twin = None
+        if body.twin_user_id:
+            twin = conn.execute(
+                """select u.email, p.full_name, s.solis_station_id
+                     from auth.users u left join public.user_profiles p on p.id = u.id
+                     left join public.solar_systems s on s.user_id = u.id and s.is_primary
+                    where u.id = %s""", (body.twin_user_id,)).fetchone()
+            if not twin:
+                raise HTTPException(404, "No such twin login")
+        still_owned = [s for s in systems if s["solis_station_id"]
+                       and not (twin and s["solis_station_id"] == twin["solis_station_id"])]
+        if still_owned:
+            raise HTTPException(400, f"This account still owns station {still_owned[0]['solis_station_id']} — "
+                                     "remap or detach it first, or name the twin that holds the same station")
+        stats = conn.execute(
+            """select count(*) as rows, min("timestamp") as first_ts, max("timestamp") as last_ts,
+                      coalesce(round(sum(production_kwh)::numeric, 1), 0) as kwh
+                 from public.energy_readings where user_id = %s""", (user_id,)).fetchone()
+        fm_rows = conn.execute(
+            "select count(*) as n from public.energy_readings_five_minutes where user_id = %s", (user_id,)).fetchone()["n"]
+        only_here = None
+        if twin:
+            only_here = conn.execute(
+                """select count(*) from (
+                     select distinct ("timestamp" at time zone 'Asia/Manila')::date from public.energy_readings where user_id = %s
+                     except
+                     select distinct ("timestamp" at time zone 'Asia/Manila')::date from public.energy_readings where user_id = %s) q""",
+                (user_id, body.twin_user_id)).fetchone()["count"]
+            if only_here:
+                raise HTTPException(400, f"This account holds {only_here} day(s) the twin does not — that is a merge, not a retirement")
+        live_jobs = conn.execute(
+            "select count(*) as n from public.backfill_jobs where system_id in "
+            "(select id from public.solar_systems where user_id = %s) and status in ('queued','running')", (user_id,)).fetchone()["n"]
+        # cleaned_data is a legacy derived copy of the readings (nothing has
+        # written to it since 2026-04-22) and references solar_systems with
+        # ON DELETE RESTRICT; a retired system's rows there go with it.
+        cleaned_rows = conn.execute(
+            "select count(*) as n from public.cleaned_data where system_id in "
+            "(select id from public.solar_systems where user_id = %s)", (user_id,)).fetchone()["n"]
+        # Customer-side tables keyed on the login (FKs to auth.users, NO ACTION).
+        # They block deleting the login; for a banned login they simply stay.
+        related = {t: conn.execute(f"select count(*) as n from public.{t} where {c} = %s", (user_id,)).fetchone()["n"]
+                   for t, c in (("energy_tips", "user_id"), ("billing_records", "user_id"), ("support_tickets", "user_id"),
+                                ("ticket_messages", "user_id"), ("referrals", "referrer_user_id"))}
+        related = {t: n for t, n in related.items() if n}
+
+    preview = _j({
+        "user_id": user_id, "email": login["email"], "full_name": profile["full_name"] if profile else None,
+        "last_sign_in_at": login["last_sign_in_at"], "systems": [dict(s) for s in systems],
+        "twin": ({"email": twin["email"], "full_name": twin["full_name"], "station": twin["solis_station_id"]} if twin else None),
+        "days_only_here": only_here, "rows_to_quarantine": stats["rows"],
+        "quarantine_range": [stats["first_ts"], stats["last_ts"]], "kwh_to_quarantine": stats["kwh"],
+        "five_minute_rows_to_drop": fm_rows, "cleaned_data_rows_to_drop": cleaned_rows,
+        "live_jobs_to_cancel": live_jobs, "related_rows": related,
+        "related_rows_action": ("delete" if body.delete_login else "keep") if related else None,
+        "login_action": "delete" if body.delete_login else "ban",
+    })
+    if body.dry_run:
+        return {"dry_run": True, **preview}
+
+    reason = _reason(body.reason)
+    request_id = str(uuid.uuid4())
+    try:
+        with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
+            conn.execute(
+                """insert into public.energy_readings_quarantine
+                   select r.*, now(), %s, %s, %s,
+                          (select solis_station_id from public.solar_systems s where s.id = r.system_id), %s
+                     from public.energy_readings r where r.user_id = %s""",
+                (staff["id"], request_id, reason, twin["solis_station_id"] if twin else None, user_id))
+            conn.execute("delete from public.energy_readings where user_id = %s", (user_id,))
+            conn.execute("delete from public.energy_readings_five_minutes where user_id = %s", (user_id,))
+            conn.execute(
+                "update public.backfill_jobs set status = 'cancelled', finished_at = now(), error = 'account retired' "
+                "where system_id in (select id from public.solar_systems where user_id = %s) and status in ('queued','running')",
+                (user_id,))
+            conn.execute(
+                "delete from public.cleaned_data where system_id in (select id from public.solar_systems where user_id = %s)",
+                (user_id,))
+            conn.execute("delete from public.solar_systems where user_id = %s", (user_id,))
+            conn.execute("delete from public.user_profiles where id = %s", (user_id,))
+            if body.delete_login and related:
+                # Test data / a login with no plant of its own: the customer-side
+                # rows would block deleting the login. Children before parents.
+                conn.execute("delete from public.ticket_messages where user_id = %s or ticket_id in "
+                             "(select id from public.support_tickets where user_id = %s)", (user_id, user_id))
+                conn.execute("delete from public.support_tickets where user_id = %s", (user_id,))
+                conn.execute("delete from public.billing_records where user_id = %s", (user_id,))
+                conn.execute("delete from public.referrals where referrer_user_id = %s", (user_id,))
+                conn.execute("delete from public.energy_tips where user_id = %s", (user_id,))
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+
+    env = _supabase_env()
+    hdr = {"apikey": env["service"], "Authorization": f"Bearer {env['service']}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        if body.delete_login:
+            r = await client.delete(env["url"] + f"/auth/v1/admin/users/{user_id}", headers=hdr)
+        else:
+            r = await client.put(env["url"] + f"/auth/v1/admin/users/{user_id}", headers=hdr, json={"ban_duration": "876000h"})
+    login_done = r.status_code in (200, 204)
+    if not login_done:
+        log.warning("retire: data removed but login %s failed for %s: %s %s", preview["login_action"], login["email"], r.status_code, r.text[:160])
+    _invalidate_rows()
+    return {"dry_run": False, "request_id": request_id, "login_done": login_done, **preview}
+
+
+# ---------------------------------------------------------------------------
 # backfill queue
 # ---------------------------------------------------------------------------
 

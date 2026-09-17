@@ -411,6 +411,18 @@ async function openPanel(systemId){
       </div>
       <p class="hint">Name and capacity are taken from Solis. The station must exist in our Solis account — validate it first.</p>
       <button class="btn sm primary" id="btn-add-station">Add station</button>
+    </details>
+    <details style="margin-top:8px"><summary class="hint"><b>Retire this account</b> — a duplicate login, test data, or a login given another plant's station</summary>
+      <div class="grid2" style="margin-top:8px">
+        <div><label>Twin login (the customer's live account), if this is a duplicate</label><input id="retire-twin" type="email" placeholder="other.email@example.com — leave empty for test data"></div>
+        <div><label>Login</label><select id="retire-login"><option value="ban">Ban the login (reversible — the person keeps the twin)</option><option value="delete">Delete the login (test data / no plant of their own)</option></select></div>
+      </div>
+      <p class="hint">Readings go to quarantine (recoverable, marked with the twin), the station row and profile are removed, and the login is banned or deleted. Refused if this account still owns a station, or holds days the twin does not (that would be a merge).</p>
+      <div class="row">
+        <button class="btn sm" id="btn-retire-preview">Preview</button>
+        <button class="btn sm danger" id="btn-retire-confirm" disabled>Confirm retirement</button>
+      </div>
+      <div class="verdict" id="v-retire" hidden></div>
     </details>` : ''}
 
     <h3>Audit trail</h3>
@@ -424,6 +436,8 @@ async function openPanel(systemId){
     $('#btn-save').onclick = () => saveAll(r);
     $('#btn-remap-preview').onclick = () => remap(r, true);
     $('#btn-remap-confirm').onclick = () => remap(r, false);
+    $('#btn-retire-preview').onclick = () => retireAccount(r, true);
+    $('#btn-retire-confirm').onclick = () => retireAccount(r, false);
     $('#btn-backfill').onclick = () => queueBackfill(r);
     $('#btn-add-station').onclick = () => addStation(r);
   }
@@ -517,6 +531,30 @@ async function remap(r, dryRun){
     if (dryRun) { $('#btn-remap-confirm').disabled = false; }
     else { toast(detach ? 'Detached — data quarantined' : 'Remapped — the worker will backfill within 15 minutes'); await loadRows(true); openPanel(r.system_id); }
   } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; $('#btn-remap-confirm').disabled = true; }
+}
+async function retireAccount(r, dryRun){
+  const twinEmail = $('#retire-twin').value.trim().toLowerCase(), box = $('#v-retire');
+  let twin = null;
+  if (twinEmail) {
+    twin = ROWS.find(x => (x.login_email||'').toLowerCase() === twinEmail);
+    if (!twin) return toast(`No customer with login ${twinEmail} in the grid`, true);
+    if (twin.user_id === r.user_id) return toast('The twin must be a different login', true);
+  }
+  const reason = ($('#reason')?.value||'').trim(), del = $('#retire-login').value === 'delete';
+  if (!dryRun && reason.length < 3) return toast('Type the reason in the Save-changes box first — it goes into the audit log', true);
+  if (!dryRun && !confirm(`Retire ${r.login_email}?\n\nReadings → quarantine, station row and profile removed, login ${del ? 'DELETED' : 'banned'}${twin ? `; twin ${twin.login_email} keeps everything` : ''}. Continue?`)) return;
+  box.hidden = false; box.textContent = dryRun ? 'Previewing…' : 'Retiring…';
+  try {
+    const v = await api('/backoffice/api/customers/'+r.user_id+'/retire', {method:'POST', body:{reason, twin_user_id: twin ? twin.user_id : null, delete_login: del, dry_run: dryRun}});
+    const range = v.quarantine_range && v.quarantine_range[0] ? `${fmtDate(v.quarantine_range[0])} → ${fmtDate(v.quarantine_range[1])}` : '—';
+    box.innerHTML = `<b>${dryRun ? 'Preview — nothing written yet' : 'Done'}</b><br>
+      Login <span class="mono">${esc(v.email)}</span> (${v.last_sign_in_at ? 'last sign-in ' + fmtDate(v.last_sign_in_at) : 'never signed in'}) → <b>${esc(v.login_action)}</b>${v.login_done===false?' <span class="tag bad">login step failed — see server log</span>':''}<br>
+      ${v.twin ? `Twin: <b>${esc(v.twin.full_name||v.twin.email)}</b> <span class="mono">${esc(v.twin.email)}</span> on station <span class="mono">${esc(v.twin.station||'—')}</span>; days only here: <b>${v.days_only_here}</b><br>` : 'No twin named (test data / no plant of its own).<br>'}
+      ${dryRun?'Will quarantine':'Quarantined'} <b>${v.rows_to_quarantine}</b> daily row(s) (${range}, ${v.kwh_to_quarantine} kWh) and ${v.five_minute_rows_to_drop} five-minute row(s); ${v.systems.length} station row(s), ${v.cleaned_data_rows_to_drop||0} legacy cleaned_data row(s) and the profile ${dryRun?'will be':'were'} removed${v.live_jobs_to_cancel?`; ${v.live_jobs_to_cancel} job(s) cancelled`:''}.`
+      + (v.related_rows && Object.keys(v.related_rows).length ? `<br>Customer-side rows on this login (${Object.entries(v.related_rows).map(([t,n]) => `${t} ${n}`).join(', ')}): <b>${v.related_rows_action === 'delete' ? (dryRun?'will be deleted with the login':'deleted with the login') : 'kept (login is banned, not deleted)'}</b>` : '');
+    if (dryRun) { $('#btn-retire-confirm').disabled = false; }
+    else { toast('Account retired'); $('#panel').classList.remove('open'); await loadRows(true); }
+  } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; $('#btn-retire-confirm').disabled = true; }
 }
 function summarizeVerdict(v){
   if (!v || typeof v !== 'object') return esc(JSON.stringify(v));
