@@ -553,14 +553,23 @@ async def remap_station(system_id: uuid.UUID, body: RemapRequest, authorization:
     staff = await _authenticate_staff(authorization)
     _require(staff, "engineer")
     new_sid = body.new_station_id.strip()
-    if not STATION_ID_RE.match(new_sid):
-        raise HTTPException(400, "Solis station id must be 15–20 digits")
-    roster, _age, stale = await _get_roster()
-    if roster is None:
-        raise HTTPException(503, "Solis roster unavailable — try again in a minute")
-    rec = roster.get(new_sid)
-    if not rec:
-        raise HTTPException(400, f"Station {new_sid} is not in our Solis account (checked the live roster)")
+    # DETACH mode (new_station_id empty): the customer was given someone else's
+    # station and their own plant is not in our Solis account at all — found to
+    # be the common case on 2026-09-17 (no plant among 654 carried any of the
+    # suspects' names). Quarantine the wrong data, clear the id, mark the system
+    # 'pending', queue nothing. Sales/engineering attach the right plant later.
+    detach = new_sid == ""
+    rec: Dict[str, Any] = {}
+    stale = False
+    if not detach:
+        if not STATION_ID_RE.match(new_sid):
+            raise HTTPException(400, "Solis station id must be 15–20 digits (or empty to detach)")
+        roster, _age, stale = await _get_roster()
+        if roster is None:
+            raise HTTPException(503, "Solis roster unavailable — try again in a minute")
+        rec = roster.get(new_sid) or {}
+        if not rec:
+            raise HTTPException(400, f"Station {new_sid} is not in our Solis account (checked the live roster)")
 
     with db.connect(autocommit=True) as conn:
         sys_row = conn.execute(
@@ -568,9 +577,11 @@ async def remap_station(system_id: uuid.UUID, body: RemapRequest, authorization:
             (system_id,)).fetchone()
         if not sys_row:
             raise HTTPException(404, "No such system")
-        if sys_row["solis_station_id"] == new_sid:
+        if not detach and sys_row["solis_station_id"] == new_sid:
             raise HTTPException(400, "That is already this system's station id")
-        holder = conn.execute(
+        if detach and not sys_row["solis_station_id"]:
+            raise HTTPException(400, "This system has no station id to detach")
+        holder = None if detach else conn.execute(
             """select s.id, s.system_name, p.full_name from public.solar_systems s
                  left join public.user_profiles p on p.id = s.user_id
                 where s.solis_station_id = %s and s.id <> %s""", (new_sid, system_id)).fetchone()
@@ -596,14 +607,15 @@ async def remap_station(system_id: uuid.UUID, body: RemapRequest, authorization:
             except ValueError:
                 pass
     today = dt.datetime.now(PHT).date()
-    backfill_from = body.backfill_from or first_power or (today - dt.timedelta(days=365))
+    backfill_from = None if detach else (body.backfill_from or first_power or (today - dt.timedelta(days=365)))
     preview = _j({
-        "system_id": system_id, "old_station_id": sys_row["solis_station_id"], "new_station_id": new_sid,
+        "system_id": system_id, "detach": detach,
+        "old_station_id": sys_row["solis_station_id"], "new_station_id": None if detach else new_sid,
         "new_plant_name": rec.get("stationName"), "new_capacity_kwp": float(rec.get("capacity") or 0) or None,
         "new_solis_email": rec.get("userEmail"), "first_power_date": first_power,
         "rows_to_quarantine": stats["rows"], "quarantine_range": [stats["first_ts"], stats["last_ts"]],
         "kwh_to_quarantine": stats["kwh"], "five_minute_rows_to_drop": fm_rows,
-        "backfill_from": backfill_from, "backfill_to": today - dt.timedelta(days=1),
+        "backfill_from": backfill_from, "backfill_to": None if detach else today - dt.timedelta(days=1),
         "live_jobs_to_cancel": len(live_jobs), "roster_stale": stale,
     })
     if body.dry_run:
@@ -617,7 +629,7 @@ async def remap_station(system_id: uuid.UUID, body: RemapRequest, authorization:
                 """insert into public.energy_readings_quarantine
                    select r.*, now(), %s, %s, %s, %s, %s
                      from public.energy_readings r where r.system_id = %s""",
-                (staff["id"], request_id, reason, sys_row["solis_station_id"], new_sid, system_id))
+                (staff["id"], request_id, reason, sys_row["solis_station_id"], None if detach else new_sid, system_id))
             conn.execute("delete from public.energy_readings where system_id = %s", (system_id,))
             conn.execute("delete from public.energy_readings_five_minutes where system_id = %s", (system_id,))
             if live_jobs:
@@ -625,19 +637,32 @@ async def remap_station(system_id: uuid.UUID, body: RemapRequest, authorization:
                     "update public.backfill_jobs set status = 'cancelled', finished_at = now(), "
                     "error = 'superseded by remap' where system_id = %s and status in ('queued','running')",
                     (system_id,))
-            conn.execute(
-                """update public.solar_systems
-                      set solis_station_id = %s, solis_plant_name = %s, solis_user_email = %s,
-                          capacity_kwp = coalesce(%s, capacity_kwp),
-                          installation_date = coalesce(%s, installation_date),
-                          solis_validated_at = now(), solis_validation = 'verified',
-                          last_backfill_status = null, last_backfill_at = null, updated_at = now()
-                    where id = %s""",
-                (new_sid, rec.get("stationName") or sys_row["system_name"], rec.get("userEmail"),
-                 float(rec.get("capacity") or 0) or None, first_power, system_id))
-            job = _enqueue_range(conn, system_id, new_sid, "daily", backfill_from, today - dt.timedelta(days=1),
-                                 staff, reason, request_id)
-            job5 = _enqueue_range(conn, system_id, new_sid, "five_minutes", today, today, staff, reason, request_id)
+            if detach:
+                # No correct plant known: clear the id, park the system as
+                # 'pending' so the syncs skip it and the grid shows it as
+                # unresolved, keep the old plant name for the audit trail.
+                conn.execute(
+                    """update public.solar_systems
+                          set solis_station_id = null, status = 'pending',
+                              solis_validated_at = now(), solis_validation = 'absent',
+                              last_backfill_status = null, last_backfill_at = null, updated_at = now()
+                        where id = %s""", (system_id,))
+                job = job5 = None
+            else:
+                conn.execute(
+                    """update public.solar_systems
+                          set solis_station_id = %s, solis_plant_name = %s, solis_user_email = %s,
+                              capacity_kwp = coalesce(%s, capacity_kwp),
+                              installation_date = coalesce(%s, installation_date),
+                              status = case when status = 'pending' then 'active' else status end,
+                              solis_validated_at = now(), solis_validation = 'verified',
+                              last_backfill_status = null, last_backfill_at = null, updated_at = now()
+                        where id = %s""",
+                    (new_sid, rec.get("stationName") or sys_row["system_name"], rec.get("userEmail"),
+                     float(rec.get("capacity") or 0) or None, first_power, system_id))
+                job = _enqueue_range(conn, system_id, new_sid, "daily", backfill_from, today - dt.timedelta(days=1),
+                                     staff, reason, request_id)
+                job5 = _enqueue_range(conn, system_id, new_sid, "five_minutes", today, today, staff, reason, request_id)
     except HTTPException:
         raise
     except psycopg.Error as exc:
@@ -825,6 +850,15 @@ async def unresolved(authorization: str = Header(None)):
             signals.append("Solis plant email MATCHES the login email → mapping is probably right; the profile name is the odd one")
         if pt and ot and (pt & ot):
             signals.append("plant name matches the ODOO name → the profile name is probably what's wrong")
+        # Household: the plant carries a relative's name, and that name is in
+        # the customer's own login address (genpastrana_delacruz@ ↔ "Helen Pastrana").
+        if le and any(w in le.split("@")[0] for w in pt if len(w) > 3):
+            signals.append("the login email contains a word of the plant name → same household, mapping is probably right")
+        # Organisation: a church, shop or company plant named after the entity,
+        # with the customer as its contact person.
+        if re.search(r"\b(ministr|church|grocery|store|shop|inc|corp|co\b|school|clinic|hoa|homes|depot|station|resort|farm)",
+                     (r["solis_plant_name"] or "").lower()):
+            signals.append("plant name looks like an organisation → the customer is probably its contact person")
         suspects.append({**dict(r), "score": score, "signals": signals, "suggested_stations": []})
     suspects.sort(key=lambda x: (-x["score"], -(x["readings"] or 0)))
 

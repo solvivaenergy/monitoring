@@ -362,9 +362,10 @@ async function openPanel(systemId){
         <div><label>Correct Solis station id</label><input id="remap-sid" pattern="\\d{15,20}" placeholder="19 digits, from the Odoo lead or Solis Cloud"></div>
         <div><label>Backfill from (optional; default = plant's first-power date)</label><input id="remap-from" type="date"></div>
       </div>
+      <label class="row hint" style="margin-top:8px"><input type="checkbox" id="remap-detach"> <b>No correct station is known</b> — detach this customer from the station and quarantine the data (system becomes <i>pending</i>; attach the right plant later when sales/engineering find it)</label>
       <div class="row" style="margin-top:8px">
         <button class="btn sm" id="btn-remap-preview">Preview</button>
-        <button class="btn sm primary" id="btn-remap-confirm" disabled>Confirm remap</button>
+        <button class="btn sm primary" id="btn-remap-confirm" disabled>Confirm</button>
         <span class="hint">Preview first. Confirm needs the reason box below. Nothing is deleted — the old rows go to quarantine, recoverable.</span>
       </div>
       <div class="verdict" id="v-remap" hidden></div>
@@ -487,22 +488,28 @@ async function reconcileSystem(r){
   } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
 }
 async function remap(r, dryRun){
-  const sid = $('#remap-sid').value.trim(), from = $('#remap-from').value || null, box = $('#v-remap');
-  if (!/^\d{15,20}$/.test(sid)) return toast('Enter the correct station id (15–20 digits)', true);
+  const detach = $('#remap-detach').checked;
+  const sid = detach ? '' : $('#remap-sid').value.trim(), from = $('#remap-from').value || null, box = $('#v-remap');
+  if (!detach && !/^\d{15,20}$/.test(sid)) return toast('Enter the correct station id (15–20 digits), or tick "No correct station is known"', true);
   const reason = ($('#reason')?.value||'').trim();
   if (!dryRun && reason.length < 3) return toast('Type the reason in the Save-changes box first — it goes into the audit log', true);
-  if (!dryRun && !confirm(`Remap "${r.full_name||r.system_name}" from ${r.solis_station_id} to ${sid}?\n\nAll readings recorded under the old id move to quarantine and the correct history is backfilled. Continue?`)) return;
-  box.hidden = false; box.textContent = dryRun ? 'Previewing…' : 'Remapping…';
+  const what = detach
+    ? `Detach "${r.full_name||r.system_name}" from station ${r.solis_station_id}?\n\nAll readings recorded under it move to quarantine; the system becomes "pending" with no station until the right plant is attached. Continue?`
+    : `Remap "${r.full_name||r.system_name}" from ${r.solis_station_id} to ${sid}?\n\nAll readings recorded under the old id move to quarantine and the correct history is backfilled. Continue?`;
+  if (!dryRun && !confirm(what)) return;
+  box.hidden = false; box.textContent = dryRun ? 'Previewing…' : (detach ? 'Detaching…' : 'Remapping…');
   try {
     const v = await api('/backoffice/api/systems/'+r.system_id+'/remap', {method:'POST', body:{new_station_id: sid, reason, dry_run: dryRun, backfill_from: from}});
     const range = v.quarantine_range && v.quarantine_range[0] ? `${fmtDate(v.quarantine_range[0])} → ${fmtDate(v.quarantine_range[1])}` : '—';
-    box.innerHTML = `<b>${dryRun ? 'Preview — nothing written yet' : 'Done'}</b><br>
-      Station: <span class="mono">${esc(v.old_station_id)}</span> → <span class="mono">${esc(v.new_station_id)}</span><br>
-      New identity from Solis: <b>${esc(v.new_plant_name||'?')}</b>, ${v.new_capacity_kwp??'?'} kWp, email ${esc(v.new_solis_email||'—')}, first power ${fmtDate(v.first_power_date)}<br>
-      ${dryRun?'Will quarantine':'Quarantined'}: <b>${v.rows_to_quarantine}</b> daily row(s) (${range}, ${v.kwh_to_quarantine} kWh) and ${v.five_minute_rows_to_drop} five-minute row(s) from today${v.live_jobs_to_cancel?`; ${v.live_jobs_to_cancel} live job(s) cancelled`:''}<br>
-      ${dryRun?'Will queue':'Queued'} a daily backfill ${fmtDate(v.backfill_from)} → ${fmtDate(v.backfill_to)} plus today's five-minute refresh${v.roster_stale?' <span class="tag warn">Solis roster is stale — plant details may be slightly old</span>':''}`;
+    box.innerHTML = `<b>${dryRun ? 'Preview — nothing written yet' : 'Done'}</b><br>`
+      + (v.detach
+          ? `Station <span class="mono">${esc(v.old_station_id)}</span> → <b>none</b>; system becomes <span class="tag warn">pending</span> and the syncs skip it until a plant is attached.<br>`
+          : `Station: <span class="mono">${esc(v.old_station_id)}</span> → <span class="mono">${esc(v.new_station_id)}</span><br>New identity from Solis: <b>${esc(v.new_plant_name||'?')}</b>, ${v.new_capacity_kwp??'?'} kWp, email ${esc(v.new_solis_email||'—')}, first power ${fmtDate(v.first_power_date)}<br>`)
+      + `${dryRun?'Will quarantine':'Quarantined'}: <b>${v.rows_to_quarantine}</b> daily row(s) (${range}, ${v.kwh_to_quarantine} kWh) and ${v.five_minute_rows_to_drop} five-minute row(s) from today${v.live_jobs_to_cancel?`; ${v.live_jobs_to_cancel} live job(s) cancelled`:''}<br>`
+      + (v.detach ? 'No backfill queued (nothing to fetch yet).' : `${dryRun?'Will queue':'Queued'} a daily backfill ${fmtDate(v.backfill_from)} → ${fmtDate(v.backfill_to)} plus today's five-minute refresh`)
+      + (v.roster_stale?' <span class="tag warn">Solis roster is stale — plant details may be slightly old</span>':'');
     if (dryRun) { $('#btn-remap-confirm').disabled = false; }
-    else { toast('Remapped — the worker will backfill within 15 minutes'); await loadRows(true); openPanel(r.system_id); }
+    else { toast(detach ? 'Detached — data quarantined' : 'Remapped — the worker will backfill within 15 minutes'); await loadRows(true); openPanel(r.system_id); }
   } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; $('#btn-remap-confirm').disabled = true; }
 }
 function summarizeVerdict(v){
@@ -637,6 +644,8 @@ function loadGuide(){
       <li><b>Check data vs Solis</b> is a different question: it confirms our stored rows equal Solis for the id we hold. It stays ~99% even on a wrong mapping, so use it after a remap to confirm the backfill, and to catch stale or leftover rows — not to decide identity.</li>
       <li>Find the correct station id (the Odoo lead's "CRM Design Solis Station ID" if sales fixed it, or Solis Cloud). <b>Validate Solis station</b> on it first.</li>
       <li><b>Remap to the correct Solis station</b> → Preview → type the reason in the Save-changes box → Confirm. All readings recorded under the wrong id move to quarantine (kept, not deleted); the plant's name, capacity and first-power date are refreshed from Solis; a backfill of the correct history is queued and runs within 15 minutes.</li>
+      <li><b>If no plant in our Solis account is the customer's</b> (the common case found on 17 Sep: none of the 654 plants carried any suspect's name), tick <i>No correct station is known</i> in the Remap box instead: the wrong data is quarantined, the system becomes <i>pending</i> and stops syncing, and the right plant is attached later with <i>Add another Solis station</i> or a Remap once sales/engineering find it.</li>
+      <li>Before deciding, read the signals in Unresolved: a login email containing a word of the plant name (a spouse's or relative's name on the plant) or a plant named after an organisation (a church, a shop) usually means the mapping is right and only the profile name needs fixing.</li>
       <li>If the wrong id came from the Odoo lead, tell sales to correct the lead — otherwise the grid keeps showing "Odoo ≠ Supabase" for that customer.</li>
     </ol>
 
