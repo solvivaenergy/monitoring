@@ -206,6 +206,12 @@ async def backfill_station_ids(
             if not apply:
                 system_id = "DRY-RUN"
             else:
+                # solis_station_id is the key both syncs iterate on since
+                # 2026-09-16. Until 2026-09-17 this insert omitted it, so a
+                # freshly onboarded customer got this 60-day backfill and then
+                # nothing — the station-centric syncs skip rows with a NULL id.
+                # Two customers onboarded on the night of 2026-09-16 were
+                # patched by hand after this was found.
                 ins = (
                     sb.table("solar_systems")
                     .insert(
@@ -216,6 +222,8 @@ async def backfill_station_ids(
                             "installation_date": start_date.isoformat(),
                             "address": "—",
                             "status": "active",
+                            "solis_station_id": station_id,
+                            "solis_plant_name": station_name,
                         }
                     )
                     .execute()
@@ -400,6 +408,7 @@ async def main() -> None:
                 if dry_run:
                     system_id = "DRY-RUN"
                 else:
+                    # Same fix as above: the syncs key on solis_station_id.
                     ins = (
                         sb.table("solar_systems")
                         .insert(
@@ -410,6 +419,8 @@ async def main() -> None:
                                 "installation_date": start_date.isoformat(),
                                 "address": "—",
                                 "status": "active",
+                                "solis_station_id": station_id,
+                                "solis_plant_name": station_name,
                             }
                         )
                         .execute()

@@ -334,6 +334,9 @@ async def main():
                     return
 
                 if not dry_run:
+                    # Unreachable in practice — the work list comes from
+                    # solar_systems, so system_id is always set — but if it
+                    # ever runs it must carry the station id the syncs key on.
                     ins = sb.table("solar_systems").insert({
                         "user_id": uid,
                         "system_name": station_name,
@@ -341,6 +344,8 @@ async def main():
                         "installation_date": today.isoformat(),
                         "address": "—",
                         "status": "active",
+                        "solis_station_id": station_id,
+                        "solis_plant_name": station_name,
                     }).execute()
                     system_id = ins.data[0]["id"]
                 else:
