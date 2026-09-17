@@ -396,6 +396,17 @@ async def main() -> None:
         except Exception as e:
             log.error("Referral code sync failed: %s", e)
 
+        # Mirror Odoo lead/partner fields and Solis plant name/email into our
+        # cached identity columns for the back office. Read-only toward Odoo.
+        # Last, so a failure here never delays the readings above.
+        if "--no-mirror" not in sys.argv:
+            try:
+                from api.sync_identity_mirror import run as mirror_identity
+                log.info("Starting identity mirror (Odoo + Solis → cached columns)…")
+                await mirror_identity(apply=True)
+            except Exception as e:
+                log.error("Identity mirror failed: %s", e)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

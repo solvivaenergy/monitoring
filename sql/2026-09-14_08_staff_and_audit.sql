@@ -169,7 +169,13 @@ declare
   a_req   uuid := nullif(current_setting('app.request_id',  true), '')::uuid;
   a_src   text := coalesce(nullif(current_setting('app.source', true), ''), 'unknown');
   a_kind  text;
-  pk      text := coalesce(new_j ->> 'id', old_j ->> 'id');
+  -- Not every audited table keys on "id": staff_users keys on user_id. As
+  -- first written this was coalesce(new_j->>'id', old_j->>'id') and returned
+  -- NULL for staff_users, so the INSERT of the very first staff row failed on
+  -- row_pk's NOT NULL (2026-09-17). Fall through the known key columns and
+  -- never return NULL. Replaced in production the same day.
+  pk      text := coalesce(new_j ->> 'id', old_j ->> 'id',
+                           new_j ->> 'user_id', old_j ->> 'user_id', '(no pk)');
 begin
   a_id   := coalesce(a_id, auth.uid());
   a_kind := case when a_id is not null      then 'staff'

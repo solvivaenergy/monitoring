@@ -22,6 +22,24 @@ services:
       # belongs on /app/*, which authenticates the Supabase JWT.
       - key: SOLIS_API_TOKEN
         sync: false
+      # /app/live, /admin/validate/* and /backoffice/* all need Supabase.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      # Handed to the back-office page so it can start a Supabase Auth session.
+      # Public by design (it ships in the mobile app); RLS + staff_users gate it.
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      # Direct Postgres for the back office (auth.users join, audited writes).
+      # db.<ref>.supabase.co is IPv6-only; if this container has no IPv6 route,
+      # set SUPABASE_DB_POOLER_URL to the Session-pooler string instead
+      # (Dashboard → Settings → Database → Connection string → Session pooler;
+      # the project is in ap-south-1). api/db.py tries both.
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_DB_POOLER_URL
+        sync: false
 
   # Daily sync cron: Solis → Supabase (2:00 AM PHT via Render cron)
   - type: cron
@@ -48,6 +66,13 @@ services:
       - key: ODOO_API_KEY
         sync: false
       - key: DEFAULT_USER_PASSWORD
+        sync: false
+      # api.sync_identity_mirror (end of the nightly run) writes through
+      # psycopg so the audit trigger attributes it. Same note as solviva-api:
+      # the direct host is IPv6-only, the Session-pooler string is the fallback.
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_DB_POOLER_URL
         sync: false
       - key: ONBOARD_BACKFILL_DAYS
         value: "60"

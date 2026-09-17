@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solviva Back Office</title>
+<meta name="robots" content="noindex, nofollow">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--text:#1d2430;--muted:#66707d;--brand:#0f7a4e;--brand-2:#0a5d3b;--warn:#b7791f;--bad:#b42318;--ok:#0f7a4e;--chip:#eef1f4;--radius:10px}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:var(--text);background:var(--bg)}
+  header{display:flex;align-items:center;gap:16px;padding:10px 20px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
+  header .spacer{flex:1}
+  nav.tabs{display:flex;gap:4px}
+  nav.tabs button{background:none;border:0;padding:8px 12px;border-radius:8px;cursor:pointer;color:var(--muted);font-weight:600}
+  nav.tabs button.active{background:var(--chip);color:var(--text)}
+  .who{color:var(--muted);font-size:13px}
+  .who b{color:var(--text)}
+  main{padding:16px 20px;max-width:1600px;margin:0 auto}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  input,select,textarea{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--text)}
+  input[type=search]{min-width:280px}
+  button{font:inherit}
+  .btn{padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:#fff;cursor:pointer;font-weight:600}
+  .btn.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  .btn.primary:hover{background:var(--brand-2)}
+  .btn.danger{color:var(--bad);border-color:#f1c5c0}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn.sm{padding:4px 9px;font-size:12px}
+  .chip{padding:5px 10px;border-radius:999px;background:var(--chip);border:1px solid transparent;cursor:pointer;font-size:12.5px;font-weight:600;color:var(--muted)}
+  .chip.active{border-color:var(--brand);color:var(--brand);background:#e9f6ef}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:7px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;white-space:nowrap}
+  th{position:sticky;top:0;background:#fafbfc;color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.3px;cursor:pointer;user-select:none}
+  tbody tr:hover{background:#f3f7f5;cursor:pointer}
+  .tablewrap{overflow:auto;max-height:calc(100vh - 210px);border:1px solid var(--line);border-radius:var(--radius);background:#fff}
+  .muted{color:var(--muted)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+  .tag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11.5px;font-weight:600;background:var(--chip);color:var(--muted)}
+  .tag.ok{background:#e9f6ef;color:var(--ok)}.tag.warn{background:#fdf3e1;color:var(--warn)}.tag.bad{background:#fdecea;color:var(--bad)}
+  .panel{position:fixed;top:0;right:0;height:100vh;width:min(560px,100vw);background:var(--card);border-left:1px solid var(--line);box-shadow:-8px 0 30px rgba(0,0,0,.08);transform:translateX(100%);transition:transform .18s ease;z-index:10;display:flex;flex-direction:column}
+  .panel.open{transform:none}
+  .panel header{position:static;border-bottom:1px solid var(--line)}
+  .panel .body{overflow:auto;padding:14px 18px 40px;flex:1}
+  .panel h3{font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);margin:18px 0 8px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
+  .grid2 label,.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}
+  .grid2 input,.grid2 select,.field input,.field textarea{width:100%}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .verdict{font-size:12.5px;padding:8px 10px;border-radius:8px;background:#fafbfc;border:1px solid var(--line);margin-top:6px;white-space:pre-wrap;word-break:break-word}
+  .audit li{padding:6px 0;border-bottom:1px dashed var(--line);font-size:12.5px}
+  .audit .when{color:var(--muted)}
+  .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#1d2430;color:#fff;padding:10px 16px;border-radius:10px;font-size:13px;z-index:20;opacity:0;transition:opacity .2s}
+  .toast.show{opacity:1}
+  .toast.bad{background:var(--bad)}
+  .login{max-width:400px;margin:70px auto}
+  .login h2{margin:0 0 6px}
+  .login .field{margin-bottom:10px}
+  .login .or{color:var(--muted);text-align:center;margin:12px 0;font-size:12px}
+  .kpi{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  .kpi .card{padding:10px 14px;min-width:150px}
+  .kpi .n{font-size:22px;font-weight:700}
+  .kpi .l{font-size:12px;color:var(--muted)}
+  ul.plain{list-style:none;margin:0;padding:0}
+  .sect{margin-bottom:18px}
+  .hint{font-size:12px;color:var(--muted)}
+  @media (max-width:800px){.grid2{grid-template-columns:1fr}input[type=search]{min-width:0;flex:1}}
+</style>
+</head>
+<body>
+
+<header id="topbar" hidden>
+  <h1>Solviva Back Office</h1>
+  <nav class="tabs" id="tabs">
+    <button data-tab="customers" class="active">Customers</button>
+    <button data-tab="unresolved">Unresolved</button>
+    <button data-tab="jobs">Backfills</button>
+    <button data-tab="audit">Audit</button>
+    <button data-tab="staff" id="tab-staff" hidden>Staff</button>
+  </nav>
+  <div class="spacer"></div>
+  <span class="who" id="who"></span>
+  <button class="btn sm" id="btn-password">Change password</button>
+  <button class="btn sm" id="btn-signout">Sign out</button>
+</header>
+
+<main id="app">
+  <section id="view-login" class="login card">
+    <h2>Sign in</h2>
+    <p class="hint">Staff accounts only. Customer logins are not authorised here.</p>
+    <div class="field"><label>Email</label><input id="login-email" type="email" autocomplete="username"></div>
+    <div class="field" id="login-pw-field"><label>Password</label><input id="login-password" type="password" autocomplete="current-password"></div>
+    <div class="row">
+      <button class="btn primary" id="btn-login">Sign in</button>
+      <button class="btn" id="btn-forgot">Forgot password</button>
+    </div>
+    <div class="or">or</div>
+    <button class="btn" id="btn-google" style="width:100%">Sign in with Google (solvivaenergy.com)</button>
+    <p class="hint" id="login-msg" style="margin-top:12px"></p>
+  </section>
+
+  <section id="view-recovery" class="login card" hidden>
+    <h2>Set a new password</h2>
+    <div class="field"><label>New password</label><input id="new-password" type="password" autocomplete="new-password"></div>
+    <button class="btn primary" id="btn-set-password">Save password</button>
+    <p class="hint" id="recovery-msg"></p>
+  </section>
+
+  <section id="view-customers" hidden>
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="Search name, email, station id, lead id, plant…">
+      <span class="chip active" data-f="all">All</span>
+      <span class="chip" data-f="nostation">No station id</span>
+      <span class="chip" data-f="dark">Dark &gt;3 days</span>
+      <span class="chip" data-f="mismatch">Odoo ≠ Supabase</span>
+      <span class="chip" data-f="multi">Multi-station</span>
+      <span class="chip" data-f="backfill">Backfill active</span>
+      <span class="muted" id="rowcount"></span>
+      <div class="spacer"></div>
+      <button class="btn" id="btn-validate-all">Validate all</button>
+      <button class="btn" id="btn-reload">Reload</button>
+    </div>
+    <div class="tablewrap"><table id="grid"><thead></thead><tbody></tbody></table></div>
+  </section>
+
+  <section id="view-unresolved" hidden></section>
+  <section id="view-jobs" hidden></section>
+  <section id="view-audit" hidden></section>
+  <section id="view-staff" hidden></section>
+</main>
+
+<aside class="panel" id="panel">
+  <header><h1 id="panel-title">Station</h1><div class="spacer"></div><button class="btn sm" id="panel-close">Close</button></header>
+  <div class="body" id="panel-body"></div>
+</aside>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ------------------------------------------------------------------ */
+/* boot: Supabase session                                               */
+/* ------------------------------------------------------------------ */
+const $ = (s, el=document) => el.querySelector(s);
+const $$ = (s, el=document) => [...el.querySelectorAll(s)];
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtDate = (v) => v ? String(v).slice(0,10) : '—';
+const fmtTs = (v) => v ? new Date(v).toLocaleString('en-PH', {hour12:false}) : '—';
+const daysSince = (v) => v ? Math.floor((Date.now() - new Date(v).getTime())/86400000) : null;
+
+let sb = null, session = null, me = null;
+let ROWS = [], FILTER = 'all', SORT = {key:'full_name', dir:1}, VALIDATIONS = {};
+
+function toast(msg, bad=false){ const t=$('#toast'); t.textContent=msg; t.className='toast show'+(bad?' bad':''); clearTimeout(t._h); t._h=setTimeout(()=>t.className='toast', 3500); }
+
+async function api(path, opts={}){
+  const headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
+  if (session?.access_token) headers.Authorization = 'Bearer ' + session.access_token;
+  const r = await fetch(path, Object.assign({}, opts, {headers, body: opts.body && typeof opts.body!=='string' ? JSON.stringify(opts.body) : opts.body}));
+  if (r.status === 401) { await signOut(); throw new Error('Session expired — please sign in again'); }
+  let data = null; try { data = await r.json(); } catch(e) {}
+  if (!r.ok) throw new Error((data && (data.detail?.message || data.detail || data.error)) || `HTTP ${r.status}`);
+  return data;
+}
+
+async function boot(){
+  const cfg = await (await fetch('/backoffice/api/config')).json();
+  sb = supabase.createClient(cfg.supabase_url, cfg.supabase_anon_key, {auth:{persistSession:true, autoRefreshToken:true, detectSessionInUrl:true}});
+  sb.auth.onAuthStateChange(async (event, s) => {
+    session = s;
+    if (event === 'PASSWORD_RECOVERY') { show('recovery'); return; }
+    if (session) await afterLogin(); else show('login');
+  });
+  const {data} = await sb.auth.getSession();
+  session = data.session;
+  if (session) await afterLogin(); else show('login');
+}
+
+function show(view){
+  $$('main > section').forEach(s => s.hidden = true);
+  const el = $('#view-'+view); if (el) el.hidden = false;
+  $('#topbar').hidden = !(me && view!=='login' && view!=='recovery');
+  $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab===view));
+}
+
+async function afterLogin(){
+  try {
+    me = await api('/backoffice/api/me');
+  } catch (e) {
+    me = null;
+    $('#login-msg').textContent = /403|authorised/i.test(e.message) ? `${session?.user?.email} is signed in but is not a staff account. Ask an admin to add you.` : e.message;
+    show('login'); return;
+  }
+  $('#who').innerHTML = `<b>${esc(me.email)}</b> · ${esc(me.role)}`;
+  $('#tab-staff').hidden = me.role !== 'admin';
+  show('customers');
+  await loadRows();
+}
+
+async function signOut(){ try { await sb.auth.signOut(); } catch(e){} session=null; me=null; show('login'); }
+
+/* login UI */
+$('#btn-login').onclick = async () => {
+  $('#login-msg').textContent = 'Signing in…';
+  const {error} = await sb.auth.signInWithPassword({email: $('#login-email').value.trim(), password: $('#login-password').value});
+  $('#login-msg').textContent = error ? error.message : '';
+};
+$('#login-password').addEventListener('keydown', e => { if (e.key==='Enter') $('#btn-login').click(); });
+$('#btn-google').onclick = async () => {
+  const {error} = await sb.auth.signInWithOAuth({provider:'google', options:{redirectTo: location.origin + '/backoffice', queryParams:{hd:'solvivaenergy.com', prompt:'select_account'}}});
+  if (error) $('#login-msg').textContent = error.message + ' (Google sign-in must be enabled in Supabase → Authentication → Providers)';
+};
+$('#btn-forgot').onclick = async () => {
+  const email = $('#login-email').value.trim(); if (!email) return $('#login-msg').textContent = 'Enter your email first.';
+  const {error} = await sb.auth.resetPasswordForEmail(email, {redirectTo: location.origin + '/backoffice'});
+  $('#login-msg').textContent = error ? error.message : 'If that address is a staff account, a reset link has been emailed.';
+};
+$('#btn-set-password').onclick = async () => {
+  const {error} = await sb.auth.updateUser({password: $('#new-password').value});
+  $('#recovery-msg').textContent = error ? error.message : 'Saved.'; if (!error) { await afterLogin(); }
+};
+$('#btn-password').onclick = () => { show('recovery'); };
+$('#btn-signout').onclick = signOut;
+$$('#tabs button').forEach(b => b.onclick = () => { show(b.dataset.tab); ({unresolved:loadUnresolved, jobs:loadJobs, audit:loadAudit, staff:loadStaff}[b.dataset.tab]||(()=>{}))(); });
+
+/* ------------------------------------------------------------------ */
+/* customers grid                                                       */
+/* ------------------------------------------------------------------ */
+const COLS = [
+  {key:'full_name', label:'Customer', render:r => `<b>${esc(r.full_name||'—')}</b>${r._multi?' <span class="tag">'+r._multi+' stations</span>':''}${r.is_primary===false?' <span class="tag">secondary</span>':''}`},
+  {key:'login_email', label:'Login email', render:r => `<span class="mono">${esc(r.login_email||'—')}</span>${r.banned_until?' <span class="tag bad">banned</span>':''}`},
+  {key:'odoo_lead_id', label:'Odoo lead', render:r => r.odoo_lead_id ? `<span class="mono">${r.odoo_lead_id}</span>` : '<span class="muted">—</span>'},
+  {key:'odoo_partner_id', label:'Odoo customer', render:r => r.odoo_partner_id ? `<span class="mono">${r.odoo_partner_id}</span>` : '<span class="muted">—</span>'},
+  {key:'odoo_customer_name', label:'Name (Odoo)', render:r => esc(r.odoo_customer_name||r.odoo_lead_name||'—')},
+  {key:'odoo_email', label:'Email (Odoo)', render:r => `<span class="mono">${esc(r.odoo_email||r.odoo_lead_email||'—')}</span>`},
+  {key:'solis_station_id', label:'Solis station', render:r => r.solis_station_id ? `<span class="mono">${r.solis_station_id}</span>${vTag(r)}` : '<span class="tag bad">none</span>'},
+  {key:'solis_plant_name', label:'Plant (Solis)', render:r => esc(r.solis_plant_name||r.system_name||'—')},
+  {key:'capacity_kwp', label:'kWp', render:r => r.capacity_kwp ?? '—'},
+  {key:'last_daily', label:'Last daily', render:r => { const d = daysSince(r.last_daily); return d===null ? '<span class="tag bad">never</span>' : `${fmtDate(r.last_daily)}${d>3?` <span class="tag ${d>30?'bad':'warn'}">${d}d</span>`:''}`; }},
+  {key:'last_5m', label:'Last 5-min', render:r => r.last_5m ? fmtTs(r.last_5m).slice(11,16) : '—'},
+  {key:'status', label:'Status', render:r => `<span class="tag ${r.status==='active'?'ok':''}">${esc(r.status)}</span>${r.active_job_status?` <span class="tag warn">backfill ${esc(r.active_job_status)}</span>`:''}`},
+];
+function vTag(r){ const v = VALIDATIONS[r.system_id]; if(!v) return ''; const s=v.solis_station?.status||v.status; return s ? ` <span class="tag ${/ok|found|assigned/i.test(s)?'ok':/unavail/i.test(s)?'warn':'bad'}" title="${esc(JSON.stringify(v))}">${esc(s)}</span>` : ''; }
+
+function mismatch(r){
+  const le = (r.login_email||'').toLowerCase(), oe = (r.odoo_email||r.odoo_lead_email||'').toLowerCase();
+  if (oe && le && oe !== le) return true;
+  const n1 = (r.full_name||'').toLowerCase().replace(/\s+/g,' ').trim(), n2 = (r.odoo_customer_name||r.odoo_lead_name||'').toLowerCase().replace(/\s+/g,' ').trim();
+  return !!(n1 && n2 && n1 !== n2);
+}
+function applyFilter(rows){
+  const q = $('#q').value.trim().toLowerCase();
+  return rows.filter(r => {
+    if (FILTER==='nostation' && r.solis_station_id) return false;
+    if (FILTER==='dark' && !(daysSince(r.last_daily)===null || daysSince(r.last_daily)>3)) return false;
+    if (FILTER==='mismatch' && !mismatch(r)) return false;
+    if (FILTER==='multi' && !(r._multi>1)) return false;
+    if (FILTER==='backfill' && !r.active_job_status) return false;
+    if (!q) return true;
+    return [r.full_name, r.login_email, r.odoo_email, r.odoo_lead_email, r.odoo_customer_name, r.odoo_lead_name, r.solis_station_id, r.solis_plant_name, r.system_name, r.odoo_lead_id, r.odoo_partner_id, r.phone].some(v => String(v??'').toLowerCase().includes(q));
+  });
+}
+function renderGrid(){
+  const rows = applyFilter(ROWS).sort((a,b) => { const x=a[SORT.key], y=b[SORT.key]; return (x==null)-(y==null) || (x>y?1:x<y?-1:0)*SORT.dir; });
+  $('#grid thead').innerHTML = '<tr>' + COLS.map(c => `<th data-k="${c.key}">${c.label}${SORT.key===c.key?(SORT.dir>0?' ▲':' ▼'):''}</th>`).join('') + '</tr>';
+  $('#grid tbody').innerHTML = rows.map(r => `<tr data-id="${r.system_id}">${COLS.map(c => `<td>${c.render(r)}</td>`).join('')}</tr>`).join('');
+  $('#rowcount').textContent = `${rows.length} of ${ROWS.length}`;
+}
+async function loadRows(){
+  try {
+    const data = await api('/backoffice/api/rows');
+    const perUser = {}; data.rows.forEach(r => perUser[r.user_id] = (perUser[r.user_id]||0)+1);
+    ROWS = data.rows.map(r => Object.assign(r, {_multi: perUser[r.user_id]}));
+    renderGrid();
+  } catch (e) { toast(e.message, true); }
+}
+$('#q').oninput = renderGrid;
+$$('.chip').forEach(c => c.onclick = () => { FILTER = c.dataset.f; $$('.chip').forEach(x => x.classList.toggle('active', x===c)); renderGrid(); });
+$('#grid thead').onclick = e => { const k = e.target.closest('th')?.dataset.k; if(!k) return; SORT = {key:k, dir: SORT.key===k ? -SORT.dir : 1}; renderGrid(); };
+$('#grid tbody').onclick = e => { const id = e.target.closest('tr')?.dataset.id; if (id) openPanel(id); };
+$('#btn-reload').onclick = loadRows;
+$('#btn-validate-all').onclick = async () => {
+  const rows = applyFilter(ROWS).slice(0, 500);
+  toast(`Validating ${rows.length} rows…`);
+  try {
+    const res = await api('/admin/validate/rows', {method:'POST', body:{rows: rows.map(r => ({row_id:r.system_id, user_id:r.user_id, station_id:r.solis_station_id, odoo_lead_id:r.odoo_lead_id, odoo_partner_id:r.odoo_partner_id})), deep_check_missing:false}});
+    (res.rows||res.results||res).forEach?.(v => { VALIDATIONS[v.row_id] = v; });
+    renderGrid(); toast('Validation done — hover the tags for detail');
+  } catch (e) { toast(e.message, true); }
+};
+
+/* ------------------------------------------------------------------ */
+/* detail panel                                                         */
+/* ------------------------------------------------------------------ */
+const canEdit = () => me && (me.role==='engineer' || me.role==='admin');
+function field(label, name, value, type='text', attrs=''){ return `<div><label>${label}</label><input name="${name}" type="${type}" value="${esc(value ?? '')}" ${canEdit()?'':'disabled'} ${attrs}></div>`; }
+
+async function openPanel(systemId){
+  $('#panel').classList.add('open'); $('#panel-body').innerHTML = '<p class="muted">Loading…</p>';
+  let d; try { d = await api('/backoffice/api/rows/'+systemId); } catch(e) { $('#panel-body').innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; return; }
+  const r = d.row; $('#panel-title').textContent = r.full_name || r.system_name || 'Station';
+  $('#panel-body').innerHTML = `
+    <div class="row"><span class="tag ${r.status==='active'?'ok':''}">${esc(r.status)}</span>${r.is_primary?'<span class="tag ok">primary</span>':'<span class="tag">secondary</span>'}<span class="muted">login: <span class="mono">${esc(r.login_email||'—')}</span></span></div>
+
+    <h3>Customer profile <span class="muted">(Supabase)</span></h3>
+    <form id="f-profile" class="grid2">
+      ${field('Full name','full_name',r.full_name)}
+      ${field('Phone','phone',r.phone)}
+      ${field('Address','address',r.profile_address)}
+      ${field('Odoo customer id (partner)','odoo_partner_id',r.odoo_partner_id,'number')}
+      ${field('Customer name (Odoo)','odoo_customer_name',r.odoo_customer_name)}
+      ${field('Email (Odoo)','odoo_email',r.odoo_email,'email')}
+    </form>
+    <div class="row" style="margin-top:8px">
+      <button class="btn sm" data-validate="customer" ${r.odoo_partner_id?'':'disabled'}>Validate Odoo customer</button>
+      <span class="hint">Odoo itself is read-only here — these fields are our copy of what Odoo says.</span>
+    </div>
+    <div class="verdict" id="v-customer" hidden></div>
+
+    <h3>Station</h3>
+    <form id="f-system" class="grid2">
+      ${field('Solis station id','solis_station_id',r.solis_station_id,'text','pattern="\\d{15,20}"')}
+      ${field('Plant name (Solis)','solis_plant_name',r.solis_plant_name)}
+      ${field('System name','system_name',r.system_name)}
+      ${field('Capacity kWp','capacity_kwp',r.capacity_kwp,'number','step="0.01"')}
+      ${field('Installation date','installation_date',fmtDate(r.installation_date)==='—'?'':fmtDate(r.installation_date),'date')}
+      <div><label>Status</label><select name="status" ${canEdit()?'':'disabled'}>${['active','inactive','decommissioned'].map(s=>`<option ${r.status===s?'selected':''}>${s}</option>`).join('')}</select></div>
+      ${field('Odoo lead id','odoo_lead_id',r.odoo_lead_id,'number')}
+      ${field('Lead email (Odoo)','odoo_lead_email',r.odoo_lead_email,'email')}
+      <div><label>Primary station</label><select name="is_primary" ${canEdit()?'':'disabled'}><option value="true" ${r.is_primary?'selected':''}>yes</option><option value="false" ${!r.is_primary?'selected':''}>no</option></select></div>
+    </form>
+    <div class="row" style="margin-top:8px">
+      <button class="btn sm" data-validate="station" ${r.solis_station_id?'':'disabled'}>Validate Solis station</button>
+      <button class="btn sm" data-validate="lead" ${r.odoo_lead_id?'':'disabled'}>Validate Odoo lead</button>
+    </div>
+    <div class="verdict" id="v-station" hidden></div>
+    <div class="verdict" id="v-lead" hidden></div>
+
+    ${canEdit() ? `
+    <h3>Save changes</h3>
+    <div class="field"><label>Reason (required, goes to the audit log)</label><textarea id="reason" rows="2" placeholder="e.g. Sales confirmed station id with customer on 17 Sep"></textarea></div>
+    <div class="row">
+      <label class="row"><input type="checkbox" id="bf-after"> also backfill</label>
+      <input type="number" id="bf-days" value="60" min="1" max="730" style="width:80px"> days
+      <select id="bf-gran"><option value="daily">daily</option><option value="five_minutes">five-minute</option></select>
+      <div class="spacer"></div>
+      <button class="btn primary" id="btn-save">Save</button>
+    </div>` : '<p class="hint">Your role is read-only.</p>'}
+
+    <h3>Data</h3>
+    <div class="grid2">
+      <div><label>Daily rows</label>${r.daily_rows ?? 0} · last ${fmtDate(r.last_daily)}</div>
+      <div><label>Five-minute today</label>last ${fmtTs(r.last_5m)}</div>
+      <div><label>Last backfill</label>${r.last_backfill_status ? `${esc(r.last_backfill_status)} · ${fmtTs(r.last_backfill_at)}` : '—'}</div>
+      <div><label>Login</label>${r.last_sign_in_at ? 'last sign-in '+fmtDate(r.last_sign_in_at) : 'never signed in'}</div>
+    </div>
+    ${canEdit() ? `
+    <div class="row" style="margin-top:8px">
+      <input type="date" id="bf-from"> → <input type="date" id="bf-to">
+      <select id="bf-gran2"><option value="daily">daily</option><option value="five_minutes">five-minute</option></select>
+      <button class="btn sm" id="btn-backfill" ${r.solis_station_id?'':'disabled'}>Queue backfill</button>
+    </div>` : ''}
+    ${d.jobs.length ? `<ul class="plain audit">${d.jobs.map(j => `<li><span class="tag ${j.status==='succeeded'?'ok':j.status==='failed'?'bad':'warn'}">${esc(j.status)}</span> ${esc(j.granularity)} ${fmtDate(j.date_from)} → ${fmtDate(j.date_to)} <span class="when">queued ${fmtTs(j.queued_at)}</span>${j.rows_written!=null?` · ${j.rows_written} rows`:''}${j.error?` · <span class="tag bad">${esc(String(j.error).slice(0,120))}</span>`:''}</li>`).join('')}</ul>` : ''}
+
+    <h3>Other stations of this customer</h3>
+    ${d.other_systems.length ? `<ul class="plain audit">${d.other_systems.map(s => `<li><a href="#" data-open="${s.id}">${esc(s.system_name)}</a> <span class="mono">${esc(s.solis_station_id||'no id')}</span> ${s.is_primary?'<span class="tag ok">primary</span>':''}</li>`).join('')}</ul>` : '<p class="hint">None — single-station customer.</p>'}
+    ${canEdit() ? `
+    <details style="margin-top:8px"><summary class="hint">Add another Solis station to this customer</summary>
+      <div class="grid2" style="margin-top:8px">
+        <div><label>Solis station id</label><input id="add-sid" pattern="\\d{15,20}"></div>
+        <div><label>Backfill days</label><input id="add-days" type="number" value="60" min="1" max="730"></div>
+        <div style="grid-column:1/-1"><label>Reason</label><input id="add-reason" placeholder="e.g. second property, Odoo lead 104331"></div>
+      </div>
+      <p class="hint">Name and capacity are taken from Solis. The station must exist in our Solis account — validate it first.</p>
+      <button class="btn sm primary" id="btn-add-station">Add station</button>
+    </details>` : ''}
+
+    <h3>Audit trail</h3>
+    <ul class="plain audit">${d.audit.length ? d.audit.map(a => `<li><span class="when">${fmtTs(a.occurred_at)}</span> · <b>${esc(a.actor_email||a.actor_kind)}</b> ${esc(a.operation)} ${esc(a.table_name)}${a.field_name?` <span class="mono">${esc(a.field_name)}</span>: <s>${esc(a.old_value)}</s> → ${esc(a.new_value)}`:''}${a.reason?` <span class="muted">— ${esc(a.reason)}</span>`:''}</li>`).join('') : '<li class="muted">No changes recorded.</li>'}</ul>
+  `;
+
+  $$('#panel-body [data-open]').forEach(a => a.onclick = e => { e.preventDefault(); openPanel(a.dataset.open); });
+  $$('#panel-body [data-validate]').forEach(b => b.onclick = () => validate(b.dataset.validate, r));
+  if (canEdit()) {
+    $('#btn-save').onclick = () => saveAll(r);
+    $('#btn-backfill').onclick = () => queueBackfill(r);
+    $('#btn-add-station').onclick = () => addStation(r);
+  }
+}
+$('#panel-close').onclick = () => $('#panel').classList.remove('open');
+
+function formDiff(form, original, numeric=[]){
+  const out = {};
+  new FormData(form).forEach((v, k) => {
+    let val = v === '' ? null : v;
+    if (numeric.includes(k) && val !== null) val = Number(val);
+    if (k === 'is_primary') val = v === 'true';
+    const orig = original[k] ?? null;
+    const same = (val === orig) || (val !== null && orig !== null && String(val) === String(orig)) || (k==='installation_date' && val && String(orig).slice(0,10)===val);
+    if (!same) out[k] = val;
+  });
+  return out;
+}
+async function saveAll(r){
+  const reason = $('#reason').value.trim();
+  const sysFields = formDiff($('#f-system'), r, ['capacity_kwp','odoo_lead_id']);
+  const profFields = formDiff($('#f-profile'), Object.assign({}, r, {address:r.profile_address}), ['odoo_partner_id']);
+  const bf = $('#bf-after').checked ? {granularity: $('#bf-gran').value, days: Number($('#bf-days').value)} : null;
+  if (!Object.keys(sysFields).length && !Object.keys(profFields).length && !bf) return toast('Nothing changed');
+  try {
+    if (Object.keys(profFields).length) await api('/backoffice/api/profiles/'+r.user_id, {method:'PATCH', body:{fields:profFields, reason}});
+    if (Object.keys(sysFields).length || bf) await api('/backoffice/api/systems/'+r.system_id, {method:'PATCH', body:{fields:sysFields, reason, backfill:bf}});
+    toast('Saved'); await loadRows(); openPanel(r.system_id);
+  } catch (e) { toast(e.message, true); }
+}
+async function queueBackfill(r){
+  const from = $('#bf-from').value, to = $('#bf-to').value, reason = ($('#reason')?.value||'').trim() || 'backfill requested from back office';
+  if (!from || !to) return toast('Pick a date range', true);
+  try { await api('/backoffice/api/backfill', {method:'POST', body:{system_id:r.system_id, granularity:$('#bf-gran2').value, date_from:from, date_to:to, reason}}); toast('Backfill queued'); openPanel(r.system_id); }
+  catch (e) { toast(e.message, true); }
+}
+async function addStation(r){
+  const sid = $('#add-sid').value.trim(), reason = $('#add-reason').value.trim();
+  if (!/^\d{15,20}$/.test(sid)) return toast('Station id must be 15–20 digits', true);
+  try {
+    const res = await api('/backoffice/api/systems', {method:'POST', body:{user_id:r.user_id, solis_station_id:sid, reason, backfill:{granularity:'daily', days:Number($('#add-days').value)||60}}});
+    toast('Station added and backfill queued'); await loadRows(); openPanel(res.system_id);
+  } catch (e) { toast(e.message, true); }
+}
+async function validate(kind, r){
+  const box = $('#v-'+kind); box.hidden = false; box.textContent = 'Checking…';
+  try {
+    let res;
+    if (kind==='station') res = await api('/admin/validate/solis-station', {method:'POST', body:{station_id: $('#f-system [name=solis_station_id]').value.trim() || r.solis_station_id, for_user_id: r.user_id}});
+    if (kind==='lead') res = await api('/admin/validate/odoo-lead', {method:'POST', body:{lead_id: Number($('#f-system [name=odoo_lead_id]').value || r.odoo_lead_id), expected_station_id: r.solis_station_id}});
+    if (kind==='customer') res = await api('/admin/validate/odoo-customer', {method:'POST', body:{partner_id: Number($('#f-profile [name=odoo_partner_id]').value || r.odoo_partner_id)}});
+    box.innerHTML = summarizeVerdict(res);
+  } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
+}
+function summarizeVerdict(v){
+  if (!v || typeof v !== 'object') return esc(JSON.stringify(v));
+  const status = v.status || v.verdict || v.solis_station?.status;
+  const head = status ? `<span class="tag ${/ok|found|match|assigned|exists/i.test(status)?'ok':/unavail|stale/i.test(status)?'warn':'bad'}">${esc(status)}</span> ` : '';
+  const interesting = Object.entries(v).filter(([k,x]) => x!=null && typeof x!=='object' && !['status','verdict'].includes(k)).map(([k,x]) => `<b>${esc(k)}</b>: ${esc(x)}`).join(' · ');
+  const nested = Object.entries(v).filter(([k,x]) => x && typeof x==='object').map(([k,x]) => `\n${esc(k)}: ${esc(JSON.stringify(x))}`).join('');
+  return head + interesting + `<span class="muted">${nested}</span>`;
+}
+
+/* ------------------------------------------------------------------ */
+/* unresolved / jobs / audit / staff                                    */
+/* ------------------------------------------------------------------ */
+async function loadUnresolved(){
+  const el = $('#view-unresolved'); el.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const u = await api('/backoffice/api/unresolved');
+    const byEmail = {}; ROWS.forEach(r => { if (r.login_email) byEmail[r.login_email.toLowerCase()] = r; });
+    const o = u.last_onboarding || {};
+    el.innerHTML = `
+      <div class="kpi">
+        <div class="card"><div class="n">${u.profiles_without_system.length}</div><div class="l">profiles without a station</div></div>
+        <div class="card"><div class="n">${u.systems_without_station.length}</div><div class="l">stations without a Solis id</div></div>
+        <div class="card"><div class="n">${u.dark_systems.length}</div><div class="l">active stations dark &gt;3 days</div></div>
+        <div class="card"><div class="n">${(o.failures||[]).length}</div><div class="l">nightly onboarding failures</div></div>
+        <div class="card"><div class="n">${(o.second_station_candidates||[]).length}</div><div class="l">second-station candidates</div></div>
+      </div>
+
+      <div class="card sect"><h3 style="margin-top:0">Nightly onboarding failures <span class="muted">— last run ${fmtTs(o.ran_at)} · ${o.candidates??'?'} candidates, ${o.created??'?'} created</span></h3>
+        <p class="hint">These are Odoo data problems. Nothing here can be fixed from this screen — send them to sales; the account is created the night after the lead is corrected.</p>
+        <table><thead><tr><th>Lead / customer</th><th>Email field in Odoo</th><th>Station</th><th>Error</th></tr></thead><tbody>
+        ${(o.failures||[]).map(f => `<tr><td>${esc(f.full_name)}</td><td class="mono">${esc(f.email)}</td><td class="mono">${esc(f.station_id)}</td><td class="muted">${esc(f.error)}</td></tr>`).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
+        </tbody></table></div>
+
+      <div class="card sect"><h3 style="margin-top:0">Second-station candidates <span class="muted">— an Odoo lead whose email already has a login</span></h3>
+        <p class="hint">The nightly job refuses to repoint an existing login. Open the customer and use “Add another Solis station”.</p>
+        <table><thead><tr><th>Customer</th><th>Login email</th><th>New station (Odoo)</th><th>Existing station</th><th></th></tr></thead><tbody>
+        ${(o.second_station_candidates||[]).map(c => { const r = byEmail[(c.email||'').toLowerCase()]; return `<tr><td>${esc(c.full_name)}</td><td class="mono">${esc(c.email)}</td><td class="mono">${esc(c.station_id)}</td><td class="mono">${esc(c.existing_station_id)}</td><td>${r?`<button class="btn sm" data-open="${r.system_id}">Open</button>`:'<span class="muted">no login row</span>'}</td></tr>`; }).join('') || '<tr><td colspan=5 class="muted">none</td></tr>'}
+        </tbody></table></div>
+
+      <div class="card sect"><h3 style="margin-top:0">Profiles without a station</h3>
+        <table><thead><tr><th>Customer</th><th>Login</th><th>Station id on profile</th><th>Created</th></tr></thead><tbody>
+        ${u.profiles_without_system.map(p => `<tr><td>${esc(p.full_name)}</td><td class="mono">${esc(p.email)}</td><td class="mono">${esc(p.solis_station_id||'—')}</td><td>${fmtDate(p.created_at)}</td></tr>`).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
+        </tbody></table></div>
+
+      <div class="card sect"><h3 style="margin-top:0">Stations without a Solis id</h3>
+        <table><thead><tr><th>Customer</th><th>System</th><th>kWp</th><th>Last daily</th><th></th></tr></thead><tbody>
+        ${u.systems_without_station.map(s => `<tr><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td>${s.capacity_kwp??''}</td><td>${fmtDate(s.last_daily)}</td><td><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=5 class="muted">none</td></tr>'}
+        </tbody></table></div>
+
+      <div class="card sect"><h3 style="margin-top:0">Active stations dark for more than 3 days</h3>
+        <table><thead><tr><th>Customer</th><th>System</th><th>Station</th><th>Last daily</th><th>Days dark</th><th></th></tr></thead><tbody>
+        ${u.dark_systems.map(s => `<tr><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td class="mono">${esc(s.solis_station_id)}</td><td>${fmtDate(s.last_daily)}</td><td>${s.days_dark??'∞'}</td><td><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=6 class="muted">none</td></tr>'}
+        </tbody></table></div>`;
+    $$('#view-unresolved [data-open]').forEach(b => b.onclick = () => openPanel(b.dataset.open));
+  } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
+}
+
+async function loadJobs(){
+  const el = $('#view-jobs'); el.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const {jobs} = await api('/backoffice/api/jobs');
+    el.innerHTML = `<div class="card"><p class="hint">Jobs are drained by the backfill worker; a station can have one queued or running job per granularity.</p>
+      <table><thead><tr><th>Queued</th><th>Customer</th><th>System</th><th>Granularity</th><th>Range</th><th>Status</th><th>Rows</th><th>Error</th><th></th></tr></thead><tbody>
+      ${jobs.map(j => `<tr><td>${fmtTs(j.queued_at)}</td><td>${esc(j.full_name)}</td><td>${esc(j.system_name)}</td><td>${esc(j.granularity)}</td><td>${fmtDate(j.date_from)} → ${fmtDate(j.date_to)}</td><td><span class="tag ${j.status==='succeeded'?'ok':j.status==='failed'?'bad':'warn'}">${esc(j.status)}</span></td><td>${j.rows_written??''}</td><td class="muted">${esc(String(j.error||'').slice(0,100))}</td><td>${j.status==='queued'&&canEdit()?`<button class="btn sm danger" data-cancel="${j.id}">Cancel</button>`:''}</td></tr>`).join('') || '<tr><td colspan=9 class="muted">No jobs yet.</td></tr>'}
+      </tbody></table></div>`;
+    $$('#view-jobs [data-cancel]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/jobs/'+b.dataset.cancel+'/cancel', {method:'POST'}); loadJobs(); } catch(e) { toast(e.message, true); } });
+  } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
+}
+
+async function loadAudit(){
+  const el = $('#view-audit'); el.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const {audit} = await api('/backoffice/api/audit?limit=300');
+    el.innerHTML = `<div class="card"><table><thead><tr><th>When</th><th>Who</th><th>Kind</th><th>Table</th><th>Row</th><th>Op</th><th>Field</th><th>Old → New</th><th>Reason</th><th>Source</th></tr></thead><tbody>
+      ${audit.map(a => `<tr><td>${fmtTs(a.occurred_at)}</td><td>${esc(a.actor_email||'—')}</td><td><span class="tag ${a.actor_kind==='staff'?'ok':''}">${esc(a.actor_kind)}</span></td><td>${esc(a.table_name)}</td><td class="mono">${esc(String(a.row_pk).slice(0,8))}…</td><td>${esc(a.operation)}</td><td class="mono">${esc(a.field_name||'')}</td><td>${a.field_name?`<s>${esc(a.old_value)}</s> → ${esc(a.new_value)}`:'<span class="muted">whole row</span>'}</td><td class="muted">${esc(a.reason||'')}</td><td class="muted">${esc(a.source)}</td></tr>`).join('')}
+      </tbody></table></div>`;
+  } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
+}
+
+async function loadStaff(){
+  const el = $('#view-staff'); el.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const {staff} = await api('/backoffice/api/staff');
+    el.innerHTML = `<div class="card">
+      <div class="row" style="margin-bottom:12px"><input id="st-email" type="email" placeholder="colleague@solvivaenergy.com"><input id="st-name" placeholder="Full name"><select id="st-role"><option>readonly</option><option>engineer</option><option>admin</option></select><button class="btn primary" id="st-add">Add staff</button><span class="hint">New addresses get an invite email from Supabase.</span></div>
+      <table><thead><tr><th>Email</th><th>Role</th><th>Active</th><th>Last sign-in</th><th>Providers</th><th>Added</th><th></th></tr></thead><tbody>
+      ${staff.map(s => `<tr><td class="mono">${esc(s.email)}</td><td><select data-role="${s.user_id}">${['readonly','engineer','admin'].map(r=>`<option ${s.role===r?'selected':''}>${r}</option>`).join('')}</select></td><td>${s.active&&!s.revoked_at?'<span class="tag ok">active</span>':'<span class="tag bad">revoked</span>'}</td><td>${fmtTs(s.last_sign_in_at)}</td><td class="muted">${esc(JSON.stringify(s.providers||[]))}</td><td>${fmtDate(s.created_at)}</td><td>${s.active&&!s.revoked_at?`<button class="btn sm danger" data-revoke="${s.user_id}">Revoke</button>`:`<button class="btn sm" data-restore="${s.user_id}">Restore</button>`}</td></tr>`).join('')}
+      </tbody></table></div>`;
+    $('#st-add').onclick = async () => { try { await api('/backoffice/api/staff', {method:'POST', body:{email:$('#st-email').value, full_name:$('#st-name').value, role:$('#st-role').value}}); toast('Added'); loadStaff(); } catch(e) { toast(e.message, true); } };
+    $$('#view-staff [data-role]').forEach(s => s.onchange = async () => { try { await api('/backoffice/api/staff/'+s.dataset.role, {method:'PATCH', body:{role:s.value}}); toast('Role updated'); } catch(e) { toast(e.message, true); loadStaff(); } });
+    $$('#view-staff [data-revoke]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/staff/'+b.dataset.revoke, {method:'PATCH', body:{active:false}}); loadStaff(); } catch(e) { toast(e.message, true); } });
+    $$('#view-staff [data-restore]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/staff/'+b.dataset.restore, {method:'PATCH', body:{active:true}}); loadStaff(); } catch(e) { toast(e.message, true); } });
+  } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
+}
+
+boot().catch(e => { document.body.innerHTML = `<main><div class="card">Back office failed to start: ${esc(e.message)}</div></main>`; });
+</script>
+</body>
+</html>

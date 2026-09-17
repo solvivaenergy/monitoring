@@ -18,6 +18,7 @@ from .solis_client import SolisCloudClient  # noqa: F401 — used by routes
 from .solis_routes import router as solis_router
 from .app_routes import router as app_router
 from .validation_routes import router as validation_router
+from .backoffice_routes import router as backoffice_router
 
 app = FastAPI(title="Solviva Monitoring API", docs_url="/docs")
 
@@ -54,6 +55,9 @@ app.add_middleware(
 app.include_router(solis_router)
 app.include_router(app_router)
 app.include_router(validation_router)
+# The back office lives at /backoffice on this same service: no second host, no
+# CORS, one deploy. Staff-only via Supabase JWT + staff_users; see the module.
+app.include_router(backoffice_router)
 
 
 @app.get("/health")
