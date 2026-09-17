@@ -16,7 +16,7 @@
 -- philosophy as file 07's ON DELETE RESTRICT and file 12's legacy quarantine.
 --
 -- Column order matters: LIKE copies energy_readings' columns first, in its
--- order, then the extras below in this order. api/backoffice_routes.py relies
+-- order, then the extras below in this order. api/monitoring_admin_routes.py relies
 -- on that with `insert into ... select r.*, now(), %s, ...`.
 
 create table if not exists public.energy_readings_quarantine (

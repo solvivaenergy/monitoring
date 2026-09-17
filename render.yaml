@@ -22,16 +22,16 @@ services:
       # belongs on /app/*, which authenticates the Supabase JWT.
       - key: SOLIS_API_TOKEN
         sync: false
-      # /app/live, /admin/validate/* and /backoffice/* all need Supabase.
+      # /app/live, /admin/validate/* and /monitoring-admin/* all need Supabase.
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_KEY
         sync: false
-      # Handed to the back-office page so it can start a Supabase Auth session.
+      # Handed to the Monitoring Admin page so it can start a Supabase Auth session.
       # Public by design (it ships in the mobile app); RLS + staff_users gate it.
       - key: SUPABASE_ANON_KEY
         sync: false
-      # Direct Postgres for the back office (auth.users join, audited writes).
+      # Direct Postgres for Monitoring Admin (auth.users join, audited writes).
       # db.<ref>.supabase.co is IPv6-only; if this container has no IPv6 route,
       # set SUPABASE_DB_POOLER_URL to the Session-pooler string instead
       # (Dashboard → Settings → Database → Connection string → Session pooler;
@@ -40,7 +40,7 @@ services:
         sync: false
       - key: SUPABASE_DB_POOLER_URL
         sync: false
-      # Odoo (read-only) for /admin/validate/odoo-* and the back office's Odoo
+      # Odoo (read-only) for /admin/validate/odoo-* and Monitoring Admin's Odoo
       # panel. Same values as solviva-sync. Without them every "Validate Odoo
       # lead/customer" click fails with "Missing Odoo connection env vars".
       - key: ODOO_SH_URL
@@ -119,7 +119,7 @@ services:
       - key: SUPABASE_SERVICE_KEY
         sync: false
 
-  # Backfill worker: drains backfill_jobs, which the back office enqueues.
+  # Backfill worker: drains backfill_jobs, which Monitoring Admin enqueues.
   # Nothing else runs those jobs. 15-minute cron, 12-minute budget per run.
   - type: cron
     name: solviva-backfill-worker

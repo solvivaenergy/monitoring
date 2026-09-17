@@ -3,7 +3,7 @@ WORKDIR /app
 COPY api/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY api/ ./api/
-# Drains backfill_jobs (queued by the back office). Runs on a 15-minute cron
+# Drains backfill_jobs (queued by Monitoring Admin). Runs on a 15-minute cron
 # with a 12-minute budget so consecutive runs never overlap; claims use
 # FOR UPDATE SKIP LOCKED so an overlap would be harmless anyway.
 CMD ["python", "-m", "api.backfill_worker", "--budget", "720"]

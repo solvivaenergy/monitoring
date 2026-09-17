@@ -1,21 +1,21 @@
 """
-Back office — the engineering team's view of customer identity across
+Monitoring Admin — the engineering team's view of customer identity across
 Supabase, Solis Cloud and Odoo, and the only sanctioned way to change it.
 
-    GET  /backoffice                       the single-page UI
-    GET  /backoffice/api/config            Supabase URL + anon key for the UI's login
-    GET  /backoffice/api/me                who am I, what role
-    GET  /backoffice/api/rows              the grid: one row per station
-    GET  /backoffice/api/rows/{system_id}  one row + its audit trail + jobs
-    PATCH /backoffice/api/systems/{id}     edit a station (engineer+)
-    PATCH /backoffice/api/profiles/{id}    edit a customer profile (engineer+)
-    POST /backoffice/api/systems           attach another station to a customer (engineer+)
-    POST /backoffice/api/backfill          enqueue a backfill (engineer+)
-    GET  /backoffice/api/jobs              backfill queue
-    POST /backoffice/api/jobs/{id}/cancel  cancel a queued job (engineer+)
-    GET  /backoffice/api/audit             who changed what
-    GET  /backoffice/api/unresolved        the work queue: gaps the nightly pipeline cannot close
-    GET/POST/PATCH /backoffice/api/staff   staff directory (admin)
+    GET  /monitoring-admin                       the single-page UI
+    GET  /monitoring-admin/api/config            Supabase URL + anon key for the UI's login
+    GET  /monitoring-admin/api/me                who am I, what role
+    GET  /monitoring-admin/api/rows              the grid: one row per station
+    GET  /monitoring-admin/api/rows/{system_id}  one row + its audit trail + jobs
+    PATCH /monitoring-admin/api/systems/{id}     edit a station (engineer+)
+    PATCH /monitoring-admin/api/profiles/{id}    edit a customer profile (engineer+)
+    POST /monitoring-admin/api/systems           attach another station to a customer (engineer+)
+    POST /monitoring-admin/api/backfill          enqueue a backfill (engineer+)
+    GET  /monitoring-admin/api/jobs              backfill queue
+    POST /monitoring-admin/api/jobs/{id}/cancel  cancel a queued job (engineer+)
+    GET  /monitoring-admin/api/audit             who changed what
+    GET  /monitoring-admin/api/unresolved        the work queue: gaps the nightly pipeline cannot close
+    GET/POST/PATCH /monitoring-admin/api/staff   staff directory (admin)
 
 Rules this file enforces, because nothing else will:
   * Odoo is read-only. There is no endpoint that writes to Odoo and there must
@@ -55,9 +55,9 @@ from .solis_client import SolisCloudClient
 from .validation_routes import _authenticate_staff, _get_roster
 
 log = logging.getLogger(__name__)
-router = APIRouter(prefix="/backoffice", tags=["Back Office"])
+router = APIRouter(prefix="/monitoring-admin", tags=["Monitoring Admin"])
 
-INDEX_HTML = Path(__file__).parent / "backoffice" / "index.html"
+INDEX_HTML = Path(__file__).parent / "monitoring_admin" / "index.html"
 STATION_ID_RE = re.compile(r"^\d{15,20}$")
 ROLE_RANK = {"readonly": 0, "engineer": 1, "admin": 2}
 
@@ -111,7 +111,7 @@ def _db_error(exc: Exception) -> HTTPException:
                         psycopg.errors.InvalidTextRepresentation, psycopg.errors.DataError,
                         psycopg.errors.NotNullViolation)):
         return HTTPException(400, str(exc).splitlines()[0][:200])
-    log.exception("back office database error")
+    log.exception("monitoring admin database error")
     return HTTPException(500, "Database error")
 
 
@@ -150,9 +150,9 @@ def _supabase_env() -> Dict[str, str]:
 
 @router.get("", include_in_schema=False)
 @router.get("/", include_in_schema=False)
-async def backoffice_index():
+async def monitoring_admin_index():
     if not INDEX_HTML.exists():
-        raise HTTPException(404, "Back office UI not built")
+        raise HTTPException(404, "Monitoring Admin UI not built")
     return FileResponse(INDEX_HTML, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
@@ -961,7 +961,7 @@ async def cancel_job(job_id: uuid.UUID, authorization: str = Header(None)):
     staff = await _authenticate_staff(authorization)
     _require(staff, "engineer")
     try:
-        with db.audited(staff["id"], staff["email"], "cancelled from back office") as conn:
+        with db.audited(staff["id"], staff["email"], "cancelled from Monitoring Admin") as conn:
             row = conn.execute(
                 "update public.backfill_jobs set status = 'cancelled', finished_at = now() "
                 "where id = %s and status = 'queued' returning id", (job_id,)).fetchone()
@@ -1154,7 +1154,7 @@ class StaffCreate(BaseModel):
     role: str = Field("readonly", pattern="^(readonly|engineer|admin)$")
     full_name: Optional[str] = None
     # "invite": Supabase emails a link (lands on the project's Site URL — set it
-    # to the back office or the link points at localhost:3000).
+    # to the Monitoring Admin page or the link points at localhost:3000).
     # "password": create the login now with a temporary password, returned ONCE
     # in the response and never stored by us; the person changes it after the
     # first sign-in. Fits the development phase, where the team signs in as
@@ -1247,7 +1247,7 @@ async def staff_create(body: StaffCreate, request: Request, authorization: str =
     if body.mode == "password":
         user_id, temporary_password = await _create_or_reset_login(email, body.full_name)
     else:
-        redirect_to = str(request.base_url).rstrip("/") + "/backoffice"
+        redirect_to = str(request.base_url).rstrip("/") + "/monitoring-admin"
         user_id = await _find_or_invite_login(email, body.full_name, redirect_to)
     try:
         with db.audited(staff["id"], staff["email"], f"staff added by {staff['email']} ({body.mode})") as conn:

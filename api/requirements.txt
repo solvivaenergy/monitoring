@@ -3,6 +3,6 @@ uvicorn[standard]==0.30.6
 httpx==0.27.2
 python-dotenv==1.0.0
 supabase==2.13.0
-# Back office: direct Postgres for the auth.users join and for audited writes
+# Monitoring Admin: direct Postgres for the auth.users join and for audited writes
 # (transaction-local GUCs the 08 audit trigger reads). See api/db.py.
 psycopg[binary,pool]>=3.2,<4

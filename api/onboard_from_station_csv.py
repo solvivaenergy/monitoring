@@ -429,7 +429,7 @@ def run_onboarding(
             # Observed live on the 18:02 UTC cron of 2026-09-12 — Lynman Bacolor,
             # Arnel Cipriano Chavez and Nanay Itengs Meter 2 were all repointed,
             # and `onboarding_runs` shows duplicate_email=1 on 12 consecutive
-            # runs. It also silently reverts any back-office correction.
+            # runs. It also silently reverts any Monitoring Admin correction.
             #
             # Until solar_systems carries solis_station_id (migration 04) and a
             # customer can hold several stations, the only safe action is to

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Solviva Back Office</title>
+<title>Solviva Monitoring Admin</title>
 <meta name="robots" content="noindex, nofollow">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <style>
@@ -88,7 +88,7 @@
 <body>
 
 <header id="topbar" hidden>
-  <h1>Solviva Back Office</h1>
+  <h1>Solviva Monitoring Admin</h1>
   <nav class="tabs" id="tabs">
     <button data-tab="customers" class="active">Customers</button>
     <button data-tab="unresolved">Unresolved</button>
@@ -184,7 +184,7 @@ async function api(path, opts={}){
 }
 
 async function boot(){
-  const cfg = await (await fetch('/backoffice/api/config')).json();
+  const cfg = await (await fetch('/monitoring-admin/api/config')).json();
   sb = supabase.createClient(cfg.supabase_url, cfg.supabase_anon_key, {auth:{persistSession:true, autoRefreshToken:true, detectSessionInUrl:true}});
   sb.auth.onAuthStateChange(async (event, s) => {
     session = s;
@@ -205,7 +205,7 @@ function show(view){
 
 async function afterLogin(){
   try {
-    me = await api('/backoffice/api/me');
+    me = await api('/monitoring-admin/api/me');
   } catch (e) {
     me = null;
     $('#login-msg').textContent = /403|authorised/i.test(e.message) ? `${session?.user?.email} is signed in but is not a staff account. Ask an admin to add you.` : e.message;
@@ -227,12 +227,12 @@ $('#btn-login').onclick = async () => {
 };
 $('#login-password').addEventListener('keydown', e => { if (e.key==='Enter') $('#btn-login').click(); });
 $('#btn-google').onclick = async () => {
-  const {error} = await sb.auth.signInWithOAuth({provider:'google', options:{redirectTo: location.origin + '/backoffice', queryParams:{hd:'solvivaenergy.com', prompt:'select_account'}}});
+  const {error} = await sb.auth.signInWithOAuth({provider:'google', options:{redirectTo: location.origin + '/monitoring-admin', queryParams:{hd:'solvivaenergy.com', prompt:'select_account'}}});
   if (error) $('#login-msg').textContent = error.message + ' (Google sign-in must be enabled in Supabase → Authentication → Providers)';
 };
 $('#btn-forgot').onclick = async () => {
   const email = $('#login-email').value.trim(); if (!email) return $('#login-msg').textContent = 'Enter your email first.';
-  const {error} = await sb.auth.resetPasswordForEmail(email, {redirectTo: location.origin + '/backoffice'});
+  const {error} = await sb.auth.resetPasswordForEmail(email, {redirectTo: location.origin + '/monitoring-admin'});
   $('#login-msg').textContent = error ? error.message : 'If that address is a staff account, a reset link has been emailed.';
 };
 $('#btn-set-password').onclick = async () => {
@@ -294,7 +294,7 @@ function renderGrid(){
 }
 async function loadRows(fresh=false){
   try {
-    const data = await api('/backoffice/api/rows' + (fresh ? '?fresh=1' : ''));
+    const data = await api('/monitoring-admin/api/rows' + (fresh ? '?fresh=1' : ''));
     const perUser = {}; data.rows.forEach(r => perUser[r.user_id] = (perUser[r.user_id]||0)+1);
     ROWS = data.rows.map(r => Object.assign(r, {_multi: perUser[r.user_id]}));
     renderGrid();
@@ -323,7 +323,7 @@ function field(label, name, value, type='text', attrs=''){ return `<div><label>$
 
 async function openPanel(systemId){
   showPanel(); $('#panel-body').innerHTML = '<p class="muted">Loading…</p>';
-  let d; try { d = await api('/backoffice/api/rows/'+systemId); } catch(e) { $('#panel-body').innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; return; }
+  let d; try { d = await api('/monitoring-admin/api/rows/'+systemId); } catch(e) { $('#panel-body').innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; return; }
   const r = d.row; $('#panel-title').textContent = r.full_name || r.system_name || 'Station';
   $('#panel-body').innerHTML = `
     <div class="row"><span class="tag ${r.status==='active'?'ok':''}">${esc(r.status)}</span>${r.is_primary?'<span class="tag ok">primary</span>':'<span class="tag">secondary</span>'}<span class="muted">login: <span class="mono">${esc(r.login_email||'—')}</span></span></div>
@@ -478,22 +478,22 @@ async function saveAll(r){
   const bf = $('#bf-after').checked ? {granularity: $('#bf-gran').value, days: Number($('#bf-days').value)} : null;
   if (!Object.keys(sysFields).length && !Object.keys(profFields).length && !bf) return toast('Nothing changed');
   try {
-    if (Object.keys(profFields).length) await api('/backoffice/api/profiles/'+r.user_id, {method:'PATCH', body:{fields:profFields, reason}});
-    if (Object.keys(sysFields).length || bf) await api('/backoffice/api/systems/'+r.system_id, {method:'PATCH', body:{fields:sysFields, reason, backfill:bf}});
+    if (Object.keys(profFields).length) await api('/monitoring-admin/api/profiles/'+r.user_id, {method:'PATCH', body:{fields:profFields, reason}});
+    if (Object.keys(sysFields).length || bf) await api('/monitoring-admin/api/systems/'+r.system_id, {method:'PATCH', body:{fields:sysFields, reason, backfill:bf}});
     toast('Saved'); await loadRows(); openPanel(r.system_id);
   } catch (e) { toast(e.message, true); }
 }
 async function queueBackfill(r){
-  const from = $('#bf-from').value, to = $('#bf-to').value, reason = ($('#reason')?.value||'').trim() || 'backfill requested from back office';
+  const from = $('#bf-from').value, to = $('#bf-to').value, reason = ($('#reason')?.value||'').trim() || 'backfill requested from Monitoring Admin';
   if (!from || !to) return toast('Pick a date range', true);
-  try { await api('/backoffice/api/backfill', {method:'POST', body:{system_id:r.system_id, granularity:$('#bf-gran2').value, date_from:from, date_to:to, reason}}); toast('Backfill queued'); openPanel(r.system_id); }
+  try { await api('/monitoring-admin/api/backfill', {method:'POST', body:{system_id:r.system_id, granularity:$('#bf-gran2').value, date_from:from, date_to:to, reason}}); toast('Backfill queued'); openPanel(r.system_id); }
   catch (e) { toast(e.message, true); }
 }
 async function addStation(r){
   const sid = $('#add-sid').value.trim(), reason = $('#add-reason').value.trim();
   if (!/^\d{15,20}$/.test(sid)) return toast('Station id must be 15–20 digits', true);
   try {
-    const res = await api('/backoffice/api/systems', {method:'POST', body:{user_id:r.user_id, solis_station_id:sid, reason, backfill:{granularity:'daily', days:Number($('#add-days').value)||60}}});
+    const res = await api('/monitoring-admin/api/systems', {method:'POST', body:{user_id:r.user_id, solis_station_id:sid, reason, backfill:{granularity:'daily', days:Number($('#add-days').value)||60}}});
     toast('Station added and backfill queued'); await loadRows(); openPanel(res.system_id);
   } catch (e) { toast(e.message, true); }
 }
@@ -513,7 +513,7 @@ async function validate(kind, r){
 async function reconcileSystem(r){
   const box = $('#v-reconcile'); box.hidden = false; box.textContent = 'Comparing with Solis… (a few seconds per month)';
   try {
-    const v = await api('/backoffice/api/systems/'+r.system_id+'/reconcile', {method:'POST', body:{months: Number($('#rec-months').value)}});
+    const v = await api('/monitoring-admin/api/systems/'+r.system_id+'/reconcile', {method:'POST', body:{months: Number($('#rec-months').value)}});
     const cls = v.agreement_pct==null ? '' : v.agreement_pct>=97 ? 'ok' : v.agreement_pct>=80 ? 'warn' : 'bad';
     box.innerHTML = `<span class="tag ${cls}">${esc(v.verdict)}</span> ${v.days_compared} day(s) compared, ${v.mismatched} differ${v.agreement_pct!=null?` — <b>${v.agreement_pct}% agreement</b>`:''}.`
       + (v.only_in_ours.length ? ` <span class="muted">${v.only_in_ours.length} day(s) we hold that Solis has no data for.</span>` : '')
@@ -534,7 +534,7 @@ async function remap(r, dryRun){
   if (!dryRun && !confirm(what)) return;
   box.hidden = false; box.textContent = dryRun ? 'Previewing…' : (detach ? 'Detaching…' : 'Remapping…');
   try {
-    const v = await api('/backoffice/api/systems/'+r.system_id+'/remap', {method:'POST', body:{new_station_id: sid, reason, dry_run: dryRun, backfill_from: from}});
+    const v = await api('/monitoring-admin/api/systems/'+r.system_id+'/remap', {method:'POST', body:{new_station_id: sid, reason, dry_run: dryRun, backfill_from: from}});
     const range = v.quarantine_range && v.quarantine_range[0] ? `${fmtDate(v.quarantine_range[0])} → ${fmtDate(v.quarantine_range[1])}` : '—';
     box.innerHTML = `<b>${dryRun ? 'Preview — nothing written yet' : 'Done'}</b><br>`
       + (v.detach
@@ -562,7 +562,7 @@ async function retireAccount(r, dryRun){
     if (!dryRun && !confirm(`Merge ${r.login_email} INTO ${twin.login_email}?\n\nIts stations and all their readings move to the twin as secondary stations; this profile is removed and this login banned. Continue?`)) return;
     box.hidden = false; box.textContent = dryRun ? 'Previewing…' : 'Merging…';
     try {
-      const v = await api('/backoffice/api/customers/'+r.user_id+'/merge-into', {method:'POST', body:{survivor_user_id: twin.user_id, reason, dry_run: dryRun}});
+      const v = await api('/monitoring-admin/api/customers/'+r.user_id+'/merge-into', {method:'POST', body:{survivor_user_id: twin.user_id, reason, dry_run: dryRun}});
       const sys = a => (a.systems||[]).map(s => `${esc(s.plant||'?')} <span class="mono">${esc(s.solis_station_id||'∅')}</span> (${s.readings} d)`).join(', ') || 'none';
       box.innerHTML = `<b>${dryRun ? 'Preview — nothing written yet' : 'Done'}</b><br>
         Loser <span class="mono">${esc(v.loser.email)}</span>: ${sys(v.loser)} → ${dryRun?'will move to':'moved to'} survivor <span class="mono">${esc(v.survivor.email)}</span> (already has: ${sys(v.survivor)})<br>
@@ -575,7 +575,7 @@ async function retireAccount(r, dryRun){
   if (!dryRun && !confirm(`Retire ${r.login_email}?\n\nReadings → quarantine, station row and profile removed, login ${del ? 'DELETED' : 'banned'}${twin ? `; twin ${twin.login_email} keeps everything` : ''}. Continue?`)) return;
   box.hidden = false; box.textContent = dryRun ? 'Previewing…' : 'Retiring…';
   try {
-    const v = await api('/backoffice/api/customers/'+r.user_id+'/retire', {method:'POST', body:{reason, twin_user_id: twin ? twin.user_id : null, delete_login: del, dry_run: dryRun}});
+    const v = await api('/monitoring-admin/api/customers/'+r.user_id+'/retire', {method:'POST', body:{reason, twin_user_id: twin ? twin.user_id : null, delete_login: del, dry_run: dryRun}});
     const range = v.quarantine_range && v.quarantine_range[0] ? `${fmtDate(v.quarantine_range[0])} → ${fmtDate(v.quarantine_range[1])}` : '—';
     box.innerHTML = `<b>${dryRun ? 'Preview — nothing written yet' : 'Done'}</b><br>
       Login <span class="mono">${esc(v.email)}</span> (${v.last_sign_in_at ? 'last sign-in ' + fmtDate(v.last_sign_in_at) : 'never signed in'}) → <b>${esc(v.login_action)}</b>${v.login_done===false?' <span class="tag bad">login step failed — see server log</span>':''}<br>
@@ -618,7 +618,7 @@ function sigTag(x){
 async function loadUnresolved(){
   const el = $('#view-unresolved'); el.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const u = await api('/backoffice/api/unresolved');
+    const u = await api('/monitoring-admin/api/unresolved');
     const byEmail = {}; ROWS.forEach(r => { if (r.login_email) byEmail[r.login_email.toLowerCase()] = r; });
     const o = u.last_onboarding || {};
     el.innerHTML = `
@@ -681,7 +681,7 @@ async function loadUnresolved(){
 async function fillSuggestions(){
   const cells = $$('#view-unresolved [data-sugg]'); if (!cells.length) return;
   try {
-    const res = await api('/backoffice/api/suspects/suggestions');
+    const res = await api('/monitoring-admin/api/suspects/suggestions');
     cells.forEach(td => {
       const hits = res.suggestions[td.dataset.sugg] || [];
       td.innerHTML = hits.length
@@ -697,19 +697,19 @@ async function fillSuggestions(){
 async function loadJobs(){
   const el = $('#view-jobs'); el.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const {jobs} = await api('/backoffice/api/jobs');
+    const {jobs} = await api('/monitoring-admin/api/jobs');
     el.innerHTML = `<div class="card"><p class="hint">Jobs are drained by the backfill worker; a station can have one queued or running job per granularity.</p>
       <table><thead><tr><th>Queued</th><th>Customer</th><th>System</th><th>Granularity</th><th>Range</th><th>Status</th><th>Rows</th><th>Error</th><th></th></tr></thead><tbody>
       ${jobs.map(j => `<tr><td>${fmtTs(j.queued_at)}</td><td>${esc(j.full_name)}</td><td>${esc(j.system_name)}</td><td>${esc(j.granularity)}</td><td>${fmtDate(j.date_from)} → ${fmtDate(j.date_to)}</td><td><span class="tag ${j.status==='succeeded'?'ok':j.status==='failed'?'bad':'warn'}">${esc(j.status)}</span></td><td>${j.rows_written??''}</td><td class="muted">${esc(String(j.error||'').slice(0,100))}</td><td>${j.status==='queued'&&canEdit()?`<button class="btn sm danger" data-cancel="${j.id}">Cancel</button>`:''}</td></tr>`).join('') || '<tr><td colspan=9 class="muted">No jobs yet.</td></tr>'}
       </tbody></table></div>`;
-    $$('#view-jobs [data-cancel]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/jobs/'+b.dataset.cancel+'/cancel', {method:'POST'}); loadJobs(); } catch(e) { toast(e.message, true); } });
+    $$('#view-jobs [data-cancel]').forEach(b => b.onclick = async () => { try { await api('/monitoring-admin/api/jobs/'+b.dataset.cancel+'/cancel', {method:'POST'}); loadJobs(); } catch(e) { toast(e.message, true); } });
   } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
 }
 
 async function loadAudit(){
   const el = $('#view-audit'); el.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const {audit} = await api('/backoffice/api/audit?limit=300');
+    const {audit} = await api('/monitoring-admin/api/audit?limit=300');
     el.innerHTML = `<div class="card"><table><thead><tr><th>When</th><th>Who</th><th>Kind</th><th>Table</th><th>Row</th><th>Op</th><th>Field</th><th>Old → New</th><th>Reason</th><th>Source</th></tr></thead><tbody>
       ${audit.map(a => `<tr><td>${fmtTs(a.occurred_at)}</td><td>${esc(a.actor_email||'—')}</td><td><span class="tag ${a.actor_kind==='staff'?'ok':''}">${esc(a.actor_kind)}</span></td><td>${esc(a.table_name)}</td><td class="mono">${esc(String(a.row_pk).slice(0,8))}…</td><td>${esc(a.operation)}</td><td class="mono">${esc(a.field_name||'')}</td><td class="wrap">${a.field_name?`<s>${esc(a.old_value)}</s> → ${esc(a.new_value)}`:'<span class="muted">whole row</span>'}</td><td class="wrap muted">${esc(a.reason||'')}</td><td class="muted">${esc(a.source)}</td></tr>`).join('')}
       </tbody></table></div>`;
@@ -719,10 +719,10 @@ async function loadAudit(){
 async function loadStaff(){
   const el = $('#view-staff'); el.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const {staff} = await api('/backoffice/api/staff');
+    const {staff} = await api('/monitoring-admin/api/staff');
     el.innerHTML = `<div class="card">
       <div class="row" style="margin-bottom:6px"><input id="st-email" type="email" placeholder="colleague@solvivaenergy.com"><input id="st-name" placeholder="Full name"><select id="st-role"><option>readonly</option><option>engineer</option><option>admin</option></select><select id="st-mode"><option value="password">Create with a temporary password (shown once)</option><option value="invite">Send an invite email</option></select><button class="btn primary" id="st-add">Add staff</button></div>
-      <p class="hint" style="margin:0 0 12px">A solvivaenergy.com Google account can also just sign in with Google once its address is listed here. Invite emails land on the project's Site URL (Supabase → Authentication → URL Configuration) — set it to this back office or the link points at localhost.</p>
+      <p class="hint" style="margin:0 0 12px">A solvivaenergy.com Google account can also just sign in with Google once its address is listed here. Invite emails land on the project's Site URL (Supabase → Authentication → URL Configuration) — set it to this page's address or the link points at localhost.</p>
       <div class="verdict" id="st-result" hidden></div>
       <table><thead><tr><th>Email</th><th>Role</th><th>Active</th><th>Last sign-in</th><th>Providers</th><th>Added</th><th></th></tr></thead><tbody>
       ${staff.map(s => `<tr><td class="mono">${esc(s.email)}</td><td><select data-role="${s.user_id}">${['readonly','engineer','admin'].map(r=>`<option ${s.role===r?'selected':''}>${r}</option>`).join('')}</select></td><td>${s.active&&!s.revoked_at?'<span class="tag ok">active</span>':'<span class="tag bad">revoked</span>'}</td><td>${fmtTs(s.last_sign_in_at)}</td><td class="muted">${esc(JSON.stringify(s.providers||[]))}</td><td>${fmtDate(s.created_at)}</td><td class="row" style="gap:6px">${s.active&&!s.revoked_at?`<button class="btn sm danger" data-revoke="${s.user_id}">Revoke</button>`:`<button class="btn sm" data-restore="${s.user_id}">Restore</button>`}${s.user_id!==me.id?`<button class="btn sm danger" data-delete="${s.user_id}" data-email="${esc(s.email)}" title="Remove the staff row and delete the login, so a fresh invite can be sent">Delete</button>`:''}</td></tr>`).join('')}
@@ -730,7 +730,7 @@ async function loadStaff(){
     $('#st-add').onclick = async () => {
       const email = $('#st-email').value.trim(), mode = $('#st-mode').value;
       try {
-        const res = await api('/backoffice/api/staff', {method:'POST', body:{email, full_name:$('#st-name').value, role:$('#st-role').value, mode}});
+        const res = await api('/monitoring-admin/api/staff', {method:'POST', body:{email, full_name:$('#st-name').value, role:$('#st-role').value, mode}});
         const html = res.temporary_password
           ? `<b>${esc(res.email)}</b> can sign in now (role ${esc(res.role)}). Temporary password — shown only this once, we do not store it:<br><span class="mono" style="font-size:15px;user-select:all">${esc(res.temporary_password)}</span><br><span class="muted">Send it to them privately; they should use <i>Change password</i> after signing in. They can also sign in with Google instead.</span>`
           : `<b>${esc(res.email)}</b> added (role ${esc(res.role)}); an invite email was sent.`;
@@ -739,12 +739,12 @@ async function loadStaff(){
         const box = $('#st-result'); box.hidden = false; box.innerHTML = html;
       } catch(e) { toast(e.message, true); }
     };
-    $$('#view-staff [data-role]').forEach(s => s.onchange = async () => { try { await api('/backoffice/api/staff/'+s.dataset.role, {method:'PATCH', body:{role:s.value}}); toast('Role updated'); } catch(e) { toast(e.message, true); loadStaff(); } });
-    $$('#view-staff [data-revoke]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/staff/'+b.dataset.revoke, {method:'PATCH', body:{active:false}}); loadStaff(); } catch(e) { toast(e.message, true); } });
-    $$('#view-staff [data-restore]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/staff/'+b.dataset.restore, {method:'PATCH', body:{active:true}}); loadStaff(); } catch(e) { toast(e.message, true); } });
+    $$('#view-staff [data-role]').forEach(s => s.onchange = async () => { try { await api('/monitoring-admin/api/staff/'+s.dataset.role, {method:'PATCH', body:{role:s.value}}); toast('Role updated'); } catch(e) { toast(e.message, true); loadStaff(); } });
+    $$('#view-staff [data-revoke]').forEach(b => b.onclick = async () => { try { await api('/monitoring-admin/api/staff/'+b.dataset.revoke, {method:'PATCH', body:{active:false}}); loadStaff(); } catch(e) { toast(e.message, true); } });
+    $$('#view-staff [data-restore]').forEach(b => b.onclick = async () => { try { await api('/monitoring-admin/api/staff/'+b.dataset.restore, {method:'PATCH', body:{active:true}}); loadStaff(); } catch(e) { toast(e.message, true); } });
     $$('#view-staff [data-delete]').forEach(b => b.onclick = async () => {
       if (!confirm(`Delete ${b.dataset.email} as staff AND delete their login?\n\nThey can then be invited or created again from scratch. Customer logins are protected and will be refused.`)) return;
-      try { const res = await api('/backoffice/api/staff/'+b.dataset.delete+'?delete_login=true', {method:'DELETE'}); toast(res.login_deleted ? 'Staff row and login deleted' : 'Staff row deleted; login could not be deleted (see server log)'); loadStaff(); }
+      try { const res = await api('/monitoring-admin/api/staff/'+b.dataset.delete+'?delete_login=true', {method:'DELETE'}); toast(res.login_deleted ? 'Staff row and login deleted' : 'Staff row deleted; login could not be deleted (see server log)'); loadStaff(); }
       catch(e) { toast(e.message, true); }
     });
   } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
@@ -787,7 +787,7 @@ function loadGuide(){
   </div>`;
 }
 
-boot().catch(e => { document.body.innerHTML = `<main><div class="card">Back office failed to start: ${esc(e.message)}</div></main>`; });
+boot().catch(e => { document.body.innerHTML = `<main><div class="card">Monitoring Admin failed to start: ${esc(e.message)}</div></main>`; });
 </script>
 </body>
 </html>

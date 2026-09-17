@@ -397,7 +397,7 @@ async def main() -> None:
             log.error("Referral code sync failed: %s", e)
 
         # Mirror Odoo lead/partner fields and Solis plant name/email into our
-        # cached identity columns for the back office. Read-only toward Odoo.
+        # cached identity columns for Monitoring Admin. Read-only toward Odoo.
         # Last, so a failure here never delays the readings above.
         if "--no-mirror" not in sys.argv:
             try:

@@ -5,13 +5,13 @@ Mirror customer-identity fields from Odoo and Solis into OUR cached columns.
     solar_systems.solis_plant_name / solis_user_email
     user_profiles.odoo_partner_id / odoo_email / odoo_customer_name
 
-Migration 04a created these columns so the back office could show, side by
+Migration 04a created these columns so Monitoring Admin could show, side by
 side, what each system believes about a customer — and where they disagree.
 Nothing populated them: on 2026-09-17 all four odoo_* columns were empty on
 every one of 627 rows. This job fills them and keeps them current.
 
 READ-ONLY toward Odoo and Solis. Odoo is the sales team's source of truth and is
-never written from this project (see api/backoffice_routes.py); this copies
+never written from this project (see api/monitoring_admin_routes.py); this copies
 Odoo's values into our database so they can be displayed and compared. Values
 are mirrored as they are — a malformed email in Odoo is shown malformed here,
 because that is exactly what an engineer needs to see.

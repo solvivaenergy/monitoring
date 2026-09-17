@@ -27,7 +27,7 @@ that is written continuously; do not work around 25001 by deleting the keyword.
 | 10 station-scoped RLS | **applied** — old policies recorded in `rls_policies_ASBUILT_2026-09-16.sql`; verified as a real customer, a stranger, and anon | 2026-09-16 |
 | 11 view security | **applied** — six views: anon/authenticated revoked, `security_invoker=on`; `system_metrics` created. As-built DDL in `monthly_energy_sync_views_ASBUILT.sql` | 2026-09-16 |
 | 12 legacy timestamp quarantine (optional) | not run — see below | |
-| **13 readings quarantine** (`2026-09-17_13_readings_quarantine.sql`) | **applied** — `energy_readings_quarantine`, used by the back office's Remap to hold readings captured under a wrong station id (recoverable, never deleted) | 2026-09-17 |
+| **13 readings quarantine** (`2026-09-17_13_readings_quarantine.sql`) | **applied** — `energy_readings_quarantine`, used by Monitoring Admin's Remap to hold readings captured under a wrong station id (recoverable, never deleted) | 2026-09-17 |
 | **14 audit_log append-only trigger** (`2026-09-17_14_audit_log_append_only_trigger.sql`) | **applied** — replaces 08's rewrite rules, which had made **every auth user undeletable** (the FK's ON DELETE SET NULL was rewritten to nothing). File 08 updated to match. | 2026-09-17 |
 
 ## Verified state after 11 (2026-09-16 ~15:40 UTC)
@@ -55,14 +55,15 @@ a partial-morning value. Full reports kept outside the repo (customer names).
 The two legacy mismatches above are why 12 exists: the 405 rows with insert-time
 timestamps are partial-day snapshots, not day totals. 12 quarantines them; the
 gap filler would then re-insert the correct noon rows from Solis. Run it when
-the back office can show what changed — it is a data edit, not a schema one.
+Monitoring Admin can show what changed — it is a data edit, not a schema one.
 
-## Not yet done
+## Not yet done (updated 2026-09-18)
 
-- `api/merge_customer_accounts.py --apply` (6 merges) — **needs a decision**:
-  merged customers see only one system until the portal has a station selector.
-- The back office itself; the backfill worker that drains `backfill_jobs`;
-  staff accounts in `staff_users` (none exist — the table is empty).
-- Render: `SOLIS_API_TOKEN` still unset (`/solis/*` returns 503 to everyone).
-- GitHub: Settings → Pages → Source: None.
+- File 12 (above).
+- Everything else from the original list is done: the 6 merges were applied
+  through Monitoring Admin's Merge action on 2026-09-18 (not the script);
+  Monitoring Admin (`/monitoring-admin`, formerly `/backoffice`), the backfill
+  worker and `staff_users` are live; `SOLIS_API_TOKEN` is set; GitHub Pages was
+  already off. `audit_log.source` says `'backoffice'` for rows written before
+  the 2026-09-18 rename and `'monitoring_admin'` after.
 - Password rotation for the 565 never-signed-in accounts.

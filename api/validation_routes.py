@@ -1,7 +1,7 @@
 """
-Back-office ID validation routes.
+Monitoring Admin ID validation routes.
 
-Three validators, used by the engineering back office before an identity edit is
+Three validators, used by the engineering team's Monitoring Admin before an identity edit is
 persisted and before any backfill is triggered:
 
     POST /admin/validate/solis-station   does this Solis station id exist, and who owns it
@@ -69,7 +69,7 @@ from supabase import create_client
 from .onboard_from_odoo import DEFAULT_FIELD_NAME, _build_odoo_config, _connect_odoo
 from .solis_client import SolisCloudClient, SolisCloudError
 
-router = APIRouter(prefix="/admin/validate", tags=["Back Office — Validation"])
+router = APIRouter(prefix="/admin/validate", tags=["Monitoring Admin — Validation"])
 log = logging.getLogger(__name__)
 
 # Verdicts. Only these three ever appear in a `status` field.
@@ -204,7 +204,7 @@ async def _authenticate_staff_uncached(authorization: str) -> Dict[str, Any]:
 
     Depends on the `staff_users` table + `is_staff()` from the security audit.
     Until that table exists, STAFF_BOOTSTRAP_EMAILS (a comma-separated env var)
-    is honoured so the back office can be brought up; remove it once staff rows
+    is honoured so Monitoring Admin can be brought up; remove it once staff rows
     are seeded, and never let it be the permanent mechanism.
     """
     if not authorization or not authorization.startswith("Bearer "):
@@ -254,7 +254,7 @@ async def _authenticate_staff_uncached(authorization: str) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail="Staff directory unavailable")
 
     if not rows or not rows[0].get("active") or rows[0].get("revoked_at"):
-        raise HTTPException(status_code=403, detail="Not authorised for the back office")
+        raise HTTPException(status_code=403, detail="Not authorised for Monitoring Admin")
 
     return {"id": str(user.id), "email": email, "role": rows[0].get("role") or "readonly"}
 
@@ -437,7 +437,7 @@ async def _get_roster(force: bool = False) -> Tuple[Optional[Dict[str, Dict[str,
 
 
 def _station_payload(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """The fields the back office grid displays. Field names verified live
+    """The fields the Monitoring Admin grid displays. Field names verified live
     against both userStationList and stationDetail on 2026-09-14."""
     state = rec.get("state")
     try:
@@ -447,7 +447,7 @@ def _station_payload(rec: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "station_id": str(rec.get("id") or ""),
         # Solis exposes NO owner-name field. `stationName` is both the plant name
-        # and the only person-ish name Solis has; the back office's "customer
+        # and the only person-ish name Solis has; Monitoring Admin's "customer
         # name (solis)" and "solis plant name" are one column, not two.
         "station_name": rec.get("stationName") or None,
         "user_email": rec.get("userEmail") or None,
@@ -1264,7 +1264,7 @@ class GridRequest(BaseModel):
 async def validate_rows(
     body: GridRequest, response: Response, authorization: str = Header(None)
 ):
-    """Validate the whole back-office grid at once.
+    """Validate the whole Monitoring Admin grid at once.
 
     Cost for all 615 rows: one roster read (memory hit, or ~90 s once per 5 min),
     one PostgREST `in.()` query, and three XML-RPC calls. Measured components:

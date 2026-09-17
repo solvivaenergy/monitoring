@@ -1,5 +1,5 @@
 """
-Direct Postgres access for the back office and the workers.
+Direct Postgres access for Monitoring Admin and the workers.
 
 Why not PostgREST for everything: the grid joins auth.users (not exposed over
 PostgREST), and every mutation must carry WHO did it and WHY into the audit
@@ -44,7 +44,7 @@ PROJECT_REF = "kzsocvzhbgtfyksrjmvk"
 POOLER_HOST = "aws-1-ap-south-1.pooler.supabase.com"
 
 # Supabase's session pooler caps connections per role; four is plenty for a
-# single-instance back office plus a worker, and leaves room for the crons.
+# single-instance Monitoring Admin plus a worker, and leaves room for the crons.
 POOL_MIN, POOL_MAX = 1, 4
 
 _pool: Optional[ConnectionPool] = None
@@ -133,7 +133,9 @@ def audited(
     actor_id: Optional[str],
     actor_email: Optional[str],
     reason: str,
-    source: str = "backoffice",
+    # audit_log.source. Rows written before the 2026-09-18 rename say
+    # 'backoffice'; filter on both when reading history.
+    source: str = "monitoring_admin",
     request_id: Optional[str] = None,
 ) -> Iterator[psycopg.Connection]:
     """One transaction whose writes the audit trigger attributes to `actor`.

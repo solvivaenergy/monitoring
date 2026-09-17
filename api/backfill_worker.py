@@ -1,7 +1,7 @@
 """
 Drain the backfill_jobs queue.
 
-The back office never runs a backfill inline — an engineer's button writes a
+Monitoring Admin never runs a backfill inline — an engineer's button writes a
 row into backfill_jobs (migration 09) and this worker picks it up. Firing
 backfills inline is how the August duplicate-station incident happened, and a
 60-day fetch against an API that 502s does not fit inside an HTTP request.
