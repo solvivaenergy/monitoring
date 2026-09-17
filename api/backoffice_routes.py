@@ -50,8 +50,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from . import db
+from .backfill_history import PHT, parse_month_day
 from .solis_client import SolisCloudClient
-from .validation_routes import _authenticate_staff
+from .validation_routes import _authenticate_staff, _get_roster
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/backoffice", tags=["Back Office"])
@@ -119,6 +120,19 @@ def _reason(reason: Optional[str]) -> str:
     if len(r) < 3:
         raise HTTPException(400, "A reason is required (what changed and why).")
     return r[:500]
+
+
+_NAME_STOP = {
+    "residence", "residential", "house", "home", "plant", "system", "solar", "meter", "grocery", "store",
+    "inc", "corp", "co", "mr", "mrs", "ms", "dr", "engr", "and", "the", "of", "de", "dela", "del",
+    "san", "sta", "sto", "jr", "sr", "ii", "iii", "2nd", "3rd",
+}
+
+
+def _name_tokens(s: Optional[str]) -> set:
+    """Words that identify a person in a name-ish string; used to compare the
+    customer's profile name, the Solis plant name and the Odoo name."""
+    return {t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if len(t) > 2 and t not in _NAME_STOP}
 
 
 def _supabase_env() -> Dict[str, str]:
@@ -279,6 +293,18 @@ def _enqueue(conn: psycopg.Connection, system_id: uuid.UUID, station_id: Optiona
     return _j(job)
 
 
+def _enqueue_range(conn: psycopg.Connection, system_id: uuid.UUID, station_id: Optional[str], granularity: str,
+                   date_from: dt.date, date_to: dt.date, staff: Dict[str, Any], reason: str, request_id: str) -> Dict[str, Any]:
+    job = conn.execute(
+        """insert into public.backfill_jobs
+             (system_id, solis_station_id, granularity, date_from, date_to,
+              requested_by, requested_reason, request_id)
+           values (%s, %s, %s, %s, %s, %s, %s, %s)
+           returning id, status, granularity, date_from, date_to""",
+        (system_id, station_id, granularity, date_from, date_to, staff["id"], reason, request_id)).fetchone()
+    return _j(job)
+
+
 @router.patch("/api/systems/{system_id}")
 async def edit_system(system_id: uuid.UUID, body: EditRequest, authorization: str = Header(None)):
     staff = await _authenticate_staff(authorization)
@@ -424,6 +450,203 @@ async def add_station(body: AddStationRequest, authorization: str = Header(None)
 
 
 # ---------------------------------------------------------------------------
+# wrong-station repair: check first, then remap with quarantine
+# ---------------------------------------------------------------------------
+
+MISMATCH_ABS_KWH, MISMATCH_REL = 0.05, 0.01
+
+
+class ReconcileRequest(BaseModel):
+    months: int = Field(3, ge=1, le=12)
+
+
+@router.post("/api/systems/{system_id}/reconcile")
+async def reconcile_system(system_id: uuid.UUID, body: ReconcileRequest, authorization: str = Header(None)):
+    """Compare this system's stored daily production with what Solis reports for
+    its station over the last N months. A right mapping agrees ~99% of days; a
+    wrong one agrees on almost none. Read-only, a few Solis calls."""
+    await _authenticate_staff(authorization)
+    today = dt.datetime.now(PHT).date()
+    months, d = [], today.replace(day=1)
+    for _ in range(body.months):
+        months.append(d.strftime("%Y-%m"))
+        d = d.replace(year=d.year - 1, month=12) if d.month == 1 else d.replace(month=d.month - 1)
+    y, m = (int(x) for x in months[-1].split("-"))
+    since = dt.datetime(y, m, 1, tzinfo=PHT)
+
+    with db.connect(autocommit=True) as conn:
+        sys_row = conn.execute(
+            "select id, solis_station_id, capacity_kwp from public.solar_systems where id = %s", (system_id,)).fetchone()
+        if not sys_row:
+            raise HTTPException(404, "No such system")
+        if not sys_row["solis_station_id"]:
+            raise HTTPException(400, "This system has no Solis station id")
+        ours = {r["day"].isoformat(): float(r["kwh"] or 0) for r in conn.execute(
+            """select ("timestamp" at time zone 'Asia/Manila')::date as day, production_kwh as kwh
+                 from public.energy_readings where system_id = %s and "timestamp" >= %s""",
+            (system_id, since)).fetchall()}
+
+    key_id, key_secret = os.getenv("SOLIS_CLOUD_KEY_ID", ""), os.getenv("SOLIS_CLOUD_KEY_SECRET", "")
+    if not key_id or not key_secret:
+        raise HTTPException(500, "Solis credentials not configured")
+    solis = SolisCloudClient(key_id, key_secret)
+    theirs: Dict[str, float] = {}
+    errors: List[str] = []
+    for mon in months:
+        try:
+            data = await solis.station_month(sys_row["solis_station_id"], mon)
+        except Exception as exc:
+            errors.append(f"{mon}: {str(exc)[:80]}")
+            continue
+        for day in (data if isinstance(data, list) else []):
+            p = parse_month_day(day, float(sys_row["capacity_kwp"] or 0))
+            if p and p["date_str"] < today.isoformat():
+                theirs[p["date_str"]] = p["production_kwh"]
+
+    compared = sorted(set(ours) & set(theirs))
+    mism = []
+    for day_s in compared:
+        a, b = ours[day_s], theirs[day_s]
+        if abs(a - b) > max(MISMATCH_ABS_KWH, MISMATCH_REL * max(abs(a), abs(b))):
+            mism.append({"day": day_s, "ours_kwh": round(a, 2), "solis_kwh": round(b, 2), "diff_kwh": round(b - a, 2)})
+    pct = round(100.0 * (len(compared) - len(mism)) / len(compared), 1) if compared else None
+    # This compares OUR rows with Solis for the station id WE HOLD. It proves
+    # data integrity for that id (stale rows, a past remap never backfilled),
+    # not identity: a customer wrongly mapped to another plant still agrees
+    # 99% here, because the rows are that plant's data faithfully copied.
+    # Identity is judged from the plant name and Solis email vs the customer.
+    if not compared:
+        verdict = "nothing to compare — no overlapping days"
+    elif pct >= 97:
+        verdict = "stored data matches Solis for this station id"
+    elif pct >= 80:
+        verdict = "mostly matches — look at the mismatched days (Solis revises recent days)"
+    else:
+        verdict = "stored data does NOT match this station's Solis history — stale rows, or a remap that was never backfilled; queue a backfill"
+    return _j({
+        "station_id": sys_row["solis_station_id"], "months": months, "days_compared": len(compared),
+        "mismatched": len(mism), "agreement_pct": pct, "verdict": verdict,
+        "only_in_ours": sorted(set(ours) - set(theirs))[:30], "only_in_solis": sorted(set(theirs) - set(ours))[:30],
+        "mismatches": sorted(mism, key=lambda x: -abs(x["diff_kwh"]))[:40], "solis_errors": errors,
+    })
+
+
+class RemapRequest(BaseModel):
+    new_station_id: str
+    reason: str = ""
+    dry_run: bool = True
+    backfill_from: Optional[dt.date] = None
+
+
+@router.post("/api/systems/{system_id}/remap")
+async def remap_station(system_id: uuid.UUID, body: RemapRequest, authorization: str = Header(None)):
+    """Move a system to the correct Solis station — the fix for a wrong station id.
+
+    In ONE transaction: every reading captured under the old id is moved to
+    energy_readings_quarantine (migration 13 — recoverable, never deleted), the
+    system's id/name/capacity/email/first-power date are refreshed from the Solis
+    roster, any live backfill jobs are cancelled, and two new jobs are queued: a
+    daily backfill of the correct station from its first-power date (or
+    backfill_from) and a five-minute refresh of today. dry_run=True (default)
+    returns exactly what would happen and writes nothing.
+    """
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "engineer")
+    new_sid = body.new_station_id.strip()
+    if not STATION_ID_RE.match(new_sid):
+        raise HTTPException(400, "Solis station id must be 15–20 digits")
+    roster, _age, stale = await _get_roster()
+    if roster is None:
+        raise HTTPException(503, "Solis roster unavailable — try again in a minute")
+    rec = roster.get(new_sid)
+    if not rec:
+        raise HTTPException(400, f"Station {new_sid} is not in our Solis account (checked the live roster)")
+
+    with db.connect(autocommit=True) as conn:
+        sys_row = conn.execute(
+            "select id, user_id, solis_station_id, system_name, is_primary from public.solar_systems where id = %s",
+            (system_id,)).fetchone()
+        if not sys_row:
+            raise HTTPException(404, "No such system")
+        if sys_row["solis_station_id"] == new_sid:
+            raise HTTPException(400, "That is already this system's station id")
+        holder = conn.execute(
+            """select s.id, s.system_name, p.full_name from public.solar_systems s
+                 left join public.user_profiles p on p.id = s.user_id
+                where s.solis_station_id = %s and s.id <> %s""", (new_sid, system_id)).fetchone()
+        if holder:
+            raise HTTPException(409, f"Station {new_sid} is already assigned to "
+                                     f"{holder['full_name'] or holder['system_name']} — correct that system first")
+        stats = conn.execute(
+            """select count(*) as rows, min("timestamp") as first_ts, max("timestamp") as last_ts,
+                      coalesce(round(sum(production_kwh)::numeric, 1), 0) as kwh
+                 from public.energy_readings where system_id = %s""", (system_id,)).fetchone()
+        fm_rows = conn.execute(
+            "select count(*) as n from public.energy_readings_five_minutes where system_id = %s", (system_id,)).fetchone()["n"]
+        live_jobs = conn.execute(
+            "select id from public.backfill_jobs where system_id = %s and status in ('queued','running')",
+            (system_id,)).fetchall()
+
+    first_power = None
+    for k in ("fisPowerTimeStr", "createDateStr"):
+        if rec.get(k):
+            try:
+                first_power = dt.date.fromisoformat(str(rec[k])[:10])
+                break
+            except ValueError:
+                pass
+    today = dt.datetime.now(PHT).date()
+    backfill_from = body.backfill_from or first_power or (today - dt.timedelta(days=365))
+    preview = _j({
+        "system_id": system_id, "old_station_id": sys_row["solis_station_id"], "new_station_id": new_sid,
+        "new_plant_name": rec.get("stationName"), "new_capacity_kwp": float(rec.get("capacity") or 0) or None,
+        "new_solis_email": rec.get("userEmail"), "first_power_date": first_power,
+        "rows_to_quarantine": stats["rows"], "quarantine_range": [stats["first_ts"], stats["last_ts"]],
+        "kwh_to_quarantine": stats["kwh"], "five_minute_rows_to_drop": fm_rows,
+        "backfill_from": backfill_from, "backfill_to": today - dt.timedelta(days=1),
+        "live_jobs_to_cancel": len(live_jobs), "roster_stale": stale,
+    })
+    if body.dry_run:
+        return {"dry_run": True, **preview}
+
+    reason = _reason(body.reason)
+    request_id = str(uuid.uuid4())
+    try:
+        with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
+            conn.execute(
+                """insert into public.energy_readings_quarantine
+                   select r.*, now(), %s, %s, %s, %s, %s
+                     from public.energy_readings r where r.system_id = %s""",
+                (staff["id"], request_id, reason, sys_row["solis_station_id"], new_sid, system_id))
+            conn.execute("delete from public.energy_readings where system_id = %s", (system_id,))
+            conn.execute("delete from public.energy_readings_five_minutes where system_id = %s", (system_id,))
+            if live_jobs:
+                conn.execute(
+                    "update public.backfill_jobs set status = 'cancelled', finished_at = now(), "
+                    "error = 'superseded by remap' where system_id = %s and status in ('queued','running')",
+                    (system_id,))
+            conn.execute(
+                """update public.solar_systems
+                      set solis_station_id = %s, solis_plant_name = %s, solis_user_email = %s,
+                          capacity_kwp = coalesce(%s, capacity_kwp),
+                          installation_date = coalesce(%s, installation_date),
+                          solis_validated_at = now(), solis_validation = 'verified',
+                          last_backfill_status = null, last_backfill_at = null, updated_at = now()
+                    where id = %s""",
+                (new_sid, rec.get("stationName") or sys_row["system_name"], rec.get("userEmail"),
+                 float(rec.get("capacity") or 0) or None, first_power, system_id))
+            job = _enqueue_range(conn, system_id, new_sid, "daily", backfill_from, today - dt.timedelta(days=1),
+                                 staff, reason, request_id)
+            job5 = _enqueue_range(conn, system_id, new_sid, "five_minutes", today, today, staff, reason, request_id)
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+    _invalidate_rows()
+    return {"dry_run": False, "request_id": request_id, "backfill_job": job, "five_minute_job": job5, **preview}
+
+
+# ---------------------------------------------------------------------------
 # backfill queue
 # ---------------------------------------------------------------------------
 
@@ -555,6 +778,17 @@ async def unresolved(authorization: str = Header(None)):
         run = conn.execute(
             "select ran_at, candidates, created, failed, duplicate_email, missing_email, duplicate_station, report "
             "from public.onboarding_runs order by ran_at desc limit 1").fetchone()
+        suspects_raw = conn.execute(
+            """select s.id as system_id, p.full_name, s.solis_plant_name,
+                      coalesce(p.odoo_customer_name, s.odoo_lead_name) as odoo_name,
+                      u.email as login_email, s.solis_user_email,
+                      coalesce(p.odoo_email, s.odoo_lead_email) as odoo_email,
+                      s.solis_station_id, s.odoo_lead_id,
+                      (select count(*) from public.energy_readings r where r.system_id = s.id) as readings
+                 from public.solar_systems s
+                 left join public.user_profiles p on p.id = s.user_id
+                 left join auth.users u on u.id = s.user_id
+                where s.solis_station_id is not null and s.solis_plant_name is not null""").fetchall()
     onboarding: Dict[str, Any] = {}
     if run:
         report = run["report"] if isinstance(run["report"], dict) else json.loads(run["report"] or "{}")
@@ -568,12 +802,90 @@ async def unresolved(authorization: str = Header(None)):
                 {k: r.get(k) for k in ("full_name", "email", "station_id", "existing_station_id")}
                 for r in results if r.get("status") == "skipped_would_repoint"],
         }
+    # Possible wrong station: the Solis plant name shares no word with the
+    # customer's name. Two very different causes look alike here, so every
+    # signal is reported and the engineer decides — "Check data vs Solis" and
+    # the emails usually settle it:
+    #   * the Odoo lead carries another plant's station id  → remap + tell sales
+    #   * the customer's PROFILE name is wrong (nickname, email as name)
+    #     while the mapping is right                          → edit the profile
+    suspects = []
+    for r in suspects_raw:
+        nt, pt, ot = _name_tokens(r["full_name"]), _name_tokens(r["solis_plant_name"]), _name_tokens(r["odoo_name"])
+        if not (nt and pt) or (nt & pt):
+            continue
+        signals = ["Solis plant name shares no word with the customer's name"]
+        score = 1
+        if ot and not (nt & ot):
+            signals.append("Odoo name also differs from the customer's name"); score += 1
+        le, se = (r["login_email"] or "").lower(), (r["solis_user_email"] or "").lower()
+        if se and le and se != le:
+            signals.append("Solis plant email differs from the login email"); score += 1
+        elif se and le and se == le:
+            signals.append("Solis plant email MATCHES the login email → mapping is probably right; the profile name is the odd one")
+        if pt and ot and (pt & ot):
+            signals.append("plant name matches the ODOO name → the profile name is probably what's wrong")
+        suspects.append({**dict(r), "score": score, "signals": signals, "suggested_stations": []})
+    suspects.sort(key=lambda x: (-x["score"], -(x["readings"] or 0)))
+
+    # Suggested correct plants come from a separate endpoint
+    # (/api/suspects/suggestions): they need the Solis roster, whose cold walk
+    # takes ~90 s and fails outright when Solis is having a bad hour. This page
+    # must never wait on that.
+
     return _j({
         "profiles_without_system": no_system,
         "systems_without_station": no_station,
         "dark_systems": dark,
         "last_onboarding": onboarding,
+        "suspect_mappings": suspects,
     })
+
+
+@router.get("/api/suspects/suggestions")
+async def suspect_suggestions(authorization: str = Header(None)):
+    """For every 'possible wrong station' suspect, the unassigned plants in our
+    Solis roster that are named after the customer — the likely correct id,
+    offered for the engineer to validate, never applied.
+
+    Separate from /api/unresolved on purpose: this needs the fleet roster, whose
+    cold walk takes ~90 s and fails when Solis is unwell (502s), and the page
+    must render without it. The UI fills the column asynchronously and offers
+    Retry on 503."""
+    await _authenticate_staff(authorization)
+    roster, _age, stale = await _get_roster()
+    if roster is None:
+        raise HTTPException(503, "Solis roster unavailable right now — retry in a minute")
+    with db.connect(autocommit=True) as conn:
+        rows = conn.execute(
+            """select s.id as system_id, p.full_name, s.solis_plant_name,
+                      coalesce(p.odoo_customer_name, s.odoo_lead_name) as odoo_name, u.email as login_email
+                 from public.solar_systems s
+                 left join public.user_profiles p on p.id = s.user_id
+                 left join auth.users u on u.id = s.user_id
+                where s.solis_station_id is not null and s.solis_plant_name is not null""").fetchall()
+        assigned = {str(x["solis_station_id"]) for x in conn.execute(
+            "select solis_station_id from public.solar_systems where solis_station_id is not null").fetchall()}
+    unassigned = [(str(sid), rec) for sid, rec in roster.items() if str(sid) not in assigned]
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        nt, pt0 = _name_tokens(r["full_name"]), _name_tokens(r["solis_plant_name"])
+        if not (nt and pt0) or (nt & pt0):
+            continue  # same suspect rule as /api/unresolved
+        nt |= _name_tokens(r["odoo_name"])
+        hits = []
+        for sid, rec in unassigned:
+            pt = _name_tokens(rec.get("stationName"))
+            if len(nt & pt) >= (2 if len(pt) > 1 else 1):
+                em = (rec.get("userEmail") or "").lower()
+                hits.append({
+                    "station_id": sid, "plant_name": rec.get("stationName"),
+                    "capacity_kwp": float(rec.get("capacity") or 0) or None, "solis_email": rec.get("userEmail"),
+                    "email_matches_login": bool(em and r["login_email"] and em == r["login_email"].lower()),
+                })
+        if hits:
+            out[str(r["system_id"])] = sorted(hits, key=lambda h: (not h["email_matches_login"], h["plant_name"] or ""))
+    return {"suggestions": out, "unassigned_in_roster": len(unassigned), "roster_stale": stale}
 
 
 # ---------------------------------------------------------------------------

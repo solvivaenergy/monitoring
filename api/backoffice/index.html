@@ -82,6 +82,7 @@
     <button data-tab="unresolved">Unresolved</button>
     <button data-tab="jobs">Backfills</button>
     <button data-tab="audit">Audit</button>
+    <button data-tab="guide">Guide</button>
     <button data-tab="staff" id="tab-staff" hidden>Staff</button>
   </nav>
   <div class="spacer"></div>
@@ -133,6 +134,7 @@
   <section id="view-jobs" hidden></section>
   <section id="view-audit" hidden></section>
   <section id="view-staff" hidden></section>
+  <section id="view-guide" hidden></section>
 </main>
 
 <aside class="panel" id="panel">
@@ -226,7 +228,7 @@ $('#btn-set-password').onclick = async () => {
 };
 $('#btn-password').onclick = () => { show('recovery'); };
 $('#btn-signout').onclick = signOut;
-$$('#tabs button').forEach(b => b.onclick = () => { show(b.dataset.tab); ({unresolved:loadUnresolved, jobs:loadJobs, audit:loadAudit, staff:loadStaff}[b.dataset.tab]||(()=>{}))(); });
+$$('#tabs button').forEach(b => b.onclick = () => { show(b.dataset.tab); ({unresolved:loadUnresolved, jobs:loadJobs, audit:loadAudit, staff:loadStaff, guide:loadGuide}[b.dataset.tab]||(()=>{}))(); });
 
 /* ------------------------------------------------------------------ */
 /* customers grid                                                       */
@@ -247,11 +249,17 @@ const COLS = [
 ];
 function vTag(r){ const v = VALIDATIONS[r.system_id]; if(!v) return ''; const s=v.solis_station?.status||v.status; return s ? ` <span class="tag ${/ok|found|assigned/i.test(s)?'ok':/unavail/i.test(s)?'warn':'bad'}" title="${esc(JSON.stringify(v))}">${esc(s)}</span>` : ''; }
 
+const NAME_STOP = new Set(['residence','residential','house','home','plant','system','solar','meter','grocery','store','inc','corp','mr','mrs','ms','dr','engr','and','the','of','de','dela','del','san','sta','sto','jr','sr','2nd','3rd']);
+const nameTokens = s => new Set(String(s||'').toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 2 && !NAME_STOP.has(t)));
+const shareWord = (a, b) => { const A = nameTokens(a), B = nameTokens(b); if (!A.size || !B.size) return true; for (const t of A) if (B.has(t)) return true; return false; };
+// "Odoo ≠ Supabase" (and Solis): any of the three systems disagreeing about who this customer is.
 function mismatch(r){
-  const le = (r.login_email||'').toLowerCase(), oe = (r.odoo_email||r.odoo_lead_email||'').toLowerCase();
+  const le = (r.login_email||'').toLowerCase(), oe = (r.odoo_email||r.odoo_lead_email||'').toLowerCase(), se = (r.solis_user_email||'').toLowerCase();
   if (oe && le && oe !== le) return true;
-  const n1 = (r.full_name||'').toLowerCase().replace(/\s+/g,' ').trim(), n2 = (r.odoo_customer_name||r.odoo_lead_name||'').toLowerCase().replace(/\s+/g,' ').trim();
-  return !!(n1 && n2 && n1 !== n2);
+  if (se && le && se !== le) return true;
+  if (!shareWord(r.full_name, r.odoo_customer_name||r.odoo_lead_name)) return true;   // Odoo calls the customer something else
+  if (!shareWord(r.full_name, r.solis_plant_name)) return true;                       // the plant is named after someone else
+  return false;
 }
 function applyFilter(rows){
   const q = $('#q').value.trim().toLowerCase();
@@ -341,6 +349,27 @@ async function openPanel(systemId){
     <div class="verdict" id="v-station" hidden></div>
     <div class="verdict" id="v-lead" hidden></div>
 
+    <h3>Does our stored data match Solis for this station id?</h3>
+    <div class="row">
+      <select id="rec-months"><option value="1">last month</option><option value="3" selected>last 3 months</option><option value="6">last 6 months</option><option value="12">last 12 months</option></select>
+      <button class="btn sm" id="btn-reconcile" ${r.solis_station_id?'':'disabled'}>Check data vs Solis</button>
+    </div>
+    <p class="hint" style="margin:6px 0 0">Checks data integrity for the id above — stale rows, or a past remap that was never backfilled. It cannot tell you whether the station <i>belongs</i> to this customer: judge that from the plant name and Solis email (${esc(r.solis_plant_name||'—')} · ${esc(r.solis_user_email||'no Solis email')}) against the login ${esc(r.login_email||'—')} and the Odoo name.</p>
+    <div class="verdict" id="v-reconcile" hidden></div>
+    ${canEdit() ? `
+    <details id="remap-box" style="margin-top:8px"><summary class="hint"><b>Remap to the correct Solis station</b> — quarantines every reading captured under the wrong id, re-identifies the station from Solis, backfills the right history</summary>
+      <div class="grid2" style="margin-top:8px">
+        <div><label>Correct Solis station id</label><input id="remap-sid" pattern="\\d{15,20}" placeholder="19 digits, from the Odoo lead or Solis Cloud"></div>
+        <div><label>Backfill from (optional; default = plant's first-power date)</label><input id="remap-from" type="date"></div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn sm" id="btn-remap-preview">Preview</button>
+        <button class="btn sm primary" id="btn-remap-confirm" disabled>Confirm remap</button>
+        <span class="hint">Preview first. Confirm needs the reason box below. Nothing is deleted — the old rows go to quarantine, recoverable.</span>
+      </div>
+      <div class="verdict" id="v-remap" hidden></div>
+    </details>` : ''}
+
     ${canEdit() ? `
     <h3>Save changes</h3>
     <div class="field"><label>Reason (required, goes to the audit log)</label><textarea id="reason" rows="2" placeholder="e.g. Sales confirmed station id with customer on 17 Sep"></textarea></div>
@@ -386,8 +415,11 @@ async function openPanel(systemId){
 
   $$('#panel-body [data-open]').forEach(a => a.onclick = e => { e.preventDefault(); openPanel(a.dataset.open); });
   $$('#panel-body [data-validate]').forEach(b => b.onclick = () => validate(b.dataset.validate, r));
+  $('#btn-reconcile').onclick = () => reconcileSystem(r);
   if (canEdit()) {
     $('#btn-save').onclick = () => saveAll(r);
+    $('#btn-remap-preview').onclick = () => remap(r, true);
+    $('#btn-remap-confirm').onclick = () => remap(r, false);
     $('#btn-backfill').onclick = () => queueBackfill(r);
     $('#btn-add-station').onclick = () => addStation(r);
   }
@@ -442,6 +474,37 @@ async function validate(kind, r){
     box.innerHTML = summarizeVerdict(res);
   } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
 }
+async function reconcileSystem(r){
+  const box = $('#v-reconcile'); box.hidden = false; box.textContent = 'Comparing with Solis… (a few seconds per month)';
+  try {
+    const v = await api('/backoffice/api/systems/'+r.system_id+'/reconcile', {method:'POST', body:{months: Number($('#rec-months').value)}});
+    const cls = v.agreement_pct==null ? '' : v.agreement_pct>=97 ? 'ok' : v.agreement_pct>=80 ? 'warn' : 'bad';
+    box.innerHTML = `<span class="tag ${cls}">${esc(v.verdict)}</span> ${v.days_compared} day(s) compared, ${v.mismatched} differ${v.agreement_pct!=null?` — <b>${v.agreement_pct}% agreement</b>`:''}.`
+      + (v.only_in_ours.length ? ` <span class="muted">${v.only_in_ours.length} day(s) we hold that Solis has no data for.</span>` : '')
+      + (v.only_in_solis.length ? ` <span class="muted">${v.only_in_solis.length} day(s) Solis has that we don't (queue a backfill).</span>` : '')
+      + (v.mismatches.length ? `<table style="margin-top:6px"><thead><tr><th>Day</th><th>Ours kWh</th><th>Solis kWh</th><th>Diff</th></tr></thead><tbody>${v.mismatches.slice(0,12).map(m => `<tr><td>${m.day}</td><td>${m.ours_kwh}</td><td>${m.solis_kwh}</td><td>${m.diff_kwh>0?'+':''}${m.diff_kwh}</td></tr>`).join('')}</tbody></table>` : '')
+      + (v.solis_errors.length ? `<div class="tag warn">Solis errors: ${esc(v.solis_errors.join('; '))}</div>` : '');
+  } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
+}
+async function remap(r, dryRun){
+  const sid = $('#remap-sid').value.trim(), from = $('#remap-from').value || null, box = $('#v-remap');
+  if (!/^\d{15,20}$/.test(sid)) return toast('Enter the correct station id (15–20 digits)', true);
+  const reason = ($('#reason')?.value||'').trim();
+  if (!dryRun && reason.length < 3) return toast('Type the reason in the Save-changes box first — it goes into the audit log', true);
+  if (!dryRun && !confirm(`Remap "${r.full_name||r.system_name}" from ${r.solis_station_id} to ${sid}?\n\nAll readings recorded under the old id move to quarantine and the correct history is backfilled. Continue?`)) return;
+  box.hidden = false; box.textContent = dryRun ? 'Previewing…' : 'Remapping…';
+  try {
+    const v = await api('/backoffice/api/systems/'+r.system_id+'/remap', {method:'POST', body:{new_station_id: sid, reason, dry_run: dryRun, backfill_from: from}});
+    const range = v.quarantine_range && v.quarantine_range[0] ? `${fmtDate(v.quarantine_range[0])} → ${fmtDate(v.quarantine_range[1])}` : '—';
+    box.innerHTML = `<b>${dryRun ? 'Preview — nothing written yet' : 'Done'}</b><br>
+      Station: <span class="mono">${esc(v.old_station_id)}</span> → <span class="mono">${esc(v.new_station_id)}</span><br>
+      New identity from Solis: <b>${esc(v.new_plant_name||'?')}</b>, ${v.new_capacity_kwp??'?'} kWp, email ${esc(v.new_solis_email||'—')}, first power ${fmtDate(v.first_power_date)}<br>
+      ${dryRun?'Will quarantine':'Quarantined'}: <b>${v.rows_to_quarantine}</b> daily row(s) (${range}, ${v.kwh_to_quarantine} kWh) and ${v.five_minute_rows_to_drop} five-minute row(s) from today${v.live_jobs_to_cancel?`; ${v.live_jobs_to_cancel} live job(s) cancelled`:''}<br>
+      ${dryRun?'Will queue':'Queued'} a daily backfill ${fmtDate(v.backfill_from)} → ${fmtDate(v.backfill_to)} plus today's five-minute refresh${v.roster_stale?' <span class="tag warn">Solis roster is stale — plant details may be slightly old</span>':''}`;
+    if (dryRun) { $('#btn-remap-confirm').disabled = false; }
+    else { toast('Remapped — the worker will backfill within 15 minutes'); await loadRows(true); openPanel(r.system_id); }
+  } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; $('#btn-remap-confirm').disabled = true; }
+}
 function summarizeVerdict(v){
   if (!v || typeof v !== 'object') return esc(JSON.stringify(v));
   const status = v.status || v.verdict || v.solis_station?.status;
@@ -467,7 +530,14 @@ async function loadUnresolved(){
         <div class="card"><div class="n">${u.dark_systems.length}</div><div class="l">active stations dark &gt;3 days</div></div>
         <div class="card"><div class="n">${(o.failures||[]).length}</div><div class="l">nightly onboarding failures</div></div>
         <div class="card"><div class="n">${(o.second_station_candidates||[]).length}</div><div class="l">second-station candidates</div></div>
+        <div class="card"><div class="n">${(u.suspect_mappings||[]).length}</div><div class="l">possible wrong station</div></div>
       </div>
+
+      <div class="card sect"><h3 style="margin-top:0">Possible wrong station <span class="muted">— the Solis plant name shares no word with the customer's name</span></h3>
+        <p class="hint">Two different problems look like this. <b>Wrong station id on the Odoo lead</b>: the plant is named after someone else AND its Solis email differs from the customer's login → the days recorded here are another plant's production. Use <i>Remap</i> with the correct id, then send the lead to sales. <b>Wrong profile name</b> (nickname, an email typed as the name): the Solis email matches the login, or the plant name matches the Odoo name → just edit the name. <i>Check data vs Solis</i> does not decide this — it only confirms our rows match Solis for whatever id we hold. Sorted by strength of signal, then by how many days are at stake.</p>
+        <table><thead><tr><th>Customer (profile)</th><th>Plant (Solis)</th><th>Name (Odoo)</th><th>Login email</th><th>Solis email</th><th>Days recorded</th><th>Signals</th><th>Unassigned plant named after this customer</th><th></th></tr></thead><tbody>
+        ${(u.suspect_mappings||[]).map(s => `<tr><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${s.readings}</td><td class="muted" style="white-space:normal;max-width:300px">${s.signals.map(x => `<span class="tag ${/probably/.test(x)?'ok':'warn'}" style="margin:1px 2px 1px 0">${esc(x)}</span>`).join('')}</td><td style="white-space:normal;max-width:300px" data-sugg="${s.system_id}"><span class="muted">looking up the Solis roster…</span></td><td><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=9 class="muted">none</td></tr>'}
+        </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Nightly onboarding failures <span class="muted">— last run ${fmtTs(o.ran_at)} · ${o.candidates??'?'} candidates, ${o.created??'?'} created</span></h3>
         <p class="hint">These are Odoo data problems. Nothing here can be fixed from this screen — send them to sales; the account is created the night after the lead is corrected.</p>
@@ -496,7 +566,25 @@ async function loadUnresolved(){
         ${u.dark_systems.map(s => `<tr><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td class="mono">${esc(s.solis_station_id)}</td><td>${fmtDate(s.last_daily)}</td><td>${s.days_dark??'∞'}</td><td><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=6 class="muted">none</td></tr>'}
         </tbody></table></div>`;
     $$('#view-unresolved [data-open]').forEach(b => b.onclick = () => openPanel(b.dataset.open));
+    if ((u.suspect_mappings||[]).length) fillSuggestions();
   } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
+}
+// The Solis roster walk can take a minute and fails when Solis is unwell, so
+// the suggestions column is filled after the page renders, with a Retry.
+async function fillSuggestions(){
+  const cells = $$('#view-unresolved [data-sugg]'); if (!cells.length) return;
+  try {
+    const res = await api('/backoffice/api/suspects/suggestions');
+    cells.forEach(td => {
+      const hits = res.suggestions[td.dataset.sugg] || [];
+      td.innerHTML = hits.length
+        ? hits.map(g => `<div><span class="mono">${esc(g.station_id)}</span> ${esc(g.plant_name)} ${g.capacity_kwp??''} kWp${g.email_matches_login?' <span class="tag ok">email matches login</span>':''}</div>`).join('')
+        : `<span class="muted">none of the ${res.unassigned_in_roster} unassigned plants is named after this customer</span>`;
+    });
+  } catch (e) {
+    cells.forEach(td => { td.innerHTML = `<span class="muted">${esc(e.message)}</span> <button class="btn sm" data-retry-sugg>Retry</button>`; });
+    $$('#view-unresolved [data-retry-sugg]').forEach(b => b.onclick = () => { cells.forEach(td => td.innerHTML = '<span class="muted">looking up the Solis roster…</span>'); fillSuggestions(); });
+  }
 }
 
 async function loadJobs(){
@@ -535,6 +623,41 @@ async function loadStaff(){
     $$('#view-staff [data-revoke]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/staff/'+b.dataset.revoke, {method:'PATCH', body:{active:false}}); loadStaff(); } catch(e) { toast(e.message, true); } });
     $$('#view-staff [data-restore]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/staff/'+b.dataset.restore, {method:'PATCH', body:{active:true}}); loadStaff(); } catch(e) { toast(e.message, true); } });
   } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
+}
+
+function loadGuide(){
+  $('#view-guide').innerHTML = `
+  <div class="card" style="max-width:980px;line-height:1.55">
+    <h2 style="margin-top:0">How the engineering team fixes customer data here</h2>
+    <p class="hint">Everything you change is recorded in <b>Audit</b> with your name and the reason you typed. Nothing here writes to Odoo — Odoo is the sales team's source of truth; when Odoo is wrong, tell sales and they fix it there, and the nightly sync picks it up the following night (02:00).</p>
+
+    <h3>1. A customer is mapped to the wrong Solis station</h3>
+    <ol>
+      <li>Open the customer. Read the <b>Station</b> section: is the <i>Plant name (Solis)</i> this customer's name? Does the plant's Solis email match the <i>login email</i>? A plant named after someone else with a different email is the wrong station — every day recorded under this customer is that other plant's production. (Unresolved → <i>Possible wrong station</i> lists these automatically.)</li>
+      <li><b>Check data vs Solis</b> is a different question: it confirms our stored rows equal Solis for the id we hold. It stays ~99% even on a wrong mapping, so use it after a remap to confirm the backfill, and to catch stale or leftover rows — not to decide identity.</li>
+      <li>Find the correct station id (the Odoo lead's "CRM Design Solis Station ID" if sales fixed it, or Solis Cloud). <b>Validate Solis station</b> on it first.</li>
+      <li><b>Remap to the correct Solis station</b> → Preview → type the reason in the Save-changes box → Confirm. All readings recorded under the wrong id move to quarantine (kept, not deleted); the plant's name, capacity and first-power date are refreshed from Solis; a backfill of the correct history is queued and runs within 15 minutes.</li>
+      <li>If the wrong id came from the Odoo lead, tell sales to correct the lead — otherwise the grid keeps showing "Odoo ≠ Supabase" for that customer.</li>
+    </ol>
+
+    <h3>2. The name/phone/address is wrong but the station is right</h3>
+    <p>Signals: the Solis plant email matches the login email, and Check data vs Solis agrees. Edit the <b>Customer profile</b> fields, type a reason, Save. Do not remap.</p>
+
+    <h3>3. A customer has a second plant</h3>
+    <p>Unresolved → <i>Second-station candidates</i> → Open → <b>Add another Solis station</b> → station id + reason → Add. Name and capacity come from Solis; a 60-day backfill is queued. Their login stays the same. (The customer app shows one station until the station selector ships.)</p>
+
+    <h3>4. Missing days / refreshing history</h3>
+    <p>In the customer panel, pick a date range → <b>Queue backfill</b>. The worker runs every 15 minutes; progress is in <b>Backfills</b>, and the row shows "backfill running/succeeded". A backfill overwrites the dates it fetches with Solis's current values.</p>
+
+    <h3>5. A new customer isn't appearing</h3>
+    <p>Accounts are created automatically every night from Odoo leads that have a valid email and a station id. Unresolved → <i>Nightly onboarding failures</i> lists the leads that were rejected and why (usually two emails in one field, or a placeholder). Those are fixed in Odoo by sales; the account appears the night after.</p>
+
+    <h3>6. Dark stations</h3>
+    <p>Unresolved → <i>Active stations dark &gt;3 days</i>. If the plant is really offline or decommissioned, set its <b>Status</b> in the panel (inactive / decommissioned) with a reason, so it stops counting as a data problem.</p>
+
+    <h3>Roles</h3>
+    <p><b>readonly</b> sees everything; <b>engineer</b> can edit, remap, add stations and queue backfills; <b>admin</b> also manages staff. Admins add colleagues in <b>Staff</b> — a solvivaenergy.com Google account signs in directly once added.</p>
+  </div>`;
 }
 
 boot().catch(e => { document.body.innerHTML = `<main><div class="card">Back office failed to start: ${esc(e.message)}</div></main>`; });

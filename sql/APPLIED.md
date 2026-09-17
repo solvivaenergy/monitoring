@@ -27,6 +27,7 @@ that is written continuously; do not work around 25001 by deleting the keyword.
 | 10 station-scoped RLS | **applied** — old policies recorded in `rls_policies_ASBUILT_2026-09-16.sql`; verified as a real customer, a stranger, and anon | 2026-09-16 |
 | 11 view security | **applied** — six views: anon/authenticated revoked, `security_invoker=on`; `system_metrics` created. As-built DDL in `monthly_energy_sync_views_ASBUILT.sql` | 2026-09-16 |
 | 12 legacy timestamp quarantine (optional) | not run — see below | |
+| **13 readings quarantine** (`2026-09-17_13_readings_quarantine.sql`) | **applied** — `energy_readings_quarantine`, used by the back office's Remap to hold readings captured under a wrong station id (recoverable, never deleted) | 2026-09-17 |
 
 ## Verified state after 11 (2026-09-16 ~15:40 UTC)
 
