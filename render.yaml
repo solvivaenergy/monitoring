@@ -40,6 +40,17 @@ services:
         sync: false
       - key: SUPABASE_DB_POOLER_URL
         sync: false
+      # Odoo (read-only) for /admin/validate/odoo-* and the back office's Odoo
+      # panel. Same values as solviva-sync. Without them every "Validate Odoo
+      # lead/customer" click fails with "Missing Odoo connection env vars".
+      - key: ODOO_SH_URL
+        sync: false
+      - key: ODOO_SH_DB
+        sync: false
+      - key: ODOO_SH_USER
+        sync: false
+      - key: ODOO_SH_API_KEY
+        sync: false
 
   # Daily sync cron: Solis → Supabase (2:00 AM PHT via Render cron)
   - type: cron

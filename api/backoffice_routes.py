@@ -930,6 +930,45 @@ class StaffCreate(BaseModel):
     email: str
     role: str = Field("readonly", pattern="^(readonly|engineer|admin)$")
     full_name: Optional[str] = None
+    # "invite": Supabase emails a link (lands on the project's Site URL — set it
+    # to the back office or the link points at localhost:3000).
+    # "password": create the login now with a temporary password, returned ONCE
+    # in the response and never stored by us; the person changes it after the
+    # first sign-in. Fits the development phase, where the team signs in as
+    # several users; no email round trip.
+    mode: str = Field("invite", pattern="^(invite|password)$")
+
+
+async def _create_or_reset_login(email: str, full_name: Optional[str]) -> tuple[str, str]:
+    """Create the auth user with a fresh temporary password, or set one on an
+    existing user. Returns (user_id, temporary_password)."""
+    import secrets
+    env = _supabase_env()
+    hdr = {"apikey": env["service"], "Authorization": f"Bearer {env['service']}"}
+    temp = secrets.token_urlsafe(12)
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(env["url"] + "/auth/v1/admin/users", headers=hdr,
+                              json={"email": email, "password": temp, "email_confirm": True,
+                                    "user_metadata": {"full_name": full_name or ""}})
+        if r.status_code in (200, 201):
+            return r.json()["id"], temp
+        # already registered → find and reset
+        page = 1
+        while page < 20:
+            lst = await client.get(env["url"] + "/auth/v1/admin/users", headers=hdr,
+                                   params={"page": page, "per_page": 1000})
+            users = lst.json().get("users", []) if lst.status_code == 200 else []
+            for u in users:
+                if (u.get("email") or "").lower() == email:
+                    upd = await client.put(env["url"] + f"/auth/v1/admin/users/{u['id']}", headers=hdr,
+                                           json={"password": temp, "email_confirm": True, "ban_duration": "none"})
+                    if upd.status_code != 200:
+                        raise HTTPException(502, f"Could not set a password for {email}: {upd.text[:160]}")
+                    return u["id"], temp
+            if len(users) < 1000:
+                break
+            page += 1
+    raise HTTPException(502, f"Could not create a login for {email}: {r.text[:160]}")
 
 
 class StaffPatch(BaseModel):
@@ -981,10 +1020,14 @@ async def staff_create(body: StaffCreate, request: Request, authorization: str =
     email = body.email.strip().lower()
     if "@" not in email:
         raise HTTPException(400, "Invalid email")
-    redirect_to = str(request.base_url).rstrip("/") + "/backoffice"
-    user_id = await _find_or_invite_login(email, body.full_name, redirect_to)
+    temporary_password = None
+    if body.mode == "password":
+        user_id, temporary_password = await _create_or_reset_login(email, body.full_name)
+    else:
+        redirect_to = str(request.base_url).rstrip("/") + "/backoffice"
+        user_id = await _find_or_invite_login(email, body.full_name, redirect_to)
     try:
-        with db.audited(staff["id"], staff["email"], f"staff added by {staff['email']}") as conn:
+        with db.audited(staff["id"], staff["email"], f"staff added by {staff['email']} ({body.mode})") as conn:
             conn.execute(
                 """insert into public.staff_users (user_id, email, role, active, created_by)
                    values (%s, %s, %s, true, %s)
@@ -993,7 +1036,8 @@ async def staff_create(body: StaffCreate, request: Request, authorization: str =
                 (user_id, email, body.role, staff["id"]))
     except psycopg.Error as exc:
         raise _db_error(exc)
-    return {"ok": True, "user_id": user_id, "email": email, "role": body.role}
+    return {"ok": True, "user_id": user_id, "email": email, "role": body.role, "mode": body.mode,
+            "temporary_password": temporary_password}
 
 
 @router.patch("/api/staff/{user_id}")

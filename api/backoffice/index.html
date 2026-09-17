@@ -466,7 +466,10 @@ async function addStation(r){
   } catch (e) { toast(e.message, true); }
 }
 async function validate(kind, r){
-  const box = $('#v-'+kind); box.hidden = false; box.textContent = 'Checking…';
+  const box = $('#v-'+kind); box.hidden = false;
+  box.textContent = kind === 'station'
+    ? 'Checking… (the first station check after a restart loads the whole Solis fleet list — up to ~90 s; later checks are instant)'
+    : 'Checking…';
   try {
     let res;
     if (kind==='station') res = await api('/admin/validate/solis-station', {method:'POST', body:{station_id: $('#f-system [name=solis_station_id]').value.trim() || r.solis_station_id, for_user_id: r.user_id}});
@@ -621,11 +624,24 @@ async function loadStaff(){
   try {
     const {staff} = await api('/backoffice/api/staff');
     el.innerHTML = `<div class="card">
-      <div class="row" style="margin-bottom:12px"><input id="st-email" type="email" placeholder="colleague@solvivaenergy.com"><input id="st-name" placeholder="Full name"><select id="st-role"><option>readonly</option><option>engineer</option><option>admin</option></select><button class="btn primary" id="st-add">Add staff</button><span class="hint">New addresses get an invite email from Supabase.</span></div>
+      <div class="row" style="margin-bottom:6px"><input id="st-email" type="email" placeholder="colleague@solvivaenergy.com"><input id="st-name" placeholder="Full name"><select id="st-role"><option>readonly</option><option>engineer</option><option>admin</option></select><select id="st-mode"><option value="password">Create with a temporary password (shown once)</option><option value="invite">Send an invite email</option></select><button class="btn primary" id="st-add">Add staff</button></div>
+      <p class="hint" style="margin:0 0 12px">A solvivaenergy.com Google account can also just sign in with Google once its address is listed here. Invite emails land on the project's Site URL (Supabase → Authentication → URL Configuration) — set it to this back office or the link points at localhost.</p>
+      <div class="verdict" id="st-result" hidden></div>
       <table><thead><tr><th>Email</th><th>Role</th><th>Active</th><th>Last sign-in</th><th>Providers</th><th>Added</th><th></th></tr></thead><tbody>
       ${staff.map(s => `<tr><td class="mono">${esc(s.email)}</td><td><select data-role="${s.user_id}">${['readonly','engineer','admin'].map(r=>`<option ${s.role===r?'selected':''}>${r}</option>`).join('')}</select></td><td>${s.active&&!s.revoked_at?'<span class="tag ok">active</span>':'<span class="tag bad">revoked</span>'}</td><td>${fmtTs(s.last_sign_in_at)}</td><td class="muted">${esc(JSON.stringify(s.providers||[]))}</td><td>${fmtDate(s.created_at)}</td><td>${s.active&&!s.revoked_at?`<button class="btn sm danger" data-revoke="${s.user_id}">Revoke</button>`:`<button class="btn sm" data-restore="${s.user_id}">Restore</button>`}</td></tr>`).join('')}
       </tbody></table></div>`;
-    $('#st-add').onclick = async () => { try { await api('/backoffice/api/staff', {method:'POST', body:{email:$('#st-email').value, full_name:$('#st-name').value, role:$('#st-role').value}}); toast('Added'); loadStaff(); } catch(e) { toast(e.message, true); } };
+    $('#st-add').onclick = async () => {
+      const email = $('#st-email').value.trim(), mode = $('#st-mode').value;
+      try {
+        const res = await api('/backoffice/api/staff', {method:'POST', body:{email, full_name:$('#st-name').value, role:$('#st-role').value, mode}});
+        const html = res.temporary_password
+          ? `<b>${esc(res.email)}</b> can sign in now (role ${esc(res.role)}). Temporary password — shown only this once, we do not store it:<br><span class="mono" style="font-size:15px;user-select:all">${esc(res.temporary_password)}</span><br><span class="muted">Send it to them privately; they should use <i>Change password</i> after signing in. They can also sign in with Google instead.</span>`
+          : `<b>${esc(res.email)}</b> added (role ${esc(res.role)}); an invite email was sent.`;
+        toast('Added');
+        await loadStaff();                       // refresh the table, then re-show the one-time result
+        const box = $('#st-result'); box.hidden = false; box.innerHTML = html;
+      } catch(e) { toast(e.message, true); }
+    };
     $$('#view-staff [data-role]').forEach(s => s.onchange = async () => { try { await api('/backoffice/api/staff/'+s.dataset.role, {method:'PATCH', body:{role:s.value}}); toast('Role updated'); } catch(e) { toast(e.message, true); loadStaff(); } });
     $$('#view-staff [data-revoke]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/staff/'+b.dataset.revoke, {method:'PATCH', body:{active:false}}); loadStaff(); } catch(e) { toast(e.message, true); } });
     $$('#view-staff [data-restore]').forEach(b => b.onclick = async () => { try { await api('/backoffice/api/staff/'+b.dataset.restore, {method:'PATCH', body:{active:true}}); loadStaff(); } catch(e) { toast(e.message, true); } });
