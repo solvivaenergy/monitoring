@@ -415,9 +415,10 @@ async function openPanel(systemId){
     <details style="margin-top:8px"><summary class="hint"><b>Retire this account</b> — a duplicate login, test data, or a login given another plant's station</summary>
       <div class="grid2" style="margin-top:8px">
         <div><label>Twin login (the customer's live account), if this is a duplicate</label><input id="retire-twin" type="email" placeholder="other.email@example.com — leave empty for test data"></div>
-        <div><label>Login</label><select id="retire-login"><option value="ban">Ban the login (reversible — the person keeps the twin)</option><option value="delete">Delete the login (test data / no plant of their own)</option></select></div>
+        <div><label>Action</label><select id="retire-action"><option value="retire">Retire — this login holds a COPY of the twin's plant (quarantine data)</option><option value="merge">Merge into twin — this login holds its OWN plant (move it to the twin)</option></select></div>
+        <div><label>Login (retire only)</label><select id="retire-login"><option value="ban">Ban the login (reversible — the person keeps the twin)</option><option value="delete">Delete the login (test data / no plant of their own)</option></select></div>
       </div>
-      <p class="hint">Readings go to quarantine (recoverable, marked with the twin), the station row and profile are removed, and the login is banned or deleted. Refused if this account still owns a station, or holds days the twin does not (that would be a merge).</p>
+      <p class="hint"><b>Retire</b>: readings go to quarantine (recoverable, marked with the twin), the station row and profile are removed, the login is banned or deleted. Refused if this account still owns a station, or holds days the twin does not. <b>Merge</b>: this login's stations become the twin's secondary stations with all their readings, the profile is removed and the login banned — nothing quarantined or refetched. Refused if both logins hold the same station (that is a copy: use Retire).</p>
       <div class="row">
         <button class="btn sm" id="btn-retire-preview">Preview</button>
         <button class="btn sm danger" id="btn-retire-confirm" disabled>Confirm retirement</button>
@@ -540,8 +541,23 @@ async function retireAccount(r, dryRun){
     if (!twin) return toast(`No customer with login ${twinEmail} in the grid`, true);
     if (twin.user_id === r.user_id) return toast('The twin must be a different login', true);
   }
-  const reason = ($('#reason')?.value||'').trim(), del = $('#retire-login').value === 'delete';
+  const reason = ($('#reason')?.value||'').trim(), del = $('#retire-login').value === 'delete', merge = $('#retire-action').value === 'merge';
   if (!dryRun && reason.length < 3) return toast('Type the reason in the Save-changes box first — it goes into the audit log', true);
+  if (merge) {
+    if (!twin) return toast('Merge needs the twin login (the account that keeps everything)', true);
+    if (!dryRun && !confirm(`Merge ${r.login_email} INTO ${twin.login_email}?\n\nIts stations and all their readings move to the twin as secondary stations; this profile is removed and this login banned. Continue?`)) return;
+    box.hidden = false; box.textContent = dryRun ? 'Previewing…' : 'Merging…';
+    try {
+      const v = await api('/backoffice/api/customers/'+r.user_id+'/merge-into', {method:'POST', body:{survivor_user_id: twin.user_id, reason, dry_run: dryRun}});
+      const sys = a => (a.systems||[]).map(s => `${esc(s.plant||'?')} <span class="mono">${esc(s.solis_station_id||'∅')}</span> (${s.readings} d)`).join(', ') || 'none';
+      box.innerHTML = `<b>${dryRun ? 'Preview — nothing written yet' : 'Done'}</b><br>
+        Loser <span class="mono">${esc(v.loser.email)}</span>: ${sys(v.loser)} → ${dryRun?'will move to':'moved to'} survivor <span class="mono">${esc(v.survivor.email)}</span> (already has: ${sys(v.survivor)})<br>
+        ${v.readings_to_move} reading row(s) ${dryRun?'will change':'changed'} owner${Object.keys(v.related_rows_to_move||{}).length ? `; customer-side rows moved: ${Object.entries(v.related_rows_to_move).map(([t,n]) => `${t} ${n}`).join(', ')}` : ''}; loser login → banned${v.login_banned===false?' <span class="tag bad">ban step failed</span>':''}.`;
+      if (dryRun) { $('#btn-retire-confirm').disabled = false; }
+      else { toast('Merged'); $('#panel').classList.remove('open'); await loadRows(true); }
+    } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; $('#btn-retire-confirm').disabled = true; }
+    return;
+  }
   if (!dryRun && !confirm(`Retire ${r.login_email}?\n\nReadings → quarantine, station row and profile removed, login ${del ? 'DELETED' : 'banned'}${twin ? `; twin ${twin.login_email} keeps everything` : ''}. Continue?`)) return;
   box.hidden = false; box.textContent = dryRun ? 'Previewing…' : 'Retiring…';
   try {

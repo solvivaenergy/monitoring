@@ -818,6 +818,83 @@ async def retire_customer(user_id: uuid.UUID, body: RetireRequest, authorization
 
 
 # ---------------------------------------------------------------------------
+# merge: two logins, one customer, each holding its own plant
+# ---------------------------------------------------------------------------
+
+class MergeRequest(BaseModel):
+    survivor_user_id: uuid.UUID
+    reason: str = ""
+    dry_run: bool = True
+
+
+@router.post("/api/customers/{user_id}/merge-into")
+async def merge_customer(user_id: uuid.UUID, body: MergeRequest, authorization: str = Header(None)):
+    """Fold this login (the loser) into the survivor: its stations move to the
+    survivor as secondary systems, their readings and the customer-side rows
+    follow, the loser's profile is deleted and its login banned. Nothing is
+    quarantined or refetched — the readings simply change owner. Use Retire
+    instead when the loser holds a COPY of a plant the survivor already has."""
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "engineer")
+    survivor = body.survivor_user_id
+    if survivor == user_id:
+        raise HTTPException(400, "Survivor and loser are the same login")
+    with db.connect(autocommit=True) as conn:
+        acct = {}
+        for label, uid_ in (("loser", user_id), ("survivor", survivor)):
+            u = conn.execute("select email, last_sign_in_at from auth.users where id = %s", (uid_,)).fetchone()
+            if not u:
+                raise HTTPException(404, f"No such {label} login")
+            if conn.execute("select 1 from public.staff_users where user_id = %s", (uid_,)).fetchone():
+                raise HTTPException(400, f"The {label} is a staff account")
+            p = conn.execute("select full_name, phone, address from public.user_profiles where id = %s", (uid_,)).fetchone()
+            systems = conn.execute(
+                """select s.id, s.solis_station_id, coalesce(s.solis_plant_name, s.system_name) as plant, s.is_primary,
+                          (select count(*) from public.energy_readings r where r.system_id = s.id) as readings
+                     from public.solar_systems s where s.user_id = %s order by s.created_at""", (uid_,)).fetchall()
+            acct[label] = {"email": u["email"], "last_sign_in_at": u["last_sign_in_at"],
+                           "full_name": p["full_name"] if p else None, "systems": [dict(s) for s in systems]}
+        if not conn.execute("select 1 from public.user_profiles where id = %s", (survivor,)).fetchone():
+            raise HTTPException(400, "The survivor has no profile — it cannot receive systems")
+        shared = {s["solis_station_id"] for s in acct["loser"]["systems"]} & {s["solis_station_id"] for s in acct["survivor"]["systems"]} - {None}
+        if shared:
+            raise HTTPException(400, f"Both logins hold station {sorted(shared)[0]} — that is a duplicate; use Retire on the copy")
+        related = {t: conn.execute(f"select count(*) as n from public.{t} where {col} = %s", (user_id,)).fetchone()["n"]
+                   for t, col in (("energy_tips", "user_id"), ("billing_records", "user_id"), ("support_tickets", "user_id"),
+                                  ("ticket_messages", "user_id"), ("referrals", "referrer_user_id"))}
+        related = {t: n for t, n in related.items() if n}
+        readings = conn.execute("select count(*) as n from public.energy_readings where user_id = %s", (user_id,)).fetchone()["n"]
+
+    preview = _j({"loser": acct["loser"], "survivor": acct["survivor"], "readings_to_move": readings,
+                  "related_rows_to_move": related, "loser_login_action": "ban"})
+    if body.dry_run:
+        return {"dry_run": True, **preview}
+
+    reason = _reason(body.reason)
+    request_id = str(uuid.uuid4())
+    try:
+        with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
+            conn.execute("update public.solar_systems set user_id = %s, is_primary = false, updated_at = now() where user_id = %s",
+                         (survivor, user_id))
+            for tbl in ("energy_readings", "energy_readings_five_minutes", "cleaned_data", "energy_readings_quarantine",
+                        "energy_tips", "billing_records", "support_tickets", "ticket_messages"):
+                conn.execute(f"update public.{tbl} set user_id = %s where user_id = %s", (survivor, user_id))
+            conn.execute("update public.referrals set referrer_user_id = %s where referrer_user_id = %s", (survivor, user_id))
+            conn.execute("delete from public.user_profiles where id = %s", (user_id,))
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+    env = _supabase_env()
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.put(env["url"] + f"/auth/v1/admin/users/{user_id}",
+                             headers={"apikey": env["service"], "Authorization": f"Bearer {env['service']}"},
+                             json={"ban_duration": "876000h"})
+    _invalidate_rows()
+    return {"dry_run": False, "request_id": request_id, "login_banned": r.status_code == 200, **preview}
+
+
+# ---------------------------------------------------------------------------
 # backfill queue
 # ---------------------------------------------------------------------------
 
