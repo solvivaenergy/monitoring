@@ -1,5 +1,5 @@
 """
-Direct Postgres access for the back office.
+Direct Postgres access for the back office and the workers.
 
 Why not PostgREST for everything: the grid joins auth.users (not exposed over
 PostgREST), and every mutation must carry WHO did it and WHY into the audit
@@ -9,13 +9,18 @@ PostgREST gives no way to set them in the same transaction as the write. A real
 connection does, and it also gives real transactions for "edit the mapping AND
 enqueue the backfill" as one unit.
 
+Connections are POOLED. The API runs in Render's Oregon region and the database
+in Mumbai (~230 ms each way); opening a fresh connection per request cost
+~1 s of TLS + auth round trips before any query ran. A small pool keeps a few
+warm connections for the life of the process.
+
 Connection resolution, in order:
   1. SUPABASE_DB_POOLER_URL if set (Supabase session-mode pooler, IPv4).
   2. SUPABASE_DB_URL (the direct host, db.<ref>.supabase.co).
   3. Derived from SUPABASE_DB_URL's password: the ap-south-1 session pooler.
 The direct host has ONLY an IPv6 address; a network without IPv6 fails on it,
-and a container might too. The first DSN that connects is remembered for the
-process so only the first request pays for a failed attempt.
+and a container might too. The first DSN that connects is the one the pool is
+built on, so only the very first request pays for a failed attempt.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from urllib.parse import quote, urlparse
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +43,11 @@ PROJECT_REF = "kzsocvzhbgtfyksrjmvk"
 # The project's region. Every other region's pooler answers "tenant not found".
 POOLER_HOST = "aws-1-ap-south-1.pooler.supabase.com"
 
-_working_dsn: Optional[str] = None
+# Supabase's session pooler caps connections per role; four is plenty for a
+# single-instance back office plus a worker, and leaves room for the crons.
+POOL_MIN, POOL_MAX = 1, 4
+
+_pool: Optional[ConnectionPool] = None
 _lock = threading.Lock()
 
 
@@ -59,30 +69,57 @@ def _candidate_dsns() -> List[str]:
     return dsns
 
 
-def connect(autocommit: bool = False) -> psycopg.Connection:
-    """Open a connection, trying each candidate DSN once and remembering the winner."""
-    global _working_dsn
-    candidates = [_working_dsn] if _working_dsn else _candidate_dsns()
+def _pick_dsn() -> str:
+    """Probe the candidates once and return the first that connects."""
+    candidates = _candidate_dsns()
     if not candidates:
         raise RuntimeError("No database configured: set SUPABASE_DB_URL or SUPABASE_DB_POOLER_URL")
-
     last: Optional[Exception] = None
     for dsn in candidates:
         try:
-            conn = psycopg.connect(dsn, autocommit=autocommit, connect_timeout=10, row_factory=dict_row)
-            with _lock:
-                _working_dsn = dsn
-            return conn
+            with psycopg.connect(dsn, connect_timeout=10):
+                return dsn
         except psycopg.OperationalError as exc:
             last = exc
             log.warning("db connect via %s failed: %s", urlparse(dsn).hostname, str(exc).splitlines()[0][:140])
-
-    if _working_dsn and len(candidates) == 1:
-        # The remembered DSN stopped working; forget it and try the full list once.
-        with _lock:
-            _working_dsn = None
-        return connect(autocommit=autocommit)
     raise RuntimeError("Database unreachable on every configured connection") from last
+
+
+def _get_pool() -> ConnectionPool:
+    global _pool
+    if _pool is not None:
+        return _pool
+    with _lock:
+        if _pool is None:
+            dsn = _pick_dsn()
+            _pool = ConnectionPool(
+                dsn,
+                min_size=POOL_MIN,
+                max_size=POOL_MAX,
+                kwargs={"row_factory": dict_row},
+                timeout=15,
+                # Recycle connections every 30 minutes so the pooler can rebalance
+                # and a stale TLS session never lingers across a DB failover.
+                max_lifetime=1800,
+                open=True,
+            )
+            log.info("db pool opened via %s", urlparse(dsn).hostname)
+    return _pool
+
+
+@contextlib.contextmanager
+def connect(autocommit: bool = False) -> Iterator[psycopg.Connection]:
+    """A pooled connection. Commits on clean exit, rolls back on exception,
+    and always returns the connection to the pool with autocommit reset."""
+    pool = _get_pool()
+    with pool.connection() as conn:
+        conn.autocommit = autocommit
+        try:
+            yield conn
+        finally:
+            # psycopg_pool resets the connection on return; autocommit is not
+            # part of that reset, so put it back explicitly.
+            conn.autocommit = False
 
 
 @contextlib.contextmanager
@@ -96,11 +133,10 @@ def audited(
     """One transaction whose writes the audit trigger attributes to `actor`.
 
     The third argument of set_config is `true` = transaction-local, so nothing
-    leaks into the next user of a pooled connection. Commit on success,
-    rollback on any exception, always close.
+    leaks into the next user of the pooled connection. The pool's context
+    manager commits on success and rolls back on any exception.
     """
-    conn = connect(autocommit=False)
-    try:
+    with connect(autocommit=False) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -113,9 +149,3 @@ def audited(
                 (actor_id or "", actor_email or "", reason or "", str(request_id or uuid.uuid4()), source),
             )
         yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()

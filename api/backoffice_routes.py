@@ -37,6 +37,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -192,15 +194,34 @@ select s.id as system_id, s.user_id, s.system_name, s.capacity_kwp, s.installati
 """
 
 
+# The grid is the one expensive call (two grouped scans of the reading tables
+# plus the auth.users join, ~2 s from Oregon to Mumbai). Cache it briefly;
+# every mutation endpoint drops the cache so an edit shows on the next load,
+# and ?fresh=1 bypasses it (the UI's Reload button).
+ROWS_CACHE_TTL = 30.0
+_rows_cache: Dict[str, Any] = {"at": 0.0, "data": None}
+_rows_lock = threading.Lock()
+
+
+def _invalidate_rows() -> None:
+    _rows_cache["at"] = 0.0
+
+
 @router.get("/api/rows")
-async def rows(authorization: str = Header(None)):
+async def rows(fresh: int = 0, authorization: str = Header(None)):
     await _authenticate_staff(authorization)
+    now = time.monotonic()
+    cached = _rows_cache["data"]
+    if not fresh and cached is not None and now - _rows_cache["at"] < ROWS_CACHE_TTL:
+        return {"rows": cached, "count": len(cached), "cached": True}
     try:
         with db.connect(autocommit=True) as conn:
-            data = conn.execute(ROWS_SQL + " order by coalesce(p.full_name, s.system_name)").fetchall()
+            data = _j(conn.execute(ROWS_SQL + " order by coalesce(p.full_name, s.system_name)").fetchall())
     except RuntimeError as exc:
         raise HTTPException(503, str(exc))
-    return {"rows": _j(data), "count": len(data)}
+    with _rows_lock:
+        _rows_cache["at"], _rows_cache["data"] = now, data
+    return {"rows": data, "count": len(data), "cached": False}
 
 
 @router.get("/api/rows/{system_id}")
@@ -307,6 +328,7 @@ async def edit_system(system_id: uuid.UUID, body: EditRequest, authorization: st
         raise
     except psycopg.Error as exc:
         raise _db_error(exc)
+    _invalidate_rows()
     return {"ok": True, "request_id": request_id, "changed": sorted(fields), "backfill_job": job}
 
 
@@ -337,6 +359,7 @@ async def edit_profile(user_id: uuid.UUID, body: EditRequest, authorization: str
         raise
     except psycopg.Error as exc:
         raise _db_error(exc)
+    _invalidate_rows()
     return {"ok": True, "request_id": request_id, "changed": sorted(fields)}
 
 
@@ -396,6 +419,7 @@ async def add_station(body: AddStationRequest, authorization: str = Header(None)
         raise
     except psycopg.Error as exc:
         raise _db_error(exc)
+    _invalidate_rows()
     return {"ok": True, "system_id": str(row["id"]), "request_id": request_id, "backfill_job": job}
 
 
@@ -438,6 +462,7 @@ async def enqueue_backfill(body: BackfillRequest, authorization: str = Header(No
         raise
     except psycopg.Error as exc:
         raise _db_error(exc)
+    _invalidate_rows()
     return {"ok": True, "job": _j(job)}
 
 

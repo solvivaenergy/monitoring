@@ -271,9 +271,9 @@ function renderGrid(){
   $('#grid tbody').innerHTML = rows.map(r => `<tr data-id="${r.system_id}">${COLS.map(c => `<td>${c.render(r)}</td>`).join('')}</tr>`).join('');
   $('#rowcount').textContent = `${rows.length} of ${ROWS.length}`;
 }
-async function loadRows(){
+async function loadRows(fresh=false){
   try {
-    const data = await api('/backoffice/api/rows');
+    const data = await api('/backoffice/api/rows' + (fresh ? '?fresh=1' : ''));
     const perUser = {}; data.rows.forEach(r => perUser[r.user_id] = (perUser[r.user_id]||0)+1);
     ROWS = data.rows.map(r => Object.assign(r, {_multi: perUser[r.user_id]}));
     renderGrid();
@@ -283,7 +283,7 @@ $('#q').oninput = renderGrid;
 $$('.chip').forEach(c => c.onclick = () => { FILTER = c.dataset.f; $$('.chip').forEach(x => x.classList.toggle('active', x===c)); renderGrid(); });
 $('#grid thead').onclick = e => { const k = e.target.closest('th')?.dataset.k; if(!k) return; SORT = {key:k, dir: SORT.key===k ? -SORT.dir : 1}; renderGrid(); };
 $('#grid tbody').onclick = e => { const id = e.target.closest('tr')?.dataset.id; if (id) openPanel(id); };
-$('#btn-reload').onclick = loadRows;
+$('#btn-reload').onclick = () => loadRows(true);
 $('#btn-validate-all').onclick = async () => {
   const rows = applyFilter(ROWS).slice(0, 500);
   toast(`Validating ${rows.length} rows…`);

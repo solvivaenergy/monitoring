@@ -195,7 +195,7 @@ async def _odoo_search_read(
 # Auth — staff only
 # ---------------------------------------------------------------------------
 
-async def _authenticate_staff(authorization: str) -> Dict[str, Any]:
+async def _authenticate_staff_uncached(authorization: str) -> Dict[str, Any]:
     """Validate a Supabase JWT and require a staff_users row.
 
     Deliberately NOT the `/solis/*` model, which has no auth at all: these
@@ -257,6 +257,37 @@ async def _authenticate_staff(authorization: str) -> Dict[str, Any]:
         raise HTTPException(status_code=403, detail="Not authorised for the back office")
 
     return {"id": str(user.id), "email": email, "role": rows[0].get("role") or "readonly"}
+
+
+# Verified staff sessions, keyed by a hash of the token, for STAFF_CACHE_TTL
+# seconds. The uncached check is two round trips to Supabase (JWT verify, then
+# the staff_users lookup) — ~1 s per request from Render's region, paid by
+# every grid load, every validate click, every audit fetch. A revoked staff row
+# therefore keeps working for at most STAFF_CACHE_TTL after revocation, which is
+# acceptable; the token itself expires on Supabase's schedule regardless. The
+# raw token is never stored — only its SHA-256.
+STAFF_CACHE_TTL = 60.0
+_staff_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_staff_cache_lock = threading.Lock()
+
+
+async def _authenticate_staff(authorization: str) -> Dict[str, Any]:
+    import hashlib
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    key = hashlib.sha256(authorization[7:].encode()).hexdigest()
+    now = time.monotonic()
+    with _staff_cache_lock:
+        hit = _staff_cache.get(key)
+        if hit and now - hit[0] < STAFF_CACHE_TTL:
+            return dict(hit[1])
+    staff = await _authenticate_staff_uncached(authorization)
+    with _staff_cache_lock:
+        if len(_staff_cache) > 500:
+            _staff_cache.clear()
+        _staff_cache[key] = (now, dict(staff))
+    return staff
 
 
 # ---------------------------------------------------------------------------

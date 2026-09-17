@@ -5,4 +5,4 @@ python-dotenv==1.0.0
 supabase==2.13.0
 # Back office: direct Postgres for the auth.users join and for audited writes
 # (transaction-local GUCs the 08 audit trigger reads). See api/db.py.
-psycopg[binary]>=3.2,<4
+psycopg[binary,pool]>=3.2,<4
