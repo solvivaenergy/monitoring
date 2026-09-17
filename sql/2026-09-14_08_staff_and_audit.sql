@@ -139,12 +139,37 @@ begin
 end $$;
 grant select on public.audit_log to authenticated;
 
--- Append-only. The trigger writes as the table owner and is unaffected by
--- these rules.
-create or replace rule audit_log_no_update as
-  on update to public.audit_log do instead nothing;
-create or replace rule audit_log_no_delete as
-  on delete to public.audit_log do instead nothing;
+-- Append-only. ORIGINALLY two rewrite rules (do instead nothing on update /
+-- delete). REPLACED 2026-09-17 by migration 14: the rules rewrote the FK's
+-- internal "UPDATE audit_log SET actor_id = NULL" (ON DELETE SET NULL from
+-- auth.users) into nothing, and Postgres's RI check then failed — which made
+-- EVERY auth user in the project undeletable. The trigger below refuses all
+-- deletes and every update except that one FK write. Kept here so this file
+-- reflects production; file 14 is the record of the change.
+create or replace function public.tg_audit_log_append_only()
+returns trigger
+language plpgsql
+as $$
+begin
+  if tg_op = 'DELETE' then
+    raise exception 'audit_log is append-only (delete refused)';
+  end if;
+  if old.actor_id is not null and new.actor_id is null
+     and row(new.id, new.occurred_at, new.actor_email, new.actor_kind, new.table_name, new.row_pk,
+             new.operation, new.field_name, new.old_value, new.new_value, new.reason, new.request_id, new.source)
+         is not distinct from
+         row(old.id, old.occurred_at, old.actor_email, old.actor_kind, old.table_name, old.row_pk,
+             old.operation, old.field_name, old.old_value, old.new_value, old.reason, old.request_id, old.source)
+  then
+    return new;
+  end if;
+  raise exception 'audit_log is append-only (update refused)';
+end $$;
+
+drop trigger if exists trg_audit_log_append_only on public.audit_log;
+create trigger trg_audit_log_append_only
+  before update or delete on public.audit_log
+  for each row execute function public.tg_audit_log_append_only();
 
 ---------------------------------------------------------------------------
 -- The audit trigger. Column names come from tg_argv; values are read out of

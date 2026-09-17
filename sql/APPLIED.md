@@ -28,6 +28,7 @@ that is written continuously; do not work around 25001 by deleting the keyword.
 | 11 view security | **applied** — six views: anon/authenticated revoked, `security_invoker=on`; `system_metrics` created. As-built DDL in `monthly_energy_sync_views_ASBUILT.sql` | 2026-09-16 |
 | 12 legacy timestamp quarantine (optional) | not run — see below | |
 | **13 readings quarantine** (`2026-09-17_13_readings_quarantine.sql`) | **applied** — `energy_readings_quarantine`, used by the back office's Remap to hold readings captured under a wrong station id (recoverable, never deleted) | 2026-09-17 |
+| **14 audit_log append-only trigger** (`2026-09-17_14_audit_log_append_only_trigger.sql`) | **applied** — replaces 08's rewrite rules, which had made **every auth user undeletable** (the FK's ON DELETE SET NULL was rewritten to nothing). File 08 updated to match. | 2026-09-17 |
 
 ## Verified state after 11 (2026-09-16 ~15:40 UTC)
 

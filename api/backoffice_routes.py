@@ -1040,6 +1040,44 @@ async def staff_create(body: StaffCreate, request: Request, authorization: str =
             "temporary_password": temporary_password}
 
 
+@router.delete("/api/staff/{user_id}")
+async def staff_delete(user_id: uuid.UUID, delete_login: bool = True, authorization: str = Header(None)):
+    """Remove a staff member entirely — the staff_users row and, by default, the
+    Supabase login — so a fresh invite can be sent. Refuses to delete yourself,
+    and refuses any login that owns customer data (a profile or a station):
+    those are customers, and customer identity is never deleted from here."""
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "admin")
+    if str(user_id) == staff["id"]:
+        raise HTTPException(400, "You cannot delete yourself")
+    with db.connect(autocommit=True) as conn:
+        row = conn.execute("select email from public.staff_users where user_id = %s", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "No such staff user")
+        owns = conn.execute(
+            """select (select count(*) from public.user_profiles where id = %s)
+                    + (select count(*) from public.solar_systems where user_id = %s) as n""",
+            (user_id, user_id)).fetchone()["n"]
+    if owns and delete_login:
+        raise HTTPException(400, f"{row['email']} owns customer data (profile/stations); remove the staff role only, not the login")
+    try:
+        with db.audited(staff["id"], staff["email"], f"staff removed by {staff['email']}"
+                        + (" (login deleted)" if delete_login else "")) as conn:
+            conn.execute("delete from public.staff_users where user_id = %s", (user_id,))
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+    login_deleted = False
+    if delete_login:
+        env = _supabase_env()
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.delete(env["url"] + f"/auth/v1/admin/users/{user_id}",
+                                    headers={"apikey": env["service"], "Authorization": f"Bearer {env['service']}"})
+        login_deleted = r.status_code in (200, 204)
+        if not login_deleted:
+            log.warning("staff row removed but login delete failed for %s: %s %s", row["email"], r.status_code, r.text[:160])
+    return {"ok": True, "email": row["email"], "login_deleted": login_deleted}
+
+
 @router.patch("/api/staff/{user_id}")
 async def staff_patch(user_id: uuid.UUID, body: StaffPatch, authorization: str = Header(None)):
     staff = await _authenticate_staff(authorization)

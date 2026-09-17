@@ -46,7 +46,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     # POST is required by /admin/validate/*; without it the browser preflight
     # fails and every validate button is dead.
-    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["authorization", "content-type", "apikey"],
     allow_credentials=False,
     max_age=600,
