@@ -4,8 +4,20 @@ services:
   - type: web
     name: solviva-api
     runtime: docker
-    plan: free
+    # starter, not free: upgraded in the dashboard 2026-09-17 (free spins down
+    # after 15 idle minutes → ~50 s cold start on every first click). The
+    # Blueprint re-applies this field on every sync, so it must match here or a
+    # push silently downgrades the service again.
+    plan: starter
     dockerfilePath: ./Dockerfile
+    # Custom hostname. Render issues and renews the TLS certificate itself once
+    # DNS resolves: at Cloudflare add  CNAME  monitoring → monitoring-5085.onrender.com
+    # (DNS-only / grey cloud, at least until the certificate is issued). The
+    # onrender.com hostname keeps working alongside. Monitoring Admin is then
+    # https://monitoring.solvivaenergy.com/monitoring-admin — update the
+    # Supabase Site URL + Redirect URLs to that.
+    domains:
+      - monitoring.solvivaenergy.com
     envVars:
       - key: SOLIS_CLOUD_KEY_ID
         sync: false

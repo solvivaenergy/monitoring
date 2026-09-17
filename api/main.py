@@ -36,7 +36,7 @@ app = FastAPI(title="Solviva Monitoring API", docs_url="/docs")
 # wildcard origin — Starlette then reflects the caller's origin verbatim.
 ALLOWED_ORIGINS = [
     "https://solvivaenergy.github.io",
-    os.getenv("MONITORING_ADMIN_ORIGIN", "https://monitoring-admin.solvivaenergy.com"),
+    os.getenv("MONITORING_ADMIN_ORIGIN", "https://monitoring.solvivaenergy.com"),
     "http://localhost:8000",
     "http://127.0.0.1:8000",
     "http://localhost:5173",   # Vite dev server for Monitoring Admin
