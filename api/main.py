@@ -19,7 +19,7 @@ from .solis_client import SolisCloudClient  # noqa: F401 — used by routes
 from .solis_routes import router as solis_router
 from .app_routes import router as app_router
 from .validation_routes import router as validation_router
-from .monitoring_admin_routes import router as monitoring_admin_router
+from .monitoring_admin_routes import router as monitoring_admin_router, serve_index
 
 app = FastAPI(title="Solviva Monitoring API", docs_url="/docs")
 
@@ -56,21 +56,28 @@ app.add_middleware(
 app.include_router(solis_router)
 app.include_router(app_router)
 app.include_router(validation_router)
-# Monitoring Admin lives at /monitoring-admin on this same service: no second
-# host, no CORS, one deploy. Staff-only via Supabase JWT + staff_users; see the
-# module.
+# Monitoring Admin: the page is the root of this host
+# (https://monitoring.solvivaenergy.com/), its API sits under
+# /monitoring-admin/api/*. Same service as the mobile-app API: no second host,
+# no CORS, one deploy. Staff-only via Supabase JWT + staff_users; see the module.
 app.include_router(monitoring_admin_router)
 
 
-# It was called "back office" and served at /backoffice until 2026-09-18.
-# Bookmarks, the Supabase Site URL and any still-open copy of the old page keep
-# working: 308 preserves the method and body (so the old page's API calls land),
-# the query string is carried over (Supabase's ?code= PKCE return), and
-# browsers carry the #fragment (implicit-flow tokens) across a redirect.
+@app.get("/", include_in_schema=False)
+async def root():
+    return serve_index()
+
+
+# It was called "back office" and served at /backoffice until 2026-09-18, then
+# briefly at /monitoring-admin. Bookmarks, the Supabase Site URL and any
+# still-open copy of the old page keep working: API calls keep their path under
+# the new prefix, page loads go to the root. 308 preserves the method and body,
+# the query string is carried over (Supabase's ?code= PKCE return), and browsers
+# carry the #fragment (implicit-flow tokens) across a redirect.
 @app.api_route("/backoffice", methods=["GET", "POST", "PATCH", "DELETE"], include_in_schema=False)
 @app.api_route("/backoffice/{rest:path}", methods=["GET", "POST", "PATCH", "DELETE"], include_in_schema=False)
 async def legacy_backoffice_redirect(request: Request, rest: str = ""):
-    target = "/monitoring-admin" + (f"/{rest}" if rest else "")
+    target = f"/monitoring-admin/{rest}" if rest.startswith("api/") else "/"
     if request.url.query:
         target += "?" + request.url.query
     return RedirectResponse(target, status_code=308)

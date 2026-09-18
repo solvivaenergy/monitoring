@@ -14,8 +14,8 @@ services:
     # DNS resolves: at Cloudflare add  CNAME  monitoring → monitoring-5085.onrender.com
     # (DNS-only / grey cloud, at least until the certificate is issued). The
     # onrender.com hostname keeps working alongside. Monitoring Admin is then
-    # https://monitoring.solvivaenergy.com/monitoring-admin — update the
-    # Supabase Site URL + Redirect URLs to that.
+    # https://monitoring.solvivaenergy.com/ (the page is the host root; its API
+    # is /monitoring-admin/api/*) — Supabase Site URL + Redirect URLs = that root.
     domains:
       - monitoring.solvivaenergy.com
     envVars:

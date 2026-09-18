@@ -2,7 +2,8 @@
 Monitoring Admin — the engineering team's view of customer identity across
 Supabase, Solis Cloud and Odoo, and the only sanctioned way to change it.
 
-    GET  /monitoring-admin                       the single-page UI
+    GET  /                                 the single-page UI (main.py mounts serve_index;
+                                           /monitoring-admin and /backoffice redirect there)
     GET  /monitoring-admin/api/config            Supabase URL + anon key for the UI's login
     GET  /monitoring-admin/api/me                who am I, what role
     GET  /monitoring-admin/api/rows              the grid: one row per station
@@ -46,7 +47,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 import psycopg
 from fastapi import APIRouter, Header, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from . import db
@@ -148,12 +149,19 @@ def _supabase_env() -> Dict[str, str]:
 # UI + identity
 # ---------------------------------------------------------------------------
 
-@router.get("", include_in_schema=False)
-@router.get("/", include_in_schema=False)
-async def monitoring_admin_index():
+def serve_index() -> FileResponse:
+    """The single-page UI. main.py mounts this at the host root ("/")."""
     if not INDEX_HTML.exists():
         raise HTTPException(404, "Monitoring Admin UI not built")
     return FileResponse(INDEX_HTML, media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+@router.get("", include_in_schema=False)
+@router.get("/", include_in_schema=False)
+async def monitoring_admin_index():
+    # The page moved to the host root on 2026-09-18; this prefix keeps only the
+    # API. Old links (and the 308 from /backoffice) still land on the page.
+    return RedirectResponse("/", status_code=308)
 
 
 @router.get("/api/config")
@@ -1247,7 +1255,7 @@ async def staff_create(body: StaffCreate, request: Request, authorization: str =
     if body.mode == "password":
         user_id, temporary_password = await _create_or_reset_login(email, body.full_name)
     else:
-        redirect_to = str(request.base_url).rstrip("/") + "/monitoring-admin"
+        redirect_to = str(request.base_url)   # the page is served at the host root
         user_id = await _find_or_invite_login(email, body.full_name, redirect_to)
     try:
         with db.audited(staff["id"], staff["email"], f"staff added by {staff['email']} ({body.mode})") as conn:

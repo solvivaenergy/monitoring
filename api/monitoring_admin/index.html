@@ -227,12 +227,12 @@ $('#btn-login').onclick = async () => {
 };
 $('#login-password').addEventListener('keydown', e => { if (e.key==='Enter') $('#btn-login').click(); });
 $('#btn-google').onclick = async () => {
-  const {error} = await sb.auth.signInWithOAuth({provider:'google', options:{redirectTo: location.origin + '/monitoring-admin', queryParams:{hd:'solvivaenergy.com', prompt:'select_account'}}});
+  const {error} = await sb.auth.signInWithOAuth({provider:'google', options:{redirectTo: location.origin + '/', queryParams:{hd:'solvivaenergy.com', prompt:'select_account'}}});
   if (error) $('#login-msg').textContent = error.message + ' (Google sign-in must be enabled in Supabase → Authentication → Providers)';
 };
 $('#btn-forgot').onclick = async () => {
   const email = $('#login-email').value.trim(); if (!email) return $('#login-msg').textContent = 'Enter your email first.';
-  const {error} = await sb.auth.resetPasswordForEmail(email, {redirectTo: location.origin + '/monitoring-admin'});
+  const {error} = await sb.auth.resetPasswordForEmail(email, {redirectTo: location.origin + '/'});
   $('#login-msg').textContent = error ? error.message : 'If that address is a staff account, a reset link has been emailed.';
 };
 $('#btn-set-password').onclick = async () => {
