@@ -62,9 +62,6 @@
   #grid tbody tr,tr[data-row-open]{cursor:pointer}
   /* Action column pinned to the right edge of a horizontally scrolling table,
      so "Open" is reachable without scrolling. Rows also open on click. */
-  th.act,td.act{position:sticky;right:0;background:#fff;box-shadow:-6px 0 8px -6px rgba(0,0,0,.18);z-index:1}
-  th.act{background:#fafbfc;z-index:2}
-  tbody tr:hover td.act{background:#f5f9ea}
   /* Dim the page while a record is open; clicking the dimmed area closes it. */
   .backdrop{position:fixed;inset:0;background:rgba(15,23,32,.38);z-index:9;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .18s ease,visibility .18s}
   .backdrop.show{opacity:1;visibility:visible;pointer-events:auto}
@@ -670,15 +667,16 @@ async function loadUnresolved(){
         <div class="card"><div class="n">${(o.second_station_candidates||[]).length}</div><div class="l">second-station candidates</div></div>
         <div class="card"><div class="n">${(u.suspect_mappings||[]).length}</div><div class="l">possible wrong station</div></div>
       </div>
+      <p class="hint" style="margin:0 0 8px">Click a row to open the record.</p>
 
       <div class="card sect"><h3 style="margin-top:0">Possible wrong station <span class="muted">— the Solis plant name shares no word with the customer's name</span></h3>
         <p class="hint">Two different problems look like this. <b>Wrong station id on the Odoo lead</b>: the plant is named after someone else AND its Solis email differs from the customer's login → the days recorded here are another plant's production. Use <i>Remap</i> with the correct id, then send the lead to sales. <b>Wrong profile name</b> (nickname, an email typed as the name): the Solis email matches the login, or the plant name matches the Odoo name → just edit the name. <i>Check data vs Solis</i> does not decide this — it only confirms our rows match Solis for whatever id we hold. Sorted by strength of signal, then by how many days are at stake.</p>
-        <table><thead><tr><th>Customer (profile)</th><th>Plant (Solis)</th><th>Name (Odoo)</th><th>Login email</th><th>Solis email</th><th>Days recorded</th><th>Signals</th><th>Unassigned plant named after this customer</th><th title="Tick once you have confirmed the station belongs to this customer. The row leaves this list; who, when and why are recorded.">Verified</th><th class="act"></th></tr></thead><tbody>
-        ${(u.suspect_mappings||[]).map(s => `<tr data-row-open="${s.system_id}"><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${s.readings}</td><td class="wrap">${s.signals.map(sigTag).join('')}</td><td class="wrap" data-sugg="${s.system_id}"><span class="muted">looking up the Solis roster…</span></td><td style="text-align:center"><input type="checkbox" data-verify="${s.system_id}" title="Manually verified — hide from this list" ${canEdit()?'':'disabled'}></td><td class="act"><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=10 class="muted">none</td></tr>'}
+        <table><thead><tr><th>Customer (profile)</th><th>Plant (Solis)</th><th>Name (Odoo)</th><th>Login email</th><th>Solis email</th><th>Days recorded</th><th>Signals</th><th>Unassigned plant named after this customer</th><th title="Tick once you have confirmed the station belongs to this customer. The row leaves this list; who, when and why are recorded.">Verified</th></tr></thead><tbody>
+        ${(u.suspect_mappings||[]).map(s => `<tr data-row-open="${s.system_id}"><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${s.readings}</td><td class="wrap">${s.signals.map(sigTag).join('')}</td><td class="wrap" data-sugg="${s.system_id}"><span class="muted">looking up the Solis roster…</span></td><td style="text-align:center"><input type="checkbox" data-verify="${s.system_id}" title="Manually verified — hide from this list" ${canEdit()?'':'disabled'}></td></tr>`).join('') || '<tr><td colspan=9 class="muted">none</td></tr>'}
         </tbody></table>
         ${(u.verified_mappings||[]).length ? `<details style="margin-top:8px"><summary class="hint"><b>${u.verified_mappings.length} manually verified</b> — hidden from the list above; untick to bring one back</summary>
-          <table style="margin-top:8px"><thead><tr><th>Customer (profile)</th><th>Plant (Solis)</th><th>Name (Odoo)</th><th>Login email</th><th>Solis email</th><th>Verified by</th><th>When</th><th>Reason</th><th>Verified</th><th class="act"></th></tr></thead><tbody>
-          ${u.verified_mappings.map(s => `<tr data-row-open="${s.system_id}"><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${esc(s.mapping_verified_by_email||'removed staff login')}</td><td>${fmtTs(s.mapping_verified_at)}</td><td class="wrap muted">${esc(s.mapping_verified_note||'')}${s.still_flagged_by_names?'':' <span class="tag ok">names agree now</span>'}</td><td style="text-align:center"><input type="checkbox" data-verify="${s.system_id}" checked title="Untick to put this station back in the scan" ${canEdit()?'':'disabled'}></td><td class="act"><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('')}
+          <table style="margin-top:8px"><thead><tr><th>Customer (profile)</th><th>Plant (Solis)</th><th>Name (Odoo)</th><th>Login email</th><th>Solis email</th><th>Verified by</th><th>When</th><th>Reason</th><th>Verified</th></tr></thead><tbody>
+          ${u.verified_mappings.map(s => `<tr data-row-open="${s.system_id}"><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${esc(s.mapping_verified_by_email||'removed staff login')}</td><td>${fmtTs(s.mapping_verified_at)}</td><td class="wrap muted">${esc(s.mapping_verified_note||'')}${s.still_flagged_by_names?'':' <span class="tag ok">names agree now</span>'}</td><td style="text-align:center"><input type="checkbox" data-verify="${s.system_id}" checked title="Untick to put this station back in the scan" ${canEdit()?'':'disabled'}></td></tr>`).join('')}
           </tbody></table></details>` : ''}</div>
 
       <div class="card sect"><h3 style="margin-top:0">Nightly onboarding failures <span class="muted">— last run ${fmtTs(o.ran_at)} · ${o.candidates??'?'} candidates, ${o.created??'?'} created</span></h3>
@@ -688,9 +686,9 @@ async function loadUnresolved(){
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Second-station candidates <span class="muted">— an Odoo lead whose email already has a login</span></h3>
-        <p class="hint">The nightly job refuses to repoint an existing login. Open the customer and use “Add another Solis station”.</p>
-        <table><thead><tr><th>Customer</th><th>Login email</th><th>New station (Odoo)</th><th>Existing station</th><th class="act"></th></tr></thead><tbody>
-        ${(o.second_station_candidates||[]).map(c => { const r = byEmail[(c.email||'').toLowerCase()]; return `<tr ${r?`data-row-open="${r.system_id}"`:''}><td>${esc(c.full_name)}</td><td class="mono">${esc(c.email)}</td><td class="mono">${esc(c.station_id)}</td><td class="mono">${esc(c.existing_station_id)}</td><td class="act">${r?`<button class="btn sm" data-open="${r.system_id}">Open</button>`:'<span class="muted">no login row</span>'}</td></tr>`; }).join('') || '<tr><td colspan=5 class="muted">none</td></tr>'}
+        <p class="hint">The nightly job refuses to repoint an existing login. Click the customer and use “Add another Solis station”.</p>
+        <table><thead><tr><th>Customer</th><th>Login email</th><th>New station (Odoo)</th><th>Existing station</th></tr></thead><tbody>
+        ${(o.second_station_candidates||[]).map(c => { const r = byEmail[(c.email||'').toLowerCase()]; return `<tr ${r?`data-row-open="${r.system_id}"`:''}><td>${esc(c.full_name)}${r?'':' <span class="tag" title="This email has no station row in the grid, so there is no record to open">no login row</span>'}</td><td class="mono">${esc(c.email)}</td><td class="mono">${esc(c.station_id)}</td><td class="mono">${esc(c.existing_station_id)}</td></tr>`; }).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Profiles without a station</h3>
@@ -699,21 +697,20 @@ async function loadUnresolved(){
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Stations without a Solis id</h3>
-        <table><thead><tr><th>Customer</th><th>System</th><th>kWp</th><th>Last daily</th><th class="act"></th></tr></thead><tbody>
-        ${u.systems_without_station.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td>${s.capacity_kwp??''}</td><td>${fmtDate(s.last_daily)}</td><td class="act"><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=5 class="muted">none</td></tr>'}
+        <table><thead><tr><th>Customer</th><th>System</th><th>kWp</th><th>Last daily</th></tr></thead><tbody>
+        ${u.systems_without_station.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td>${s.capacity_kwp??''}</td><td>${fmtDate(s.last_daily)}</td></tr>`).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Active stations dark for more than 3 days</h3>
-        <table><thead><tr><th>Customer</th><th>System</th><th>Station</th><th>Last daily</th><th>Days dark</th><th class="act"></th></tr></thead><tbody>
-        ${u.dark_systems.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td class="mono">${esc(s.solis_station_id)}</td><td>${fmtDate(s.last_daily)}</td><td>${s.days_dark??'∞'}</td><td class="act"><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=6 class="muted">none</td></tr>'}
+        <table><thead><tr><th>Customer</th><th>System</th><th>Station</th><th>Last daily</th><th>Days dark</th></tr></thead><tbody>
+        ${u.dark_systems.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td class="mono">${esc(s.solis_station_id)}</td><td>${fmtDate(s.last_daily)}</td><td>${s.days_dark??'∞'}</td></tr>`).join('') || '<tr><td colspan=5 class="muted">none</td></tr>'}
         </tbody></table></div>`;
-    // One delegated handler: the Open button, or a click anywhere on a row
-    // that has a record behind it. Other buttons/links in the row (Retry on
-    // the suggestions column) keep their own behaviour.
+    // One delegated handler: a click anywhere on a row that has a record
+    // behind it opens the panel (the Open column was dropped 2026-09-19 as
+    // redundant). Controls inside a row — the Verified checkbox, Retry on the
+    // suggestions column — keep their own behaviour.
     el.onclick = e => {
-      const b = e.target.closest('[data-open]');
-      if (b) return openPanel(b.dataset.open);
-      if (e.target.closest('button,a,input,select,textarea')) return;
+      if (e.target.closest('button,a,input,select,textarea,label')) return;
       const tr = e.target.closest('tr[data-row-open]');
       if (tr) openPanel(tr.dataset.rowOpen);
     };
@@ -820,7 +817,7 @@ function loadGuide(){
     <p>Signals: the Solis plant email matches the login email, and Check data vs Solis agrees. Edit the <b>Customer profile</b> fields, type a reason, Save. Do not remap.</p>
 
     <h3>3. A customer has a second plant</h3>
-    <p>Unresolved → <i>Second-station candidates</i> → Open → <b>Add another Solis station</b> → station id + reason → Add. Name and capacity come from Solis; a 60-day backfill is queued. Their login stays the same. (The customer app shows one station until the station selector ships.)</p>
+    <p>Unresolved → <i>Second-station candidates</i> → click the row → <b>Add another Solis station</b> → station id + reason → Add. Name and capacity come from Solis; a 60-day backfill is queued. Their login stays the same. (The customer app shows one station until the station selector ships.)</p>
 
     <h3>4. Missing days / refreshing history</h3>
     <p>In the customer panel, pick a date range → <b>Queue backfill</b>. The worker runs every 15 minutes; progress is in <b>Backfills</b>, and the row shows "backfill running/succeeded". A backfill overwrites the dates it fetches with Solis's current values.</p>
