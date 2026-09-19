@@ -245,7 +245,9 @@ create trigger trg_audit_solar_systems
     'user_id','system_name','capacity_kwp','installation_date',
     'battery_capacity_kwh','status','address','is_primary',
     'solis_station_id','solis_plant_name','solis_user_email',
-    'odoo_lead_id','odoo_lead_email');
+    'odoo_lead_id','odoo_lead_email',
+    -- added by file 15 (2026-09-19): the "manually verified" tick on a mapping
+    'mapping_verified_at','mapping_verified_note');
 
 drop trigger if exists trg_audit_staff_users on public.staff_users;
 create trigger trg_audit_staff_users

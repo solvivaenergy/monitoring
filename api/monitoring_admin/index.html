@@ -345,7 +345,7 @@ async function openPanel(systemId){
   let d; try { d = await api('/monitoring-admin/api/rows/'+systemId); } catch(e) { $('#panel-body').innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; return; }
   const r = d.row; $('#panel-title').textContent = r.full_name || r.system_name || 'Station';
   $('#panel-body').innerHTML = `
-    <div class="row"><span class="tag ${r.status==='active'?'ok':''}">${esc(r.status)}</span>${r.is_primary?'<span class="tag ok">primary</span>':'<span class="tag">secondary</span>'}<span class="muted">login: <span class="mono">${esc(r.login_email||'—')}</span></span></div>
+    <div class="row"><span class="tag ${r.status==='active'?'ok':''}">${esc(r.status)}</span>${r.is_primary?'<span class="tag ok">primary</span>':'<span class="tag">secondary</span>'}${r.mapping_verified_at?`<span class="tag ok" title="Mapping manually verified by ${esc(r.mapping_verified_by_email||'a removed staff login')} on ${esc(fmtTs(r.mapping_verified_at))}">mapping verified</span>`:''}<span class="muted">login: <span class="mono">${esc(r.login_email||'—')}</span></span></div>
 
     <h3>Customer profile <span class="muted">(Supabase)</span></h3>
     <form id="f-profile" class="grid2">
@@ -378,6 +378,7 @@ async function openPanel(systemId){
       <button class="btn sm" data-validate="station" ${r.solis_station_id?'':'disabled'}>Validate Solis station</button>
       <button class="btn sm" data-validate="lead" ${r.odoo_lead_id?'':'disabled'}>Validate Odoo lead</button>
     </div>
+    <label class="row hint" style="margin-top:8px"><input type="checkbox" id="map-verified" ${r.mapping_verified_at?'checked':''} ${canEdit()&&r.solis_station_id?'':'disabled'}> <span><b>Manually verified</b> — this Solis station belongs to this customer; hide it from Unresolved → <i>Possible wrong station</i>. Cleared automatically if the station id is remapped or edited.${r.mapping_verified_at?` <span class="muted">Verified by <b>${esc(r.mapping_verified_by_email||'a removed staff login')}</b> on ${esc(fmtTs(r.mapping_verified_at))}${r.mapping_verified_note?` — “${esc(r.mapping_verified_note)}”`:''}</span>`:''}</span></label>
     <div class="verdict" id="v-station" hidden></div>
     <div class="verdict" id="v-lead" hidden></div>
 
@@ -470,7 +471,27 @@ async function openPanel(systemId){
     $('#btn-retire-confirm').onclick = () => retireAccount(r, false);
     $('#btn-backfill').onclick = () => queueBackfill(r);
     $('#btn-add-station').onclick = () => addStation(r);
+    $('#map-verified').onchange = e => setMappingVerified(r, e.target.checked);
   }
+}
+// The "possible wrong station" scan is a name heuristic; it cannot clear a
+// plant named after a business, a church or a relative. An engineer who has
+// checked one ticks "manually verified". Who and when are stamped on the
+// server from the session; the reason goes to the audit log. `after` is what
+// to refresh: the panel (default) or the Unresolved tab.
+async function setMappingVerified(r, verified, after){
+  const refresh = after || (() => openPanel(r.system_id));
+  const panelReason = $('#panel').classList.contains('open') ? ($('#reason')?.value||'').trim() : '';
+  const reason = (panelReason || prompt(verified
+    ? `Why does "${r.solis_plant_name||r.solis_station_id}" belong to ${r.full_name||r.system_name}? (recorded in the audit log)`
+    : `Why is this mapping no longer verified? (recorded in the audit log)`) || '').trim();
+  if (reason.length < 3) { toast('A reason is required — nothing changed', true); return refresh(); }
+  try {
+    await api('/monitoring-admin/api/systems/'+r.system_id+'/mapping-verified', {method:'POST', body:{verified, reason}});
+    toast(verified ? 'Marked as manually verified — removed from Possible wrong station' : 'Verification removed — back in the scan');
+    await loadRows(true);
+  } catch (e) { toast(e.message, true); }
+  refresh();
 }
 function showPanel(){ $('#panel').classList.add('open'); $('#backdrop').classList.add('show'); }
 function closePanel(){ $('#panel').classList.remove('open'); $('#backdrop').classList.remove('show'); }
@@ -652,9 +673,13 @@ async function loadUnresolved(){
 
       <div class="card sect"><h3 style="margin-top:0">Possible wrong station <span class="muted">— the Solis plant name shares no word with the customer's name</span></h3>
         <p class="hint">Two different problems look like this. <b>Wrong station id on the Odoo lead</b>: the plant is named after someone else AND its Solis email differs from the customer's login → the days recorded here are another plant's production. Use <i>Remap</i> with the correct id, then send the lead to sales. <b>Wrong profile name</b> (nickname, an email typed as the name): the Solis email matches the login, or the plant name matches the Odoo name → just edit the name. <i>Check data vs Solis</i> does not decide this — it only confirms our rows match Solis for whatever id we hold. Sorted by strength of signal, then by how many days are at stake.</p>
-        <table><thead><tr><th>Customer (profile)</th><th>Plant (Solis)</th><th>Name (Odoo)</th><th>Login email</th><th>Solis email</th><th>Days recorded</th><th>Signals</th><th>Unassigned plant named after this customer</th><th class="act"></th></tr></thead><tbody>
-        ${(u.suspect_mappings||[]).map(s => `<tr data-row-open="${s.system_id}"><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${s.readings}</td><td class="wrap">${s.signals.map(sigTag).join('')}</td><td class="wrap" data-sugg="${s.system_id}"><span class="muted">looking up the Solis roster…</span></td><td class="act"><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=9 class="muted">none</td></tr>'}
-        </tbody></table></div>
+        <table><thead><tr><th>Customer (profile)</th><th>Plant (Solis)</th><th>Name (Odoo)</th><th>Login email</th><th>Solis email</th><th>Days recorded</th><th>Signals</th><th>Unassigned plant named after this customer</th><th title="Tick once you have confirmed the station belongs to this customer. The row leaves this list; who, when and why are recorded.">Verified</th><th class="act"></th></tr></thead><tbody>
+        ${(u.suspect_mappings||[]).map(s => `<tr data-row-open="${s.system_id}"><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${s.readings}</td><td class="wrap">${s.signals.map(sigTag).join('')}</td><td class="wrap" data-sugg="${s.system_id}"><span class="muted">looking up the Solis roster…</span></td><td style="text-align:center"><input type="checkbox" data-verify="${s.system_id}" title="Manually verified — hide from this list" ${canEdit()?'':'disabled'}></td><td class="act"><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('') || '<tr><td colspan=10 class="muted">none</td></tr>'}
+        </tbody></table>
+        ${(u.verified_mappings||[]).length ? `<details style="margin-top:8px"><summary class="hint"><b>${u.verified_mappings.length} manually verified</b> — hidden from the list above; untick to bring one back</summary>
+          <table style="margin-top:8px"><thead><tr><th>Customer (profile)</th><th>Plant (Solis)</th><th>Name (Odoo)</th><th>Login email</th><th>Solis email</th><th>Verified by</th><th>When</th><th>Reason</th><th>Verified</th><th class="act"></th></tr></thead><tbody>
+          ${u.verified_mappings.map(s => `<tr data-row-open="${s.system_id}"><td><b>${esc(s.full_name)}</b></td><td>${esc(s.solis_plant_name)}</td><td>${esc(s.odoo_name||'—')}</td><td class="mono">${esc(s.login_email||'—')}</td><td class="mono">${esc(s.solis_user_email||'—')}</td><td>${esc(s.mapping_verified_by_email||'removed staff login')}</td><td>${fmtTs(s.mapping_verified_at)}</td><td class="wrap muted">${esc(s.mapping_verified_note||'')}${s.still_flagged_by_names?'':' <span class="tag ok">names agree now</span>'}</td><td style="text-align:center"><input type="checkbox" data-verify="${s.system_id}" checked title="Untick to put this station back in the scan" ${canEdit()?'':'disabled'}></td><td class="act"><button class="btn sm" data-open="${s.system_id}">Open</button></td></tr>`).join('')}
+          </tbody></table></details>` : ''}</div>
 
       <div class="card sect"><h3 style="margin-top:0">Nightly onboarding failures <span class="muted">— last run ${fmtTs(o.ran_at)} · ${o.candidates??'?'} candidates, ${o.created??'?'} created</span></h3>
         <p class="hint">These are Odoo data problems. Nothing here can be fixed from this screen — send them to sales; the account is created the night after the lead is corrected.</p>
@@ -692,6 +717,10 @@ async function loadUnresolved(){
       const tr = e.target.closest('tr[data-row-open]');
       if (tr) openPanel(tr.dataset.rowOpen);
     };
+    // The Verified checkboxes (both tables). The row objects carry what the
+    // prompt needs; the tab reloads afterwards so the row moves between lists.
+    const byId = {}; [...(u.suspect_mappings||[]), ...(u.verified_mappings||[])].forEach(s => byId[s.system_id] = s);
+    $$('#view-unresolved [data-verify]').forEach(cb => cb.onchange = () => setMappingVerified(byId[cb.dataset.verify], cb.checked, loadUnresolved));
     if ((u.suspect_mappings||[]).length) fillSuggestions();
   } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
 }
@@ -783,6 +812,7 @@ function loadGuide(){
       <li><b>Remap to the correct Solis station</b> → Preview → type the reason in the Save-changes box → Confirm. All readings recorded under the wrong id move to quarantine (kept, not deleted); the plant's name, capacity and first-power date are refreshed from Solis; a backfill of the correct history is queued and runs within 15 minutes.</li>
       <li><b>If no plant in our Solis account is the customer's</b> (the common case found on 17 Sep: none of the 654 plants carried any suspect's name), tick <i>No correct station is known</i> in the Remap box instead: the wrong data is quarantined, the system becomes <i>pending</i> and stops syncing, and the right plant is attached later with <i>Add another Solis station</i> or a Remap once sales/engineering find it.</li>
       <li>Before deciding, read the signals in Unresolved: a login email containing a word of the plant name (a spouse's or relative's name on the plant) or a plant named after an organisation (a church, a shop) usually means the mapping is right and only the profile name needs fixing.</li>
+      <li><b>If the mapping is right</b> — the plant is the customer's business, church, lot number or a relative's name, and the Solis email or the data confirm it — tick <b>Manually verified</b>: in the Verified column of the Unresolved table, or in the Station section of the record. Type why. The record leaves <i>Possible wrong station</i>; your name, the time and the reason are shown on the record, kept in Audit, and listed under “manually verified” at the bottom of that table, where the tick can be undone. A Remap, Detach or hand edit of the station id clears the tick automatically, because it was a verdict about that mapping.</li>
       <li>If the wrong id came from the Odoo lead, tell sales to correct the lead — otherwise the grid keeps showing "Odoo ≠ Supabase" for that customer.</li>
     </ol>
 

@@ -29,6 +29,7 @@ that is written continuously; do not work around 25001 by deleting the keyword.
 | 12 legacy timestamp quarantine (optional) | not run — see below | |
 | **13 readings quarantine** (`2026-09-17_13_readings_quarantine.sql`) | **applied** — `energy_readings_quarantine`, used by Monitoring Admin's Remap to hold readings captured under a wrong station id (recoverable, never deleted) | 2026-09-17 |
 | **14 audit_log append-only trigger** (`2026-09-17_14_audit_log_append_only_trigger.sql`) | **applied** — replaces 08's rewrite rules, which had made **every auth user undeletable** (the FK's ON DELETE SET NULL was rewritten to nothing). File 08 updated to match. | 2026-09-17 |
+| **15 mapping "manually verified"** (`2026-09-19_15_mapping_verified.sql`) | **applied** — `solar_systems.mapping_verified_at / _by / _note`; the 08 audit trigger now lists `mapping_verified_at` + `_note` (file 08 updated to match); `trg_clear_mapping_verified` clears the tick whenever `solis_station_id` changes. Proven in a rolled-back transaction: tick audited to the staff email, remap clears and audits the clearing, same-value id write keeps it. 0 verified at apply time. | 2026-09-19 |
 
 ## Verified state after 11 (2026-09-16 ~15:40 UTC)
 

@@ -9,6 +9,8 @@ Supabase, Solis Cloud and Odoo, and the only sanctioned way to change it.
     GET  /monitoring-admin/api/rows              the grid: one row per station
     GET  /monitoring-admin/api/rows/{system_id}  one row + its audit trail + jobs
     PATCH /monitoring-admin/api/systems/{id}     edit a station (engineer+)
+    POST /monitoring-admin/api/systems/{id}/mapping-verified
+                                           tick/untick "manually verified" on a mapping (engineer+)
     PATCH /monitoring-admin/api/profiles/{id}    edit a customer profile (engineer+)
     POST /monitoring-admin/api/systems           attach another station to a customer (engineer+)
     POST /monitoring-admin/api/backfill          enqueue a backfill (engineer+)
@@ -202,6 +204,8 @@ select s.id as system_id, s.user_id, s.system_name, s.capacity_kwp, s.installati
        s.solis_station_id, s.solis_plant_name, s.solis_user_email, s.solis_validated_at, s.solis_validation,
        s.odoo_lead_id, s.odoo_lead_email, s.odoo_lead_name, s.odoo_stage,
        s.last_backfill_at, s.last_backfill_status, s.created_at,
+       s.mapping_verified_at, s.mapping_verified_by, s.mapping_verified_note,
+       v.email as mapping_verified_by_email,
        p.full_name, p.phone, p.address as profile_address,
        p.odoo_partner_id, p.odoo_email, p.odoo_customer_name,
        u.email as login_email, u.last_sign_in_at, u.banned_until,
@@ -213,6 +217,7 @@ select s.id as system_id, s.user_id, s.system_name, s.capacity_kwp, s.installati
   left join daily r on r.system_id = s.id
   left join fm f on f.system_id = s.id
   left join active_job j on j.system_id = s.id
+  left join public.staff_users v on v.user_id = s.mapping_verified_by
 """
 
 
@@ -364,6 +369,60 @@ async def edit_system(system_id: uuid.UUID, body: EditRequest, authorization: st
         raise _db_error(exc)
     _invalidate_rows()
     return {"ok": True, "request_id": request_id, "changed": sorted(fields), "backfill_job": job}
+
+
+class MappingVerifiedRequest(BaseModel):
+    verified: bool
+    reason: str
+
+
+@router.post("/api/systems/{system_id}/mapping-verified")
+async def set_mapping_verified(system_id: uuid.UUID, body: MappingVerifiedRequest,
+                               authorization: str = Header(None)):
+    """Tick or untick "manually verified" on a station's customer mapping.
+
+    The "possible wrong station" scan is a name heuristic: it cannot clear a
+    plant named after a business, a church or a relative. An engineer who has
+    checked one says so here. The row then leaves the scan, and WHO decided,
+    WHEN and WHY are stamped from the staff session — never taken from the
+    browser — and land in the audit trail through the 08 trigger (file 15 added
+    the two columns to its list). Changing the station id later clears the tick
+    (trg_clear_mapping_verified): the verdict was about that mapping only.
+
+    Its own endpoint rather than a PATCH field so the by/at columns can never
+    be set to arbitrary values from the client.
+    """
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "engineer")
+    reason = _reason(body.reason)
+    request_id = str(uuid.uuid4())
+    try:
+        with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
+            if body.verified:
+                row = conn.execute(
+                    """update public.solar_systems
+                          set mapping_verified_at = now(), mapping_verified_by = %s,
+                              mapping_verified_note = %s, updated_at = now()
+                        where id = %s
+                    returning id, solis_station_id, mapping_verified_at, mapping_verified_note""",
+                    (staff["id"], reason, system_id)).fetchone()
+            else:
+                row = conn.execute(
+                    """update public.solar_systems
+                          set mapping_verified_at = null, mapping_verified_by = null,
+                              mapping_verified_note = null, updated_at = now()
+                        where id = %s
+                    returning id, solis_station_id, mapping_verified_at, mapping_verified_note""",
+                    (system_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "No such system")
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+    _invalidate_rows()
+    return {"ok": True, "request_id": request_id, **_j(dict(row)),
+            "mapping_verified_by_email": staff["email"] if body.verified else None}
 
 
 @router.patch("/api/profiles/{user_id}")
@@ -1044,7 +1103,23 @@ async def unresolved(authorization: str = Header(None)):
                  from public.solar_systems s
                  left join public.user_profiles p on p.id = s.user_id
                  left join auth.users u on u.id = s.user_id
-                where s.solis_station_id is not null and s.solis_plant_name is not null""").fetchall()
+                where s.solis_station_id is not null and s.solis_plant_name is not null
+                  and s.mapping_verified_at is null""").fetchall()
+        # The register of mappings an engineer has ticked "manually verified".
+        # Returned separately so the page can show them collapsed and a tick
+        # made in error can be undone from the same place.
+        verified_raw = conn.execute(
+            """select s.id as system_id, p.full_name, s.solis_plant_name, s.solis_station_id,
+                      coalesce(p.odoo_customer_name, s.odoo_lead_name) as odoo_name,
+                      u.email as login_email, s.solis_user_email,
+                      s.mapping_verified_at, s.mapping_verified_note,
+                      v.email as mapping_verified_by_email
+                 from public.solar_systems s
+                 left join public.user_profiles p on p.id = s.user_id
+                 left join auth.users u on u.id = s.user_id
+                 left join public.staff_users v on v.user_id = s.mapping_verified_by
+                where s.mapping_verified_at is not null
+                order by s.mapping_verified_at desc""").fetchall()
     onboarding: Dict[str, Any] = {}
     if run:
         report = run["report"] if isinstance(run["report"], dict) else json.loads(run["report"] or "{}")
@@ -1065,6 +1140,10 @@ async def unresolved(authorization: str = Header(None)):
     #   * the Odoo lead carries another plant's station id  → remap + tell sales
     #   * the customer's PROFILE name is wrong (nickname, email as name)
     #     while the mapping is right                          → edit the profile
+    #   * the mapping is right and the plant is simply named after a business,
+    #     a church, a relative or a lot number (28 of 30 on 2026-09-19) — the
+    #     heuristic can never clear these; the engineer ticks "manually
+    #     verified" (mapping_verified_at) and the row leaves this scan.
     suspects = []
     for r in suspects_raw:
         nt, pt, ot = _name_tokens(r["full_name"]), _name_tokens(r["solis_plant_name"]), _name_tokens(r["odoo_name"])
@@ -1093,6 +1172,13 @@ async def unresolved(authorization: str = Header(None)):
         suspects.append({**dict(r), "score": score, "signals": signals, "suggested_stations": []})
     suspects.sort(key=lambda x: (-x["score"], -(x["readings"] or 0)))
 
+    # For each verified mapping, say whether the name heuristic would still
+    # flag it today — a tick on a row whose names now agree is just history.
+    verified = []
+    for r in verified_raw:
+        nt, pt = _name_tokens(r["full_name"]), _name_tokens(r["solis_plant_name"])
+        verified.append({**dict(r), "still_flagged_by_names": bool(nt and pt and not (nt & pt))})
+
     # Suggested correct plants come from a separate endpoint
     # (/api/suspects/suggestions): they need the Solis roster, whose cold walk
     # takes ~90 s and fails outright when Solis is having a bad hour. This page
@@ -1104,6 +1190,7 @@ async def unresolved(authorization: str = Header(None)):
         "dark_systems": dark,
         "last_onboarding": onboarding,
         "suspect_mappings": suspects,
+        "verified_mappings": verified,
     })
 
 
