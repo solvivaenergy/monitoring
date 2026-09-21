@@ -64,22 +64,53 @@ def _is_retryable_supabase_error(exc: Exception) -> bool:
     return status_code == 522
 
 
+def _lookup_station_for_user(sb, user_id: str) -> str | None:
+    """The station this login may look at: its own primary station, else the
+    first station it was GRANTED view access to (public.system_access, migration
+    16 — e.g. the staff member an SME owner assigns to watch the portal). One
+    station per login until the portal's station selector ships; the oldest
+    grant wins so the answer is stable."""
+    resp = (
+        sb.table("user_profiles")
+        .select("solis_station_id")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if resp.data and resp.data[0].get("solis_station_id"):
+        return resp.data[0]["solis_station_id"]
+
+    grant = (
+        sb.table("system_access")
+        .select("system_id")
+        .eq("user_id", user_id)
+        .order("granted_at")
+        .limit(1)
+        .execute()
+    )
+    if grant.data:
+        system = (
+            sb.table("solar_systems")
+            .select("solis_station_id")
+            .eq("id", grant.data[0]["system_id"])
+            .limit(1)
+            .execute()
+        )
+        if system.data and system.data[0].get("solis_station_id"):
+            return system.data[0]["solis_station_id"]
+    return None
+
+
 async def _query_user_profile_station_id(user_id: str) -> str:
     sb = _get_supabase()
     last_exc: Exception | None = None
 
     for attempt in range(3):
         try:
-            resp = (
-                sb.table("user_profiles")
-                .select("solis_station_id")
-                .eq("id", user_id)
-                .limit(1)
-                .execute()
-            )
-            if not resp.data or not resp.data[0].get("solis_station_id"):
+            station_id = _lookup_station_for_user(sb, user_id)
+            if not station_id:
                 raise HTTPException(status_code=404, detail="No Solis station mapped for this user")
-            return resp.data[0]["solis_station_id"]
+            return station_id
         except HTTPException:
             raise
         except Exception as exc:

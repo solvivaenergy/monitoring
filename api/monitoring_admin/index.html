@@ -78,6 +78,11 @@
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
   .grid2 label,.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}
   .grid2 input,.grid2 select,.field input,.field textarea{width:100%}
+  /* Values we only mirror from Odoo / Solis: same footprint as an input, dashed so
+     it reads as "not yours to type in"; the tag says which system owns it. */
+  .ro .val{padding:7px 10px;border:1px dashed var(--line);border-radius:8px;background:#fafbfc;min-height:36px;font-size:13.5px;word-break:break-word}
+  .src{display:inline-block;margin-left:5px;padding:0 6px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;background:var(--chip);color:var(--muted);vertical-align:1px}
+  .src.odoo{background:#e3f0fb;color:var(--info)}.src.solis{background:#fdf3e1;color:var(--warn)}
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .verdict{font-size:12.5px;padding:8px 10px;border-radius:8px;background:#fafbfc;border:1px solid var(--line);margin-top:6px;white-space:pre-wrap;word-break:break-word}
   .audit li{padding:6px 0;border-bottom:1px dashed var(--line);font-size:12.5px}
@@ -263,7 +268,7 @@ $$('#tabs button').forEach(b => b.onclick = () => { show(b.dataset.tab); ({unres
 /* customers grid                                                       */
 /* ------------------------------------------------------------------ */
 const COLS = [
-  {key:'full_name', label:'Customer', render:r => `<b>${esc(r.full_name||'—')}</b>${r._multi?' <span class="tag">'+r._multi+' stations</span>':''}${r.is_primary===false?' <span class="tag">secondary</span>':''}`},
+  {key:'full_name', label:'Customer', render:r => `<b>${esc(r.full_name||'—')}</b>${r._multi?' <span class="tag">'+r._multi+' stations</span>':''}${r.is_primary===false?' <span class="tag">secondary</span>':''}${r.viewer_count?' <span class="tag" title="Other logins with view access to this station">+'+r.viewer_count+' viewer'+(r.viewer_count>1?'s':'')+'</span>':''}`},
   {key:'login_email', label:'Login email', render:r => `<span class="mono">${esc(r.login_email||'—')}</span>${r.banned_until?' <span class="tag bad">banned</span>':''}`},
   {key:'odoo_lead_id', label:'Odoo lead', render:r => r.odoo_lead_id ? `<span class="mono">${r.odoo_lead_id}</span>` : '<span class="muted">—</span>'},
   {key:'odoo_partner_id', label:'Odoo customer', render:r => r.odoo_partner_id ? `<span class="mono">${r.odoo_partner_id}</span>` : '<span class="muted">—</span>'},
@@ -336,6 +341,13 @@ $('#btn-validate-all').onclick = async () => {
 /* ------------------------------------------------------------------ */
 const canEdit = () => me && (me.role==='engineer' || me.role==='admin');
 function field(label, name, value, type='text', attrs=''){ return `<div><label>${label}</label><input name="${name}" type="${type}" value="${esc(value ?? '')}" ${canEdit()?'':'disabled'} ${attrs}></div>`; }
+// A value we only mirror from Odoo or Solis: shown, never typed into (the API
+// refuses it too). The tag names the system where it is actually fixed.
+function ro(label, value, src, mono=false){
+  const v = (value==null || value==='') ? '<span class="muted">—</span>' : (mono ? `<span class="mono">${esc(value)}</span>` : esc(value));
+  return `<div class="ro"><label>${label}<span class="src ${src.toLowerCase()}">${src}</span></label><div class="val">${v}</div></div>`;
+}
+const synced = (ts) => ts ? `last synced ${fmtTs(ts)}` : 'not synced yet';
 
 async function openPanel(systemId){
   showPanel(); $('#panel-body').innerHTML = '<p class="muted">Loading…</p>';
@@ -344,39 +356,59 @@ async function openPanel(systemId){
   $('#panel-body').innerHTML = `
     <div class="row"><span class="tag ${r.status==='active'?'ok':''}">${esc(r.status)}</span>${r.is_primary?'<span class="tag ok">primary</span>':'<span class="tag">secondary</span>'}${r.mapping_verified_at?`<span class="tag ok" title="Mapping manually verified by ${esc(r.mapping_verified_by_email||'a removed staff login')} on ${esc(fmtTs(r.mapping_verified_at))}">mapping verified</span>`:''}<span class="muted">login: <span class="mono">${esc(r.login_email||'—')}</span></span></div>
 
-    <h3>Customer profile <span class="muted">(Supabase)</span></h3>
+    <h3>Customer profile <span class="muted">(Supabase — ours)</span></h3>
     <form id="f-profile" class="grid2">
       ${field('Full name','full_name',r.full_name)}
       ${field('Phone','phone',r.phone)}
       ${field('Address','address',r.profile_address)}
-      ${field('Odoo customer id (partner)','odoo_partner_id',r.odoo_partner_id,'number')}
-      ${field('Customer name (Odoo)','odoo_customer_name',r.odoo_customer_name)}
-      ${field('Email (Odoo)','odoo_email',r.odoo_email,'email')}
     </form>
+
+    <h3>Customer <span class="muted">(Odoo)</span></h3>
+    <div class="grid2">
+      ${ro('Odoo customer id (partner)',r.odoo_partner_id,'Odoo',true)}
+      ${ro('Customer name',r.odoo_customer_name,'Odoo')}
+      ${ro('Email',r.odoo_email,'Odoo',true)}
+    </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="customer" ${r.odoo_partner_id?'':'disabled'}>Validate Odoo customer</button>
-      <span class="hint">Odoo itself is read-only here — these fields are our copy of what Odoo says.</span>
+      <span class="hint">Read-only copy of the Odoo contact (${synced(r.profile_odoo_synced_at)}). Wrong here means wrong in Odoo: tell sales, and it refreshes the night after.</span>
     </div>
     <div class="verdict" id="v-customer" hidden></div>
 
-    <h3>Station</h3>
+    <h3>Station <span class="muted">(Supabase — ours)</span></h3>
     <form id="f-system" class="grid2">
       ${field('Solis station id','solis_station_id',r.solis_station_id,'text','pattern="\\d{15,20}"')}
-      ${field('Plant name (Solis)','solis_plant_name',r.solis_plant_name)}
-      ${field('System name','system_name',r.system_name)}
-      ${field('Capacity kWp','capacity_kwp',r.capacity_kwp,'number','step="0.01"')}
       ${field('Installation date','installation_date',fmtDate(r.installation_date)==='—'?'':fmtDate(r.installation_date),'date')}
       <div><label>Status</label><select name="status" ${canEdit()?'':'disabled'}>${['active','inactive','decommissioned'].map(s=>`<option ${r.status===s?'selected':''}>${s}</option>`).join('')}</select></div>
-      ${field('Odoo lead id','odoo_lead_id',r.odoo_lead_id,'number')}
-      ${field('Lead email (Odoo)','odoo_lead_email',r.odoo_lead_email,'email')}
       <div><label>Primary station</label><select name="is_primary" ${canEdit()?'':'disabled'}><option value="true" ${r.is_primary?'selected':''}>yes</option><option value="false" ${!r.is_primary?'selected':''}>no</option></select></div>
     </form>
+    <p class="hint" style="margin:6px 0 0">The station id is our mapping — which Solis plant this customer's data comes from. To change it, prefer <b>Remap</b> below: it quarantines the history recorded under the wrong id, a plain edit here keeps it.</p>
+
+    <h3>Plant <span class="muted">(Solis)</span></h3>
+    <div class="grid2">
+      ${ro('Plant name',r.solis_plant_name,'Solis')}
+      ${ro('Plant email',r.solis_user_email,'Solis',true)}
+      ${ro('Capacity kWp',r.capacity_kwp,'Solis')}
+      ${r.system_name && r.system_name!==r.solis_plant_name ? ro('System name — realigned to the plant name nightly',r.system_name,'Solis') : ''}
+    </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="station" ${r.solis_station_id?'':'disabled'}>Validate Solis station</button>
-      <button class="btn sm" data-validate="lead" ${r.odoo_lead_id?'':'disabled'}>Validate Odoo lead</button>
+      <span class="hint">Read-only copy of Solis Cloud for the station id above (${synced(r.solis_synced_at)}). A wrong name, email or capacity is fixed in Solis Cloud; a wrong <i>plant</i> is fixed with Remap.</span>
     </div>
-    <label class="row hint" style="margin-top:8px"><input type="checkbox" id="map-verified" ${r.mapping_verified_at?'checked':''} ${canEdit()&&r.solis_station_id?'':'disabled'}> <span><b>Manually verified</b> — this Solis station belongs to this customer; hide it from Unresolved → <i>Possible wrong station</i>. Cleared automatically if the station id is remapped or edited.${r.mapping_verified_at?` <span class="muted">Verified by <b>${esc(r.mapping_verified_by_email||'a removed staff login')}</b> on ${esc(fmtTs(r.mapping_verified_at))}${r.mapping_verified_note?` — “${esc(r.mapping_verified_note)}”`:''}</span>`:''}</span></label>
     <div class="verdict" id="v-station" hidden></div>
+    <label class="row hint" style="margin-top:8px"><input type="checkbox" id="map-verified" ${r.mapping_verified_at?'checked':''} ${canEdit()&&r.solis_station_id?'':'disabled'}> <span><b>Manually verified</b> — this Solis station belongs to this customer; hide it from Unresolved → <i>Possible wrong station</i>. Cleared automatically if the station id is remapped or edited.${r.mapping_verified_at?` <span class="muted">Verified by <b>${esc(r.mapping_verified_by_email||'a removed staff login')}</b> on ${esc(fmtTs(r.mapping_verified_at))}${r.mapping_verified_note?` — “${esc(r.mapping_verified_note)}”`:''}</span>`:''}</span></label>
+
+    <h3>Lead <span class="muted">(Odoo)</span></h3>
+    <div class="grid2">
+      ${ro('Odoo lead id',r.odoo_lead_id,'Odoo',true)}
+      ${ro('Lead name',r.odoo_lead_name,'Odoo')}
+      ${ro('Lead email',r.odoo_lead_email,'Odoo',true)}
+      ${ro('Stage',r.odoo_stage,'Odoo')}
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn sm" data-validate="lead" ${r.odoo_lead_id?'':'disabled'}>Validate Odoo lead</button>
+      <span class="hint">Read-only copy of the Odoo lead whose “CRM Design Solis Station ID” is the station id above (${synced(r.odoo_synced_at)}). Empty means no lead in Odoo carries this id. Fixes go to sales.</span>
+    </div>
     <div class="verdict" id="v-lead" hidden></div>
 
     <h3>Does our stored data match Solis for this station id?</h3>
@@ -384,7 +416,7 @@ async function openPanel(systemId){
       <select id="rec-months"><option value="1">last month</option><option value="3" selected>last 3 months</option><option value="6">last 6 months</option><option value="12">last 12 months</option></select>
       <button class="btn sm" id="btn-reconcile" ${r.solis_station_id?'':'disabled'}>Check data vs Solis</button>
     </div>
-    <p class="hint" style="margin:6px 0 0">Checks data integrity for the id above — stale rows, or a past remap that was never backfilled. It cannot tell you whether the station <i>belongs</i> to this customer: judge that from the plant name and Solis email (${esc(r.solis_plant_name||'—')} · ${esc(r.solis_user_email||'no Solis email')}) against the login ${esc(r.login_email||'—')} and the Odoo name.</p>
+    <p class="hint" style="margin:6px 0 0">Checks data integrity for the id above — stale rows, or a past remap that was never backfilled. It cannot tell you whether the station <i>belongs</i> to this customer: judge that from the Plant (Solis) block above against the login ${esc(r.login_email||'—')} and the Odoo names.</p>
     <div class="verdict" id="v-reconcile" hidden></div>
     ${canEdit() ? `
     <details id="remap-box" style="margin-top:8px"><summary class="hint"><b>Remap to the correct Solis station</b> — quarantines every reading captured under the wrong id, re-identifies the station from Solis, backfills the right history</summary>
@@ -427,6 +459,20 @@ async function openPanel(systemId){
     </div>` : ''}
     ${d.jobs.length ? `<ul class="plain audit">${d.jobs.map(j => `<li><span class="tag ${j.status==='succeeded'?'ok':j.status==='failed'?'bad':'warn'}">${esc(j.status)}</span> ${esc(j.granularity)} ${fmtDate(j.date_from)} → ${fmtDate(j.date_to)} <span class="when">queued ${fmtTs(j.queued_at)}</span>${j.rows_written!=null?` · ${j.rows_written} rows`:''}${j.error?` · <span class="tag bad">${esc(String(j.error).slice(0,120))}</span>`:''}</li>`).join('')}</ul>` : ''}
 
+    <h3>Who can view this station</h3>
+    <div id="access-box"><p class="muted">Loading…</p></div>
+    ${canEdit() ? `
+    <details style="margin-top:8px"><summary class="hint"><b>Give another login view access</b> — e.g. the staff member an SME owner assigns to watch the portal</summary>
+      <div class="grid2" style="margin-top:8px">
+        <div><label>Email of the person</label><input id="acc-email" type="email" placeholder="staff@company.com"></div>
+        <div><label>Full name (for a new login)</label><input id="acc-name" placeholder="e.g. Maria Santos"></div>
+        <div style="grid-column:1/-1"><label>Reason (audit log — who asked, when)</label><input id="acc-reason" placeholder="e.g. Owner asked on 21 Sep that their admin can watch the portal"></div>
+      </div>
+      <p class="hint">View only: this station's live data and history, nothing else — not the owner's phone or address, no edits. Ownership, syncs and the Odoo mapping stay with the owner. If the email has no login yet, one is created and its temporary password is shown once; pass it on privately and ask them to change it. The portal shows one station per login.</p>
+      <div class="row" style="margin-top:8px"><button class="btn sm primary" id="btn-grant">Grant view access</button></div>
+      <div class="verdict" id="v-access" hidden></div>
+    </details>` : ''}
+
     <h3>Other stations of this customer</h3>
     ${d.other_systems.length ? `<ul class="plain audit">${d.other_systems.map(s => `<li><a href="#" data-open="${s.id}">${esc(s.system_name)}</a> <span class="mono">${esc(s.solis_station_id||'no id')}</span> ${s.is_primary?'<span class="tag ok">primary</span>':''}</li>`).join('')}</ul>` : '<p class="hint">None — single-station customer.</p>'}
     ${canEdit() ? `
@@ -460,7 +506,9 @@ async function openPanel(systemId){
   $$('#panel-body [data-open]').forEach(a => a.onclick = e => { e.preventDefault(); openPanel(a.dataset.open); });
   $$('#panel-body [data-validate]').forEach(b => b.onclick = () => validate(b.dataset.validate, r));
   $('#btn-reconcile').onclick = () => reconcileSystem(r);
+  loadAccess(r);
   if (canEdit()) {
+    $('#btn-grant').onclick = () => grantAccess(r);
     $('#btn-save').onclick = () => saveAll(r);
     $('#btn-remap-preview').onclick = () => remap(r, true);
     $('#btn-remap-confirm').onclick = () => remap(r, false);
@@ -490,6 +538,46 @@ async function setMappingVerified(r, verified, after){
   } catch (e) { toast(e.message, true); }
   refresh();
 }
+// Who may look at this station besides the owner (system_access, migration 16):
+// view-only grants for e.g. the staff member an SME owner assigns to the portal.
+async function loadAccess(r){
+  const box = $('#access-box'); if (!box) return;
+  try {
+    const a = await api('/monitoring-admin/api/systems/'+r.system_id+'/access');
+    const owner = `<li><span class="tag ok">owner</span> <b>${esc(a.owner.full_name||'—')}</b> <span class="mono">${esc(a.owner.email||'—')}</span> <span class="when">${a.owner.last_sign_in_at?'last sign-in '+fmtDate(a.owner.last_sign_in_at):'never signed in'}</span></li>`;
+    const viewers = a.viewers.map(v => `<li><span class="tag ${v.banned?'bad':''}">${v.banned?'viewer · banned':'viewer'}</span> <b>${esc(v.full_name||'—')}</b> <span class="mono">${esc(v.email)}</span> <span class="when">granted ${fmtDate(v.granted_at)} by ${esc(v.granted_by_email||'a removed staff login')}${v.reason?` — “${esc(v.reason)}”`:''} · ${v.last_sign_in_at?'last sign-in '+fmtDate(v.last_sign_in_at):'never signed in'}${v.owns_a_station?' · also owns a station':''}</span>${canEdit()?` <button class="btn sm" data-revoke-access="${v.user_id}" data-email="${esc(v.email)}" data-owns="${v.owns_a_station?'1':''}">Revoke</button>`:''}</li>`);
+    box.innerHTML = `<ul class="plain audit">${owner}${viewers.join('')}</ul>${viewers.length?'':'<p class="hint" style="margin:4px 0 0">Only the owner can see this station.</p>'}`;
+    $$('#access-box [data-revoke-access]').forEach(b => b.onclick = () => revokeAccess(r, b.dataset.revokeAccess, b.dataset.email, !!b.dataset.owns));
+  } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
+}
+async function grantAccess(r){
+  const email = $('#acc-email').value.trim().toLowerCase(), name = $('#acc-name').value.trim(), reason = $('#acc-reason').value.trim(), box = $('#v-access');
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return toast('Enter a valid email address', true);
+  if (reason.length < 3) return toast('Type the reason — it goes into the audit log', true);
+  if (!confirm(`Let ${email} view "${r.solis_plant_name||r.system_name}" (station ${r.solis_station_id||'no id'})?\n\nThey will see this station's data in the portal, read-only.`)) return;
+  box.hidden = false; box.textContent = 'Granting…';
+  try {
+    const v = await api('/monitoring-admin/api/systems/'+r.system_id+'/access', {method:'POST', body:{email, full_name:name||null, reason}});
+    box.innerHTML = `<b>Access granted</b> to <span class="mono">${esc(v.email)}</span>.`
+      + (v.login_created
+          ? `<br>A new login was created. Temporary password (shown once, not stored): <span class="mono" style="user-select:all"><b>${esc(v.temporary_password)}</b></span><br><span class="muted">Pass it on privately and ask them to change it at first sign-in.</span>`
+          : '<br><span class="muted">The login already existed; its password was not touched.</span>');
+    $('#acc-email').value = ''; $('#acc-name').value = ''; $('#acc-reason').value = '';
+    toast('View access granted'); loadAccess(r); loadRows(true);
+  } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
+}
+async function revokeAccess(r, userId, email, ownsStation){
+  const typed = ($('#acc-reason')?.value || $('#reason')?.value || '').trim();
+  const reason = (typed || prompt(`Why is ${email} losing view access to this station? (recorded in the audit log)`) || '').trim();
+  if (reason.length < 3) return toast('A reason is required — nothing changed', true);
+  if (!confirm(`Revoke ${email}'s view access to this station?`)) return;
+  const disable = ownsStation ? false : confirm(`Also disable the login ${email}?\n\nOK = ban it if it has no other station to look at.\nCancel = keep the login, only remove this access.`);
+  try {
+    const v = await api(`/monitoring-admin/api/systems/${r.system_id}/access/${userId}/revoke`, {method:'POST', body:{reason, disable_login:disable}});
+    toast(v.login_disabled ? 'Access revoked and the login disabled' : v.login_still_has_access ? 'Access revoked — the login still has other access' : 'Access revoked — the login has nothing left to view');
+    loadAccess(r); loadRows(true);
+  } catch (e) { toast(e.message, true); }
+}
 function showPanel(){ $('#panel').classList.add('open'); $('#backdrop').classList.add('show'); }
 function closePanel(){ $('#panel').classList.remove('open'); $('#backdrop').classList.remove('show'); }
 $('#panel-close').onclick = closePanel;
@@ -510,8 +598,8 @@ function formDiff(form, original, numeric=[]){
 }
 async function saveAll(r){
   const reason = $('#reason').value.trim();
-  const sysFields = formDiff($('#f-system'), r, ['capacity_kwp','odoo_lead_id']);
-  const profFields = formDiff($('#f-profile'), Object.assign({}, r, {address:r.profile_address}), ['odoo_partner_id']);
+  const sysFields = formDiff($('#f-system'), r);
+  const profFields = formDiff($('#f-profile'), Object.assign({}, r, {address:r.profile_address}));
   const bf = $('#bf-after').checked ? {granularity: $('#bf-gran').value, days: Number($('#bf-days').value)} : null;
   if (!Object.keys(sysFields).length && !Object.keys(profFields).length && !bf) return toast('Nothing changed');
   try {
@@ -542,8 +630,8 @@ async function validate(kind, r){
   try {
     let res;
     if (kind==='station') res = await api('/admin/validate/solis-station', {method:'POST', body:{station_id: $('#f-system [name=solis_station_id]').value.trim() || r.solis_station_id, for_user_id: r.user_id}});
-    if (kind==='lead') res = await api('/admin/validate/odoo-lead', {method:'POST', body:{lead_id: Number($('#f-system [name=odoo_lead_id]').value || r.odoo_lead_id), expected_station_id: r.solis_station_id}});
-    if (kind==='customer') res = await api('/admin/validate/odoo-customer', {method:'POST', body:{partner_id: Number($('#f-profile [name=odoo_partner_id]').value || r.odoo_partner_id)}});
+    if (kind==='lead') res = await api('/admin/validate/odoo-lead', {method:'POST', body:{lead_id: Number(r.odoo_lead_id), expected_station_id: r.solis_station_id}});
+    if (kind==='customer') res = await api('/admin/validate/odoo-customer', {method:'POST', body:{partner_id: Number(r.odoo_partner_id)}});
     box.innerHTML = summarizeVerdict(res);
   } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
 }
@@ -799,11 +887,11 @@ function loadGuide(){
   $('#view-guide').innerHTML = `
   <div class="card" style="max-width:980px;line-height:1.55">
     <h2 style="margin-top:0">How the engineering team fixes customer data here</h2>
-    <p class="hint">Everything you change is recorded in <b>Audit</b> with your name and the reason you typed. Nothing here writes to Odoo — Odoo is the sales team's source of truth; when Odoo is wrong, tell sales and they fix it there, and the nightly sync picks it up the following night (02:00).</p>
+    <p class="hint">Everything you change is recorded in <b>Audit</b> with your name and the reason you typed. Nothing here writes to Odoo — Odoo is the sales team's source of truth; when Odoo is wrong, tell sales and they fix it there, and the nightly sync picks it up the following night (02:00). In a record, every value tagged <span class="src odoo">Odoo</span> or <span class="src solis">Solis</span> is our nightly copy of that system and cannot be typed into here — an edit would be overwritten the next night anyway. Only the two <b>Supabase — ours</b> blocks are edited here: the profile's name, phone and address; the station's Solis station id, installation date, status and primary flag.</p>
 
     <h3>1. A customer is mapped to the wrong Solis station</h3>
     <ol>
-      <li>Open the customer. Read the <b>Station</b> section: is the <i>Plant name (Solis)</i> this customer's name? Does the plant's Solis email match the <i>login email</i>? A plant named after someone else with a different email is the wrong station — every day recorded under this customer is that other plant's production. (Unresolved → <i>Possible wrong station</i> lists these automatically.)</li>
+      <li>Open the customer. Read the <b>Plant (Solis)</b> block: is the <i>Plant name</i> this customer's name? Does the <i>Plant email</i> match the <i>login email</i>? A plant named after someone else with a different email is the wrong station — every day recorded under this customer is that other plant's production. (Unresolved → <i>Possible wrong station</i> lists these automatically.)</li>
       <li><b>Check data vs Solis</b> is a different question: it confirms our stored rows equal Solis for the id we hold. It stays ~99% even on a wrong mapping, so use it after a remap to confirm the backfill, and to catch stale or leftover rows — not to decide identity.</li>
       <li>Find the correct station id (the Odoo lead's "CRM Design Solis Station ID" if sales fixed it, or Solis Cloud). <b>Validate Solis station</b> on it first.</li>
       <li><b>Remap to the correct Solis station</b> → Preview → type the reason in the Save-changes box → Confirm. All readings recorded under the wrong id move to quarantine (kept, not deleted); the plant's name, capacity and first-power date are refreshed from Solis; a backfill of the correct history is queued and runs within 15 minutes.</li>
@@ -827,6 +915,9 @@ function loadGuide(){
 
     <h3>6. Dark stations</h3>
     <p>Unresolved → <i>Active stations dark &gt;3 days</i>. If the plant is really offline or decommissioned, set its <b>Status</b> in the panel (inactive / decommissioned) with a reason, so it stops counting as a data problem.</p>
+
+    <h3>7. Several people must watch one station (SME staff, a family member)</h3>
+    <p>Open the station → <b>Who can view this station</b> → <i>Give another login view access</i> → email, name, reason → Grant. If the email has no login yet, one is created and a temporary password is shown once — pass it on privately and have them change it. The viewer sees this station in the portal exactly as the owner does, read-only, without the owner's contact details. Revoke from the same list. Ownership does not move: the Odoo mapping, the syncs and the backfills still follow the owner. Never give the second person a second station row or a second Odoo lead — that is the duplicate pattern Retire cleans up.</p>
 
     <h3>Roles</h3>
     <p><b>readonly</b> sees everything; <b>engineer</b> can edit, remap, add stations and queue backfills; <b>admin</b> also manages staff. Admins add colleagues in <b>Staff</b> — a solvivaenergy.com Google account signs in directly once added.</p>

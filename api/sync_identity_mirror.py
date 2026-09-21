@@ -129,6 +129,14 @@ async def run(apply: bool) -> Dict[str, int]:
 
     sys_updates: List[tuple] = []
     prof_updates: Dict[Any, tuple] = {}
+    # Rows whose values were confirmed tonight, changed or not. Monitoring Admin
+    # shows odoo_synced_at / solis_synced_at as "last synced", so the stamp must
+    # mean "the copy was checked against the source", not "a value changed" —
+    # the first version only stamped changed rows, and every unchanged row
+    # kept showing the date of the first fill.
+    odoo_ok_systems: List[Any] = []
+    solis_ok_systems: List[Any] = []
+    odoo_ok_profiles: List[Any] = []
     counts = {"systems_seen": len(systems), "systems_changed": 0, "profiles_changed": 0,
               "stations_in_odoo": 0, "stations_in_solis": 0}
 
@@ -137,6 +145,10 @@ async def run(apply: bool) -> Dict[str, int]:
         o, z = odoo.get(sid), solis.get(sid)
         counts["stations_in_odoo"] += bool(o)
         counts["stations_in_solis"] += bool(z)
+        if o:
+            odoo_ok_systems.append(s["id"])
+        if z:
+            solis_ok_systems.append(s["id"])
         new = {
             "odoo_lead_id": o["lead_id"] if o else s["odoo_lead_id"],
             "odoo_lead_email": o["lead_email"] if o else s["odoo_lead_email"],
@@ -151,6 +163,7 @@ async def run(apply: bool) -> Dict[str, int]:
                                 now if z else None, s["id"]))
         if o and s["is_primary"] and s["user_id"] in profiles:
             p = profiles[s["user_id"]]
+            odoo_ok_profiles.append(p["id"])
             pn = {"odoo_partner_id": o["partner_id"],
                   "odoo_email": o["partner_email"] or o["lead_email"],
                   "odoo_customer_name": o["partner_name"] or o["lead_name"]}
@@ -178,7 +191,17 @@ async def run(apply: bool) -> Dict[str, int]:
                       set odoo_partner_id = %s, odoo_email = %s, odoo_customer_name = %s,
                           odoo_synced_at = %s, updated_at = now()
                     where id = %s""", list(prof_updates.values()))
-    log.info("mirror: wrote %d system row(s), %d profile row(s)", len(sys_updates), len(prof_updates))
+            # Freshness stamp for the unchanged rows. The *_synced_at columns are
+            # not in the 08 audit trigger's list and updated_at is left alone, so
+            # this writes no audit rows and does not make the rows look edited.
+            cur.execute("update public.solar_systems set odoo_synced_at = %s where id = any(%s)",
+                        (now, odoo_ok_systems))
+            cur.execute("update public.solar_systems set solis_synced_at = %s where id = any(%s)",
+                        (now, solis_ok_systems))
+            cur.execute("update public.user_profiles set odoo_synced_at = %s where id = any(%s)",
+                        (now, odoo_ok_profiles))
+    log.info("mirror: wrote %d system row(s), %d profile row(s); stamped %d/%d systems (odoo/solis), %d profiles",
+             len(sys_updates), len(prof_updates), len(odoo_ok_systems), len(solis_ok_systems), len(odoo_ok_profiles))
     return counts
 
 

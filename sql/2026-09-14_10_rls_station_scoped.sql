@@ -15,6 +15,11 @@
 -- Make the grant itself station-derived so the authorization boundary and the
 -- display boundary are the same boundary.
 --
+-- SUPERSEDED IN PART by file 16 (2026-09-21): owns_system() now also returns
+-- true for a login holding a view grant in public.system_access, and
+-- solar_systems has an extra policy ss_read_granted. The policies below are
+-- otherwise unchanged and still what is live.
+--
 -- IMPLEMENTATION NOTE: the policy calls a SECURITY DEFINER helper rather than
 -- inlining `exists (select 1 from solar_systems ...)`. A subquery inside a
 -- policy is ITSELF subject to the referenced table's RLS — a classic footgun

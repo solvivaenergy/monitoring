@@ -64,15 +64,35 @@ INDEX_HTML = Path(__file__).parent / "monitoring_admin" / "index.html"
 STATION_ID_RE = re.compile(r"^\d{15,20}$")
 ROLE_RANK = {"readonly": 0, "engineer": 1, "admin": 2}
 
-SYSTEM_FIELDS = {
-    "solis_station_id", "system_name", "capacity_kwp", "installation_date", "status",
-    "address", "battery_capacity_kwh", "is_primary",
-    "odoo_lead_id", "odoo_lead_email", "odoo_lead_name", "odoo_stage", "solis_plant_name",
+# Only OUR data is editable here. Everything else on these two tables is a
+# nightly copy of another system and is refused with a pointer to that system:
+# an edit would only change our copy, and the next sync would silently put the
+# other system's value back (identity mirror for odoo_*/solis_plant_name/
+# solis_user_email; sync_to_supabase for system_name/capacity_kwp/battery).
+SYSTEM_FIELDS = {"solis_station_id", "installation_date", "status", "address", "is_primary"}
+PROFILE_FIELDS = {"full_name", "phone", "address", "electricity_provider_id"}
+
+_FIX_IN_ODOO = ("is our nightly copy of Odoo. Fix it in Odoo (sales own it) and the copy "
+                "refreshes here the following night.")
+_FIX_IN_SOLIS = ("is our nightly copy of Solis Cloud. Fix the plant in Solis Cloud and the copy "
+                 "refreshes here the following night; if the plant itself is wrong, use Remap.")
+MIRRORED_FIELDS = {
+    "odoo_lead_id": _FIX_IN_ODOO, "odoo_lead_email": _FIX_IN_ODOO, "odoo_lead_name": _FIX_IN_ODOO,
+    "odoo_stage": _FIX_IN_ODOO, "odoo_partner_id": _FIX_IN_ODOO, "odoo_email": _FIX_IN_ODOO,
+    "odoo_customer_name": _FIX_IN_ODOO,
+    "solis_plant_name": _FIX_IN_SOLIS, "solis_user_email": _FIX_IN_SOLIS, "system_name": _FIX_IN_SOLIS,
+    "capacity_kwp": _FIX_IN_SOLIS, "battery_capacity_kwh": _FIX_IN_SOLIS,
 }
-PROFILE_FIELDS = {
-    "full_name", "phone", "address", "odoo_partner_id", "odoo_email",
-    "odoo_customer_name", "electricity_provider_id",
-}
+
+
+def _refuse_unknown(fields: Dict[str, Any], allowed: set, hint: str = "") -> None:
+    unknown = set(fields) - allowed
+    if not unknown:
+        return
+    mirrored = sorted(k for k in unknown if k in MIRRORED_FIELDS)
+    if mirrored:
+        raise HTTPException(400, f"Not editable here: {mirrored[0]} {MIRRORED_FIELDS[mirrored[0]]}")
+    raise HTTPException(400, f"Not editable here: {sorted(unknown)}{hint}")
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +223,8 @@ select s.id as system_id, s.user_id, s.system_name, s.capacity_kwp, s.installati
        s.status, s.is_primary, s.address,
        s.solis_station_id, s.solis_plant_name, s.solis_user_email, s.solis_validated_at, s.solis_validation,
        s.odoo_lead_id, s.odoo_lead_email, s.odoo_lead_name, s.odoo_stage,
+       s.odoo_synced_at, s.solis_synced_at, p.odoo_synced_at as profile_odoo_synced_at,
+       (select count(*) from public.system_access a where a.system_id = s.id) as viewer_count,
        s.last_backfill_at, s.last_backfill_status, s.created_at,
        s.mapping_verified_at, s.mapping_verified_by, s.mapping_verified_note,
        v.email as mapping_verified_by_email,
@@ -324,10 +346,8 @@ async def edit_system(system_id: uuid.UUID, body: EditRequest, authorization: st
     _require(staff, "engineer")
     reason = _reason(body.reason)
 
-    fields = {k: v for k, v in body.fields.items() if k in SYSTEM_FIELDS}
-    unknown = set(body.fields) - SYSTEM_FIELDS
-    if unknown:
-        raise HTTPException(400, f"Not editable here: {sorted(unknown)}")
+    _refuse_unknown(body.fields, SYSTEM_FIELDS)
+    fields = dict(body.fields)
     if not fields and not body.backfill:
         raise HTTPException(400, "Nothing to change")
 
@@ -337,9 +357,6 @@ async def edit_system(system_id: uuid.UUID, body: EditRequest, authorization: st
         if sid and not STATION_ID_RE.match(sid):
             raise HTTPException(400, "Solis station id must be 15–20 digits")
         fields["solis_station_id"] = sid
-    for k in ("odoo_lead_id",):
-        if k in fields and fields[k] in ("", None):
-            fields[k] = None
 
     request_id = str(uuid.uuid4())
     try:
@@ -430,15 +447,12 @@ async def edit_profile(user_id: uuid.UUID, body: EditRequest, authorization: str
     staff = await _authenticate_staff(authorization)
     _require(staff, "engineer")
     reason = _reason(body.reason)
-    fields = {k: v for k, v in body.fields.items() if k in PROFILE_FIELDS}
-    unknown = set(body.fields) - PROFILE_FIELDS
-    if unknown:
-        raise HTTPException(400, f"Not editable here: {sorted(unknown)} (the station id lives on the system)")
+    _refuse_unknown(body.fields, PROFILE_FIELDS, " (the station id lives on the system)")
+    fields = dict(body.fields)
     if not fields:
         raise HTTPException(400, "Nothing to change")
-    for k in ("odoo_partner_id", "electricity_provider_id"):
-        if k in fields and fields[k] in ("", None):
-            fields[k] = None
+    if "electricity_provider_id" in fields and fields["electricity_provider_id"] in ("", None):
+        fields["electricity_provider_id"] = None
     request_id = str(uuid.uuid4())
     try:
         with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
@@ -1072,6 +1086,8 @@ async def unresolved(authorization: str = Header(None)):
             """select p.id as user_id, p.full_name, p.solis_station_id, u.email, p.created_at
                  from public.user_profiles p left join auth.users u on u.id = p.id
                 where not exists (select 1 from public.solar_systems s where s.user_id = p.id)
+                  -- a view-only login (system_access) owns nothing by design
+                  and not exists (select 1 from public.system_access a where a.user_id = p.id)
                 order by p.created_at desc""").fetchall()
         no_station = conn.execute(
             """select s.id as system_id, s.system_name, s.capacity_kwp, p.full_name, u.email, s.created_at,
@@ -1238,6 +1254,179 @@ async def suspect_suggestions(authorization: str = Header(None)):
         if hits:
             out[str(r["system_id"])] = sorted(hits, key=lambda h: (not h["email_matches_login"], h["plant_name"] or ""))
     return {"suggestions": out, "unassigned_in_roster": len(unassigned), "roster_stale": stale}
+
+
+# ---------------------------------------------------------------------------
+# view-only access grants: several logins, one station (migration 16)
+# ---------------------------------------------------------------------------
+#
+# An SME owner hands the portal to a staff member with their own email. The
+# station keeps ONE owner (solar_systems.user_id — syncs, backfills and the Odoo
+# mapping follow it); a row in public.system_access lets a second login READ
+# the station and its readings through the same RLS helper the owner uses.
+# Grants are made here with a reason, audited by the 08 trigger, and revoked by
+# deleting the row. A grantee never gets the owner's phone or address.
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class GrantAccessRequest(BaseModel):
+    email: str
+    full_name: Optional[str] = None
+    reason: str
+
+
+class RevokeAccessRequest(BaseModel):
+    reason: str
+    # Ban the login when the revoke leaves it with nothing to look at (no station
+    # of its own, no other grant, not staff). Off by default: the person may be
+    # granted another station a minute later.
+    disable_login: bool = False
+
+
+async def _create_login_with_temp_password(email: str, full_name: Optional[str]) -> tuple[str, str]:
+    """Create a NEW auth user with a temporary password, returned once. Unlike
+    _create_or_reset_login this never touches an existing login: the caller has
+    already checked auth.users, and resetting a customer's password because an
+    engineer typed their address into the grant box would be a nasty surprise."""
+    import secrets
+    env = _supabase_env()
+    hdr = {"apikey": env["service"], "Authorization": f"Bearer {env['service']}"}
+    temp = secrets.token_urlsafe(12)
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(env["url"] + "/auth/v1/admin/users", headers=hdr,
+                              json={"email": email, "password": temp, "email_confirm": True,
+                                    "user_metadata": {"full_name": full_name or ""}})
+    if r.status_code in (200, 201):
+        return r.json()["id"], temp
+    if r.status_code == 422:
+        raise HTTPException(409, f"A login for {email} appeared while granting — retry")
+    raise HTTPException(502, f"Could not create a login for {email}: {r.text[:160]}")
+
+
+@router.get("/api/systems/{system_id}/access")
+async def list_access(system_id: uuid.UUID, authorization: str = Header(None)):
+    await _authenticate_staff(authorization)
+    with db.connect(autocommit=True) as conn:
+        owner = conn.execute(
+            """select s.user_id, u.email, p.full_name, u.last_sign_in_at
+                 from public.solar_systems s
+                 left join auth.users u on u.id = s.user_id
+                 left join public.user_profiles p on p.id = s.user_id
+                where s.id = %s""", (system_id,)).fetchone()
+        if not owner:
+            raise HTTPException(404, "No such system")
+        viewers = conn.execute(
+            """select a.id as grant_id, a.user_id, u.email, p.full_name, u.last_sign_in_at,
+                      (u.banned_until > now()) as banned,
+                      a.granted_at, a.reason, g.email as granted_by_email,
+                      exists (select 1 from public.solar_systems o where o.user_id = a.user_id) as owns_a_station
+                 from public.system_access a
+                 join auth.users u on u.id = a.user_id
+                 left join public.user_profiles p on p.id = a.user_id
+                 left join public.staff_users g on g.user_id = a.granted_by
+                where a.system_id = %s
+                order by a.granted_at""", (system_id,)).fetchall()
+    return {"owner": _j(dict(owner)), "viewers": _j(viewers)}
+
+
+@router.post("/api/systems/{system_id}/access")
+async def grant_access(system_id: uuid.UUID, body: GrantAccessRequest, authorization: str = Header(None)):
+    """Let `email` view this station. Creates the login if none exists (temporary
+    password returned ONCE, never stored) and a minimal profile row so the
+    portal has a name to show. Never resets an existing login's password."""
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "engineer")
+    reason = _reason(body.reason)
+    email = (body.email or "").strip().lower()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, "Enter a valid email address")
+
+    with db.connect(autocommit=True) as conn:
+        system = conn.execute(
+            """select s.id, s.user_id, s.system_name, s.solis_station_id, u.email as owner_email
+                 from public.solar_systems s left join auth.users u on u.id = s.user_id
+                where s.id = %s""", (system_id,)).fetchone()
+        if not system:
+            raise HTTPException(404, "No such system")
+        if (system["owner_email"] or "").lower() == email:
+            raise HTTPException(409, f"{email} already owns this station")
+        login = conn.execute(
+            "select id, (banned_until > now()) as banned from auth.users where lower(email) = %s", (email,)).fetchone()
+        if login and conn.execute(
+                "select 1 from public.system_access where system_id = %s and user_id = %s",
+                (system_id, login["id"])).fetchone():
+            raise HTTPException(409, f"{email} already has view access to this station")
+        if login and login["banned"]:
+            raise HTTPException(409, f"The login {email} is banned (a retired duplicate?) — pick another address or restore it first")
+
+    created, temp, user_id = False, None, (str(login["id"]) if login else None)
+    if not user_id:
+        user_id, temp = await _create_login_with_temp_password(email, body.full_name)
+        created = True
+
+    request_id = str(uuid.uuid4())
+    try:
+        with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
+            # A profile row (full_name is NOT NULL) so the portal can greet the
+            # person. No station on it: the grant is the only link, on purpose.
+            conn.execute(
+                """insert into public.user_profiles (id, full_name)
+                   values (%s, %s) on conflict (id) do nothing""",
+                (user_id, (body.full_name or "").strip() or email))
+            conn.execute(
+                """insert into public.system_access (system_id, user_id, role, granted_by, reason)
+                   values (%s, %s, 'viewer', %s, %s)""",
+                (system_id, user_id, staff["id"], reason))
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+    _invalidate_rows()
+    return {"ok": True, "request_id": request_id, "system_id": str(system_id),
+            "station_id": system["solis_station_id"], "user_id": user_id, "email": email,
+            "login_created": created, "temporary_password": temp}
+
+
+@router.post("/api/systems/{system_id}/access/{user_id}/revoke")
+async def revoke_access(system_id: uuid.UUID, user_id: uuid.UUID, body: RevokeAccessRequest,
+                        authorization: str = Header(None)):
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "engineer")
+    reason = _reason(body.reason)
+    request_id = str(uuid.uuid4())
+    try:
+        with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
+            gone = conn.execute(
+                "delete from public.system_access where system_id = %s and user_id = %s returning id",
+                (system_id, user_id)).fetchone()
+            if not gone:
+                raise HTTPException(404, "That login has no grant on this station")
+            still = conn.execute(
+                """select exists (select 1 from public.solar_systems where user_id = %s) as owns,
+                          exists (select 1 from public.system_access where user_id = %s) as other_grants,
+                          exists (select 1 from public.staff_users where user_id = %s) as is_staff,
+                          (select email from auth.users where id = %s) as email""",
+                (user_id, user_id, user_id, user_id)).fetchone()
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+
+    stranded = not (still["owns"] or still["other_grants"] or still["is_staff"])
+    disabled = False
+    if body.disable_login and stranded:
+        env = _supabase_env()
+        hdr = {"apikey": env["service"], "Authorization": f"Bearer {env['service']}"}
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.put(env["url"] + f"/auth/v1/admin/users/{user_id}", headers=hdr,
+                                 json={"ban_duration": "876000h"})
+        disabled = r.status_code == 200
+        if not disabled:
+            log.warning("revoke: grant removed but ban of %s failed: %s %s", still["email"], r.status_code, r.text[:160])
+    _invalidate_rows()
+    return {"ok": True, "request_id": request_id, "email": still["email"],
+            "login_still_has_access": not stranded, "login_disabled": disabled}
 
 
 # ---------------------------------------------------------------------------
