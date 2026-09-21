@@ -82,7 +82,9 @@
      it reads as "not yours to type in"; the tag says which system owns it. */
   .ro .val{padding:7px 10px;border:1px dashed var(--line);border-radius:8px;background:#fafbfc;min-height:36px;font-size:13.5px;word-break:break-word}
   .src{display:inline-block;margin-left:5px;padding:0 6px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;background:var(--chip);color:var(--muted);vertical-align:1px}
-  .src.odoo{background:#e3f0fb;color:var(--info)}.src.solis{background:#fdf3e1;color:var(--warn)}
+  .src.odoo{background:#e3f0fb;color:var(--info)}.src.solis{background:#fdf3e1;color:var(--warn)}.src.supabase{background:#eaf4dc;color:var(--ok)}
+  /* Column sorting on every table (the Customers grid draws its own arrows). */
+  th[data-dir=asc]::after{content:' ▲'}th[data-dir=desc]::after{content:' ▼'}
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .verdict{font-size:12.5px;padding:8px 10px;border-radius:8px;background:#fafbfc;border:1px solid var(--line);margin-top:6px;white-space:pre-wrap;word-break:break-word}
   .audit li{padding:6px 0;border-bottom:1px dashed var(--line);font-size:12.5px}
@@ -324,6 +326,30 @@ async function loadRows(fresh=false){
 $('#q').oninput = renderGrid;
 $$('.chip').forEach(c => c.onclick = () => { FILTER = c.dataset.f; $$('.chip').forEach(x => x.classList.toggle('active', x===c)); renderGrid(); });
 $('#grid thead').onclick = e => { const k = e.target.closest('th')?.dataset.k; if(!k) return; SORT = {key:k, dir: SORT.key===k ? -SORT.dir : 1}; renderGrid(); };
+// Every OTHER table sorts by clicking a header. Numbers and dates are detected
+// from the column's cells; empty cells sink to the bottom. Rows are moved, not
+// re-rendered, so their click handlers, checkboxes and buttons survive.
+document.addEventListener('click', e => {
+  const th = e.target.closest('th'); if (!th || th.closest('#grid')) return;
+  const table = th.closest('table'), tbody = table && table.tBodies[0]; if (!tbody || tbody.rows.length < 2) return;
+  const idx = [...th.parentNode.children].indexOf(th);
+  const dir = th.dataset.dir === 'asc' ? 'desc' : 'asc';
+  [...th.parentNode.children].forEach(h => { delete h.dataset.dir; }); th.dataset.dir = dir;
+  const raw = tr => { const td = tr.children[idx]; return td ? (td.dataset.sort ?? td.textContent.trim()) : ''; };
+  const empty = v => v === '' || v === '—' || v === '-';
+  const num = v => { const n = parseFloat(String(v).replace(/[,%₱\s]/g, '')); return Number.isNaN(n) ? null : n; };
+  const rows = [...tbody.rows], vals = rows.map(raw).filter(v => !empty(v));
+  const numeric = vals.length > 0 && vals.every(v => /^[\s\d.,%₱+-]+$/.test(v) && num(v) !== null);
+  const dated = !numeric && vals.length > 0 && vals.every(v => !Number.isNaN(Date.parse(v)));
+  const key = v => numeric ? num(v) : dated ? Date.parse(v) : v.toLowerCase();
+  rows.sort((a, b) => {
+    const x = raw(a), y = raw(b);
+    if (empty(x) || empty(y)) return empty(x) - empty(y);
+    const kx = key(x), ky = key(y);
+    return (kx > ky ? 1 : kx < ky ? -1 : 0) * (dir === 'asc' ? 1 : -1);
+  });
+  rows.forEach(tr => tbody.appendChild(tr));
+});
 $('#grid tbody').onclick = e => { const id = e.target.closest('tr')?.dataset.id; if (id) openPanel(id); };
 $('#btn-reload').onclick = () => loadRows(true);
 $('#btn-validate-all').onclick = async () => {
@@ -340,74 +366,97 @@ $('#btn-validate-all').onclick = async () => {
 /* detail panel                                                         */
 /* ------------------------------------------------------------------ */
 const canEdit = () => me && (me.role==='engineer' || me.role==='admin');
-function field(label, name, value, type='text', attrs=''){ return `<div><label>${label}</label><input name="${name}" type="${type}" value="${esc(value ?? '')}" ${canEdit()?'':'disabled'} ${attrs}></div>`; }
-// A value we only mirror from Odoo or Solis: shown, never typed into (the API
-// refuses it too). The tag names the system where it is actually fixed.
-function ro(label, value, src, mono=false){
-  const v = (value==null || value==='') ? '<span class="muted">—</span>' : (mono ? `<span class="mono">${esc(value)}</span>` : esc(value));
-  return `<div class="ro"><label>${label}<span class="src ${src.toLowerCase()}">${src}</span></label><div class="val">${v}</div></div>`;
+// One field of the record. `src` tags it with the system the value comes from
+// (Supabase = ours; Odoo / Solis = our nightly copy). Every field is editable
+// for now; a field the engineering team declares read-only arrives in
+// me.locked_fields (from /api/me) and is then shown, not typed into, with the
+// reason on hover — the API refuses it too. `attrs` may carry form="f-…" so a
+// field can sit in another block than its <form>.
+function field(label, name, value, type='text', attrs='', src=''){
+  const tag = src ? `<span class="src ${src.toLowerCase()}">${src}</span>` : '';
+  const lock = me && me.locked_fields && me.locked_fields[name];
+  if (lock) return `<div class="ro"><label>${label}${tag}</label><div class="val" title="${esc(lock)}">${(value==null||value==='')?'<span class="muted">—</span>':esc(value)}</div></div>`;
+  return `<div><label>${label}${tag}</label><input name="${name}" type="${type}" value="${esc(value ?? '')}" ${canEdit()?'':'disabled'} ${attrs}></div>`;
 }
-const synced = (ts) => ts ? `last synced ${fmtTs(ts)}` : 'not synced yet';
+const synced = (ts) => ts ? `Last synced ${fmtTs(ts)}` : 'Not synced yet';
+const copyHint = (src) => `Edits here change our database only — nothing is written to ${src}, and the nightly sync brings ${src}'s value back; to make a change stick, fix it in ${src} too.`;
+// Why (if at all) this record is listed under Unresolved → Possible wrong
+// station: the server sends the same signals the tab shows, for this one row.
+function wrongStationBox(r, w){
+  if (!w) return '';
+  const head = r.mapping_verified_at
+    ? 'The name check would still flag this station — it stays out of Unresolved because it was manually verified'
+    : 'Why this record is under Unresolved → Possible wrong station';
+  const advice = w.score >= 2
+    ? 'Two or more signals point at a wrong station id: compare the plant name and plant email above with the login, then Remap (or Detach) below, and tell sales if the id came from the Odoo lead.'
+    : 'Only the names differ: usually the profile name is the odd one — fix it under Customer profile — or, if the plant is this customer\'s business, church or relative, tick Manually verified.';
+  return `<div class="verdict" style="margin-top:8px"><b>${head}</b><ul style="margin:6px 0 0 18px;padding:0">${w.signals.map(s => `<li>${esc(s)}</li>`).join('')}</ul><div class="hint" style="margin-top:6px">${advice}</div></div>`;
+}
 
-async function openPanel(systemId){
+// opts.attach = a station id to prefill in "Add another Solis station" (from
+// Unresolved → Second-station candidates), with opts.reason.
+async function openPanel(systemId, opts={}){
   showPanel(); $('#panel-body').innerHTML = '<p class="muted">Loading…</p>';
   let d; try { d = await api('/monitoring-admin/api/rows/'+systemId); } catch(e) { $('#panel-body').innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; return; }
   const r = d.row; $('#panel-title').textContent = r.full_name || r.system_name || 'Station';
   $('#panel-body').innerHTML = `
     <div class="row"><span class="tag ${r.status==='active'?'ok':''}">${esc(r.status)}</span>${r.is_primary?'<span class="tag ok">primary</span>':'<span class="tag">secondary</span>'}${r.mapping_verified_at?`<span class="tag ok" title="Mapping manually verified by ${esc(r.mapping_verified_by_email||'a removed staff login')} on ${esc(fmtTs(r.mapping_verified_at))}">mapping verified</span>`:''}<span class="muted">login: <span class="mono">${esc(r.login_email||'—')}</span></span></div>
 
-    <h3>Customer profile <span class="muted">(Supabase — ours)</span></h3>
+    <h3>Customer profile <span class="muted">(Supabase — our database)</span></h3>
     <form id="f-profile" class="grid2">
-      ${field('Full name','full_name',r.full_name)}
-      ${field('Phone','phone',r.phone)}
-      ${field('Address','address',r.profile_address)}
+      ${field('Full name','full_name',r.full_name,'text','','Supabase')}
+      ${field('Phone','phone',r.phone,'text','','Supabase')}
+      ${field('Address','address',r.profile_address,'text','','Supabase')}
     </form>
 
-    <h3>Customer <span class="muted">(Odoo)</span></h3>
+    <h3>Customer <span class="muted">(Odoo — our copy of the contact)</span></h3>
     <div class="grid2">
-      ${ro('Odoo customer id (partner)',r.odoo_partner_id,'Odoo',true)}
-      ${ro('Customer name',r.odoo_customer_name,'Odoo')}
-      ${ro('Email',r.odoo_email,'Odoo',true)}
+      ${field('Odoo customer id (partner)','odoo_partner_id',r.odoo_partner_id,'number','form="f-profile"','Odoo')}
+      ${field('Customer name','odoo_customer_name',r.odoo_customer_name,'text','form="f-profile"','Odoo')}
+      ${field('Email','odoo_email',r.odoo_email,'email','form="f-profile"','Odoo')}
     </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="customer" ${r.odoo_partner_id?'':'disabled'}>Validate Odoo customer</button>
-      <span class="hint">Read-only copy of the Odoo contact (${synced(r.profile_odoo_synced_at)}). Wrong here means wrong in Odoo: tell sales, and it refreshes the night after.</span>
+      <span class="hint">${synced(r.profile_odoo_synced_at)}. ${copyHint('Odoo')}</span>
     </div>
     <div class="verdict" id="v-customer" hidden></div>
 
-    <h3>Station <span class="muted">(Supabase — ours)</span></h3>
+    <h3>Station <span class="muted">(Supabase — our database)</span></h3>
     <form id="f-system" class="grid2">
-      ${field('Solis station id','solis_station_id',r.solis_station_id,'text','pattern="\\d{15,20}"')}
-      ${field('Installation date','installation_date',fmtDate(r.installation_date)==='—'?'':fmtDate(r.installation_date),'date')}
-      <div><label>Status</label><select name="status" ${canEdit()?'':'disabled'}>${['active','inactive','decommissioned'].map(s=>`<option ${r.status===s?'selected':''}>${s}</option>`).join('')}</select></div>
-      <div><label>Primary station</label><select name="is_primary" ${canEdit()?'':'disabled'}><option value="true" ${r.is_primary?'selected':''}>yes</option><option value="false" ${!r.is_primary?'selected':''}>no</option></select></div>
+      ${field('Solis station id','solis_station_id',r.solis_station_id,'text','pattern="\\d{15,20}"','Supabase')}
+      ${field('Installation date','installation_date',fmtDate(r.installation_date)==='—'?'':fmtDate(r.installation_date),'date','','Supabase')}
+      <div><label>Status<span class="src supabase">Supabase</span></label><select name="status" ${canEdit()?'':'disabled'}>${['active','inactive','decommissioned','pending'].map(s=>`<option ${r.status===s?'selected':''}>${s}</option>`).join('')}</select></div>
+      <div><label>Primary station<span class="src supabase">Supabase</span></label><select name="is_primary" ${canEdit()?'':'disabled'}><option value="true" ${r.is_primary?'selected':''}>yes</option><option value="false" ${!r.is_primary?'selected':''}>no</option></select></div>
+      ${field('Station address','address',r.address,'text','','Supabase')}
     </form>
     <p class="hint" style="margin:6px 0 0">The station id is our mapping — which Solis plant this customer's data comes from. To change it, prefer <b>Remap</b> below: it quarantines the history recorded under the wrong id, a plain edit here keeps it.</p>
 
-    <h3>Plant <span class="muted">(Solis)</span></h3>
+    <h3>Plant <span class="muted">(Solis — our copy of the plant)</span></h3>
     <div class="grid2">
-      ${ro('Plant name',r.solis_plant_name,'Solis')}
-      ${ro('Plant email',r.solis_user_email,'Solis',true)}
-      ${ro('Capacity kWp',r.capacity_kwp,'Solis')}
-      ${r.system_name && r.system_name!==r.solis_plant_name ? ro('System name — realigned to the plant name nightly',r.system_name,'Solis') : ''}
+      ${field('Plant name','solis_plant_name',r.solis_plant_name,'text','form="f-system"','Solis')}
+      ${field('Plant email','solis_user_email',r.solis_user_email,'email','form="f-system"','Solis')}
+      ${field('Capacity kWp','capacity_kwp',r.capacity_kwp,'number','form="f-system" step="0.01"','Solis')}
+      ${field('Battery kWh','battery_capacity_kwh',r.battery_capacity_kwh,'number','form="f-system" step="0.1"','Solis')}
+      ${field('System name (reset to the plant name nightly)','system_name',r.system_name,'text','form="f-system"','Solis')}
     </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="station" ${r.solis_station_id?'':'disabled'}>Validate Solis station</button>
-      <span class="hint">Read-only copy of Solis Cloud for the station id above (${synced(r.solis_synced_at)}). A wrong name, email or capacity is fixed in Solis Cloud; a wrong <i>plant</i> is fixed with Remap.</span>
+      <span class="hint">${synced(r.solis_synced_at)}. ${copyHint('Solis Cloud')} A wrong <i>plant</i>, not just a wrong name, is fixed with Remap.</span>
     </div>
     <div class="verdict" id="v-station" hidden></div>
+    ${wrongStationBox(r, d.wrong_station)}
     <label class="row hint" style="margin-top:8px"><input type="checkbox" id="map-verified" ${r.mapping_verified_at?'checked':''} ${canEdit()&&r.solis_station_id?'':'disabled'}> <span><b>Manually verified</b> — this Solis station belongs to this customer; hide it from Unresolved → <i>Possible wrong station</i>. Cleared automatically if the station id is remapped or edited.${r.mapping_verified_at?` <span class="muted">Verified by <b>${esc(r.mapping_verified_by_email||'a removed staff login')}</b> on ${esc(fmtTs(r.mapping_verified_at))}${r.mapping_verified_note?` — “${esc(r.mapping_verified_note)}”`:''}</span>`:''}</span></label>
 
-    <h3>Lead <span class="muted">(Odoo)</span></h3>
+    <h3>Lead <span class="muted">(Odoo — our copy of the lead)</span></h3>
     <div class="grid2">
-      ${ro('Odoo lead id',r.odoo_lead_id,'Odoo',true)}
-      ${ro('Lead name',r.odoo_lead_name,'Odoo')}
-      ${ro('Lead email',r.odoo_lead_email,'Odoo',true)}
-      ${ro('Stage',r.odoo_stage,'Odoo')}
+      ${field('Odoo lead id','odoo_lead_id',r.odoo_lead_id,'number','form="f-system"','Odoo')}
+      ${field('Lead name','odoo_lead_name',r.odoo_lead_name,'text','form="f-system"','Odoo')}
+      ${field('Lead email','odoo_lead_email',r.odoo_lead_email,'email','form="f-system"','Odoo')}
+      ${field('Stage','odoo_stage',r.odoo_stage,'text','form="f-system"','Odoo')}
     </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="lead" ${r.odoo_lead_id?'':'disabled'}>Validate Odoo lead</button>
-      <span class="hint">Read-only copy of the Odoo lead whose “CRM Design Solis Station ID” is the station id above (${synced(r.odoo_synced_at)}). Empty means no lead in Odoo carries this id. Fixes go to sales.</span>
+      <span class="hint">The lead whose “CRM Design Solis Station ID” is the station id above (empty = no lead in Odoo carries it). ${synced(r.odoo_synced_at)}. ${copyHint('Odoo')}</span>
     </div>
     <div class="verdict" id="v-lead" hidden></div>
 
@@ -517,6 +566,11 @@ async function openPanel(systemId){
     $('#btn-backfill').onclick = () => queueBackfill(r);
     $('#btn-add-station').onclick = () => addStation(r);
     $('#map-verified').onchange = e => setMappingVerified(r, e.target.checked);
+    if (opts.attach) {
+      const det = $('#add-sid').closest('details');
+      det.open = true; $('#add-sid').value = opts.attach; $('#add-reason').value = opts.reason || '';
+      det.scrollIntoView({block:'center'});
+    }
   }
 }
 // The "possible wrong station" scan is a name heuristic; it cannot clear a
@@ -598,8 +652,10 @@ function formDiff(form, original, numeric=[]){
 }
 async function saveAll(r){
   const reason = $('#reason').value.trim();
-  const sysFields = formDiff($('#f-system'), r);
-  const profFields = formDiff($('#f-profile'), Object.assign({}, r, {address:r.profile_address}));
+  // FormData(form) also collects the inputs that point at the form with form="f-…"
+  // from the Odoo / Solis blocks.
+  const sysFields = formDiff($('#f-system'), r, ['capacity_kwp','battery_capacity_kwh','odoo_lead_id']);
+  const profFields = formDiff($('#f-profile'), Object.assign({}, r, {address:r.profile_address}), ['odoo_partner_id']);
   const bf = $('#bf-after').checked ? {granularity: $('#bf-gran').value, days: Number($('#bf-days').value)} : null;
   if (!Object.keys(sysFields).length && !Object.keys(profFields).length && !bf) return toast('Nothing changed');
   try {
@@ -629,9 +685,11 @@ async function validate(kind, r){
     : 'Checking…';
   try {
     let res;
-    if (kind==='station') res = await api('/admin/validate/solis-station', {method:'POST', body:{station_id: $('#f-system [name=solis_station_id]').value.trim() || r.solis_station_id, for_user_id: r.user_id}});
-    if (kind==='lead') res = await api('/admin/validate/odoo-lead', {method:'POST', body:{lead_id: Number(r.odoo_lead_id), expected_station_id: r.solis_station_id}});
-    if (kind==='customer') res = await api('/admin/validate/odoo-customer', {method:'POST', body:{partner_id: Number(r.odoo_partner_id)}});
+    // Validate what is typed in the box (possibly unsaved), falling back to the stored value.
+    const typed = n => { const el = $('#panel-body [name='+n+']'); return el ? el.value.trim() : ''; };
+    if (kind==='station') res = await api('/admin/validate/solis-station', {method:'POST', body:{station_id: typed('solis_station_id') || r.solis_station_id, for_user_id: r.user_id}});
+    if (kind==='lead') res = await api('/admin/validate/odoo-lead', {method:'POST', body:{lead_id: Number(typed('odoo_lead_id') || r.odoo_lead_id), expected_station_id: typed('solis_station_id') || r.solis_station_id}});
+    if (kind==='customer') res = await api('/admin/validate/odoo-customer', {method:'POST', body:{partner_id: Number(typed('odoo_partner_id') || r.odoo_partner_id)}});
     box.innerHTML = summarizeVerdict(res);
   } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
 }
@@ -773,10 +831,10 @@ async function loadUnresolved(){
         ${(o.failures||[]).map(f => `<tr><td>${esc(f.full_name)}</td><td class="mono">${esc(f.email)}</td><td class="mono">${esc(f.station_id)}</td><td class="muted">${esc(f.error)}</td></tr>`).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
         </tbody></table></div>
 
-      <div class="card sect"><h3 style="margin-top:0">Second-station candidates <span class="muted">— an Odoo lead whose email already has a login</span></h3>
-        <p class="hint">The nightly job refuses to repoint an existing login. Click the customer and use “Add another Solis station”.</p>
-        <table><thead><tr><th>Customer</th><th>Login email</th><th>New station (Odoo)</th><th>Existing station</th></tr></thead><tbody>
-        ${(o.second_station_candidates||[]).map(c => { const r = byEmail[(c.email||'').toLowerCase()]; return `<tr ${r?`data-row-open="${r.system_id}"`:''}><td>${esc(c.full_name)}${r?'':' <span class="tag" title="This email has no station row in the grid, so there is no record to open">no login row</span>'}</td><td class="mono">${esc(c.email)}</td><td class="mono">${esc(c.station_id)}</td><td class="mono">${esc(c.existing_station_id)}</td></tr>`; }).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
+      <div class="card sect"><h3 style="margin-top:0">Second-station candidates <span class="muted">— an Odoo lead carries a Solis station id that is not in our database, and the lead's email already has a login holding a different station</span></h3>
+        <p class="hint">The nightly onboarding refuses to repoint an existing login, so these wait for a person. <b>Genuine second property</b> (same customer, another plant): click the row — the record opens with <i>Add another Solis station</i> prefilled with the new id and a reason; <i>Validate</i>, then <i>Add</i>. The plant is attached to the same login and its history backfilled. <b>Duplicate lead, or a wrong id on the lead</b> (the plant is someone else's, or two leads describe one plant): nothing to add — tell sales to fix the lead; the row disappears the night after. <b>A different person behind the same email</b> (family, an installer's inbox): a view grant under <i>Who can view this station</i>, or a separate login — not a second station.</p>
+        <table><thead><tr><th>Plant name (Solis, new station)</th><th>Email on the Odoo lead = existing login</th><th>New station id (Odoo lead)</th><th>Station this login already holds</th></tr></thead><tbody>
+        ${(o.second_station_candidates||[]).map(c => { const r = byEmail[(c.email||'').toLowerCase()]; const reason = `Second-station candidate from nightly onboarding (${fmtDate(o.ran_at)}): Odoo lead for "${c.full_name}" carries station ${c.station_id}; login ${c.email} already holds ${c.existing_station_id}`; return `<tr ${r?`data-row-open="${r.system_id}" data-attach="${esc(c.station_id)}" data-attach-reason="${esc(reason)}"`:''}><td>${esc(c.full_name)}${r?'':' <span class="tag" title="This email has no station row in the grid, so there is no record to open">no login row</span>'}</td><td class="mono">${esc(c.email)}</td><td class="mono">${esc(c.station_id)}</td><td class="mono">${esc(c.existing_station_id)}</td></tr>`; }).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Profiles without a station</h3>
@@ -800,7 +858,7 @@ async function loadUnresolved(){
     el.onclick = e => {
       if (e.target.closest('button,a,input,select,textarea,label')) return;
       const tr = e.target.closest('tr[data-row-open]');
-      if (tr) openPanel(tr.dataset.rowOpen);
+      if (tr) openPanel(tr.dataset.rowOpen, tr.dataset.attach ? {attach: tr.dataset.attach, reason: tr.dataset.attachReason} : {});
     };
     // The Verified checkboxes (both tables). The row objects carry what the
     // prompt needs; the tab reloads afterwards so the row moves between lists.
@@ -887,11 +945,11 @@ function loadGuide(){
   $('#view-guide').innerHTML = `
   <div class="card" style="max-width:980px;line-height:1.55">
     <h2 style="margin-top:0">How the engineering team fixes customer data here</h2>
-    <p class="hint">Everything you change is recorded in <b>Audit</b> with your name and the reason you typed. Nothing here writes to Odoo — Odoo is the sales team's source of truth; when Odoo is wrong, tell sales and they fix it there, and the nightly sync picks it up the following night (02:00). In a record, every value tagged <span class="src odoo">Odoo</span> or <span class="src solis">Solis</span> is our nightly copy of that system and cannot be typed into here — an edit would be overwritten the next night anyway. Only the two <b>Supabase — ours</b> blocks are edited here: the profile's name, phone and address; the station's Solis station id, installation date, status and primary flag.</p>
+    <p class="hint">Everything you change is recorded in <b>Audit</b> with your name and the reason you typed. Nothing here writes to Odoo — Odoo is the sales team's source of truth; when Odoo is wrong, tell sales and they fix it there, and the nightly sync picks it up the following night (02:00). In a record, every field is tagged with the system it comes from: <span class="src supabase">Supabase</span> is our own data; <span class="src odoo">Odoo</span> and <span class="src solis">Solis</span> are our nightly copies of those systems. All fields can be edited for now, but an edit to a copy changes our database only — nothing is written to Odoo or Solis, and the next nightly sync brings their value back — so fix the source too. Engineering will hand over the list of fields that must stay read-only here; those will then show locked, with the reason on hover. Every table sorts by clicking a column header.</p>
 
     <h3>1. A customer is mapped to the wrong Solis station</h3>
     <ol>
-      <li>Open the customer. Read the <b>Plant (Solis)</b> block: is the <i>Plant name</i> this customer's name? Does the <i>Plant email</i> match the <i>login email</i>? A plant named after someone else with a different email is the wrong station — every day recorded under this customer is that other plant's production. (Unresolved → <i>Possible wrong station</i> lists these automatically.)</li>
+      <li>Open the customer. Under <b>Plant (Solis)</b> a box lists exactly why the record is flagged — the same signals as the table's Signals column — and what usually resolves it. Then read the block: is the <i>Plant name</i> this customer's name? Does the <i>Plant email</i> match the <i>login email</i>? A plant named after someone else with a different email is the wrong station — every day recorded under this customer is that other plant's production. (Unresolved → <i>Possible wrong station</i> lists these automatically.)</li>
       <li><b>Check data vs Solis</b> is a different question: it confirms our stored rows equal Solis for the id we hold. It stays ~99% even on a wrong mapping, so use it after a remap to confirm the backfill, and to catch stale or leftover rows — not to decide identity.</li>
       <li>Find the correct station id (the Odoo lead's "CRM Design Solis Station ID" if sales fixed it, or Solis Cloud). <b>Validate Solis station</b> on it first.</li>
       <li><b>Remap to the correct Solis station</b> → Preview → type the reason in the Save-changes box → Confirm. All readings recorded under the wrong id move to quarantine (kept, not deleted); the plant's name, capacity and first-power date are refreshed from Solis; a backfill of the correct history is queued and runs within 15 minutes.</li>
@@ -905,7 +963,7 @@ function loadGuide(){
     <p>Signals: the Solis plant email matches the login email, and Check data vs Solis agrees. Edit the <b>Customer profile</b> fields, type a reason, Save. Do not remap.</p>
 
     <h3>3. A customer has a second plant</h3>
-    <p>Unresolved → <i>Second-station candidates</i> → click the row → <b>Add another Solis station</b> → station id + reason → Add. Name and capacity come from Solis; a 60-day backfill is queued. Their login stays the same. (The customer app shows one station until the station selector ships.)</p>
+    <p>These are Odoo leads whose station id is not in our database yet, while the lead's email already has a login holding another station. Unresolved → <i>Second-station candidates</i> → click the row: the record opens with <b>Add another Solis station</b> already filled with the new station id and a reason → <i>Validate Solis station</i> → Add. Name and capacity come from Solis; a 60-day backfill is queued. Their login stays the same. (The customer app shows one station until the station selector ships.)</p>
 
     <h3>4. Missing days / refreshing history</h3>
     <p>In the customer panel, pick a date range → <b>Queue backfill</b>. The worker runs every 15 minutes; progress is in <b>Backfills</b>, and the row shows "backfill running/succeeded". A backfill overwrites the dates it fetches with Solis's current values.</p>

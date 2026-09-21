@@ -64,35 +64,39 @@ INDEX_HTML = Path(__file__).parent / "monitoring_admin" / "index.html"
 STATION_ID_RE = re.compile(r"^\d{15,20}$")
 ROLE_RANK = {"readonly": 0, "engineer": 1, "admin": 2}
 
-# Only OUR data is editable here. Everything else on these two tables is a
-# nightly copy of another system and is refused with a pointer to that system:
-# an edit would only change our copy, and the next sync would silently put the
-# other system's value back (identity mirror for odoo_*/solis_plant_name/
-# solis_user_email; sync_to_supabase for system_name/capacity_kwp/battery).
-SYSTEM_FIELDS = {"solis_station_id", "installation_date", "status", "address", "is_primary"}
-PROFILE_FIELDS = {"full_name", "phone", "address", "electricity_provider_id"}
-
-_FIX_IN_ODOO = ("is our nightly copy of Odoo. Fix it in Odoo (sales own it) and the copy "
-                "refreshes here the following night.")
-_FIX_IN_SOLIS = ("is our nightly copy of Solis Cloud. Fix the plant in Solis Cloud and the copy "
-                 "refreshes here the following night; if the plant itself is wrong, use Remap.")
-MIRRORED_FIELDS = {
-    "odoo_lead_id": _FIX_IN_ODOO, "odoo_lead_email": _FIX_IN_ODOO, "odoo_lead_name": _FIX_IN_ODOO,
-    "odoo_stage": _FIX_IN_ODOO, "odoo_partner_id": _FIX_IN_ODOO, "odoo_email": _FIX_IN_ODOO,
-    "odoo_customer_name": _FIX_IN_ODOO,
-    "solis_plant_name": _FIX_IN_SOLIS, "solis_user_email": _FIX_IN_SOLIS, "system_name": _FIX_IN_SOLIS,
-    "capacity_kwp": _FIX_IN_SOLIS, "battery_capacity_kwh": _FIX_IN_SOLIS,
+# Every column on the two tables is editable from the drawer for now (user's
+# decision 2026-09-21: "make them all available for edit"). Edits change OUR
+# database only — nothing here writes to Odoo (sales' system of record) or to
+# Solis (no API for it). The odoo_* / solis_* columns and system_name,
+# capacity_kwp, battery_capacity_kwh are nightly copies, so an edit to one of
+# them is overwritten by the next sync unless the source is fixed too; the
+# drawer says so next to each block.
+SYSTEM_FIELDS = {
+    "solis_station_id", "system_name", "capacity_kwp", "installation_date", "status",
+    "address", "battery_capacity_kwh", "is_primary",
+    "odoo_lead_id", "odoo_lead_email", "odoo_lead_name", "odoo_stage",
+    "solis_plant_name", "solis_user_email",
 }
+PROFILE_FIELDS = {
+    "full_name", "phone", "address", "odoo_partner_id", "odoo_email",
+    "odoo_customer_name", "electricity_provider_id",
+}
+
+# Fields the engineering team declares read-only here regardless of role,
+# because they must be changed in the system that owns them. The team will
+# submit the list; add entries as  field -> where to fix it  and both the API
+# (refused with that message) and the drawer (shown, not typed into; the list
+# is sent with /api/me) follow. Empty until the list arrives.
+LOCKED_FIELDS: Dict[str, str] = {}
 
 
 def _refuse_unknown(fields: Dict[str, Any], allowed: set, hint: str = "") -> None:
+    locked = sorted(k for k in fields if k in LOCKED_FIELDS)
+    if locked:
+        raise HTTPException(400, f"Not editable here: {locked[0]} — {LOCKED_FIELDS[locked[0]]}")
     unknown = set(fields) - allowed
-    if not unknown:
-        return
-    mirrored = sorted(k for k in unknown if k in MIRRORED_FIELDS)
-    if mirrored:
-        raise HTTPException(400, f"Not editable here: {mirrored[0]} {MIRRORED_FIELDS[mirrored[0]]}")
-    raise HTTPException(400, f"Not editable here: {sorted(unknown)}{hint}")
+    if unknown:
+        raise HTTPException(400, f"Not editable here: {sorted(unknown)}{hint}")
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +202,8 @@ async def config():
 
 @router.get("/api/me")
 async def me(authorization: str = Header(None)):
-    return await _authenticate_staff(authorization)
+    staff = await _authenticate_staff(authorization)
+    return {**staff, "locked_fields": LOCKED_FIELDS}
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +225,7 @@ active_job as (
     from public.backfill_jobs where status in ('queued','running')
     order by system_id, queued_at desc)
 select s.id as system_id, s.user_id, s.system_name, s.capacity_kwp, s.installation_date,
-       s.status, s.is_primary, s.address,
+       s.status, s.is_primary, s.address, s.battery_capacity_kwh,
        s.solis_station_id, s.solis_plant_name, s.solis_user_email, s.solis_validated_at, s.solis_validation,
        s.odoo_lead_id, s.odoo_lead_email, s.odoo_lead_name, s.odoo_stage,
        s.odoo_synced_at, s.solis_synced_at, p.odoo_synced_at as profile_odoo_synced_at,
@@ -296,7 +301,13 @@ async def row_detail(system_id: uuid.UUID, authorization: str = Header(None)):
         jobs = conn.execute(
             "select * from public.backfill_jobs where system_id = %s order by queued_at desc limit 20",
             (system_id,)).fetchall()
-    return {"row": _j(row), "other_systems": _j(siblings), "audit": _j(audit), "jobs": _j(jobs)}
+        # Why (if at all) this record sits under Unresolved → Possible wrong
+        # station: the same heuristic the tab uses, for this one row, so the
+        # drawer can spell the reasons out next to the plant fields.
+        suspect_row = conn.execute(SUSPECT_SQL + " and s.id = %s", (system_id,)).fetchone()
+    wrong = _wrong_station_signals(suspect_row) if suspect_row else None
+    return {"row": _j(row), "other_systems": _j(siblings), "audit": _j(audit), "jobs": _j(jobs),
+            "wrong_station": wrong}
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +368,9 @@ async def edit_system(system_id: uuid.UUID, body: EditRequest, authorization: st
         if sid and not STATION_ID_RE.match(sid):
             raise HTTPException(400, "Solis station id must be 15–20 digits")
         fields["solis_station_id"] = sid
+    for k in ("odoo_lead_id", "capacity_kwp", "battery_capacity_kwh", "installation_date"):
+        if k in fields and fields[k] in ("", None):
+            fields[k] = None
 
     request_id = str(uuid.uuid4())
     try:
@@ -451,8 +465,9 @@ async def edit_profile(user_id: uuid.UUID, body: EditRequest, authorization: str
     fields = dict(body.fields)
     if not fields:
         raise HTTPException(400, "Nothing to change")
-    if "electricity_provider_id" in fields and fields["electricity_provider_id"] in ("", None):
-        fields["electricity_provider_id"] = None
+    for k in ("odoo_partner_id", "electricity_provider_id"):
+        if k in fields and fields[k] in ("", None):
+            fields[k] = None
     request_id = str(uuid.uuid4())
     try:
         with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
@@ -1076,6 +1091,66 @@ async def audit(table: Optional[str] = None, row_pk: Optional[str] = None,
     return {"audit": _j(data)}
 
 
+# One row per mapped station with the three names and three emails the
+# "possible wrong station" heuristic compares. Shared by the Unresolved tab
+# (all rows) and the record drawer (one row), so both spell out the same reasons.
+SUSPECT_SQL = """
+select s.id as system_id, p.full_name, s.solis_plant_name,
+       coalesce(p.odoo_customer_name, s.odoo_lead_name) as odoo_name,
+       u.email as login_email, s.solis_user_email,
+       coalesce(p.odoo_email, s.odoo_lead_email) as odoo_email,
+       s.solis_station_id, s.odoo_lead_id, s.mapping_verified_at,
+       (select count(*) from public.energy_readings r where r.system_id = s.id) as readings
+  from public.solar_systems s
+  left join public.user_profiles p on p.id = s.user_id
+  left join auth.users u on u.id = s.user_id
+ where s.solis_station_id is not null and s.solis_plant_name is not null
+"""
+
+
+def _wrong_station_signals(r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The 'possible wrong station' heuristic for ONE row.
+
+    None when the Solis plant name shares a word with the customer's name (not
+    flagged). Otherwise the list of signals an engineer reads to decide, and a
+    score = how many of them point at a wrong station id rather than at a wrong
+    profile name. Two very different causes look alike here, so every signal is
+    reported and the engineer decides — "Check data vs Solis" and the emails
+    usually settle it:
+      * the Odoo lead carries another plant's station id  → remap + tell sales
+      * the customer's PROFILE name is wrong (nickname, email as name)
+        while the mapping is right                          → edit the profile
+      * the mapping is right and the plant is simply named after a business,
+        a church, a relative or a lot number (28 of 30 on 2026-09-19) — the
+        heuristic can never clear these; the engineer ticks "manually
+        verified" (mapping_verified_at) and the row leaves the scan.
+    """
+    nt, pt, ot = _name_tokens(r["full_name"]), _name_tokens(r["solis_plant_name"]), _name_tokens(r["odoo_name"])
+    if not (nt and pt) or (nt & pt):
+        return None
+    signals = ["Solis plant name shares no word with the customer's name"]
+    score = 1
+    if ot and not (nt & ot):
+        signals.append("Odoo name also differs from the customer's name"); score += 1
+    le, se = (r["login_email"] or "").lower(), (r["solis_user_email"] or "").lower()
+    if se and le and se != le:
+        signals.append("Solis plant email differs from the login email"); score += 1
+    elif se and le and se == le:
+        signals.append("Solis plant email MATCHES the login email → mapping is probably right; the profile name is the odd one")
+    if pt and ot and (pt & ot):
+        signals.append("plant name matches the ODOO name → the profile name is probably what's wrong")
+    # Household: the plant carries a relative's name, and that name is in
+    # the customer's own login address (genpastrana_delacruz@ ↔ "Helen Pastrana").
+    if le and any(w in le.split("@")[0] for w in pt if len(w) > 3):
+        signals.append("the login email contains a word of the plant name → same household, mapping is probably right")
+    # Organisation: a church, shop or company plant named after the entity,
+    # with the customer as its contact person.
+    if re.search(r"\b(ministr|church|grocery|store|shop|inc|corp|co\b|school|clinic|hoa|homes|depot|station|resort|farm)",
+                 (r["solis_plant_name"] or "").lower()):
+        signals.append("plant name looks like an organisation → the customer is probably its contact person")
+    return {"score": score, "signals": signals}
+
+
 @router.get("/api/unresolved")
 async def unresolved(authorization: str = Header(None)):
     """Everything the nightly pipeline cannot fix by itself. Odoo-side items are
@@ -1109,18 +1184,7 @@ async def unresolved(authorization: str = Header(None)):
         run = conn.execute(
             "select ran_at, candidates, created, failed, duplicate_email, missing_email, duplicate_station, report "
             "from public.onboarding_runs order by ran_at desc limit 1").fetchone()
-        suspects_raw = conn.execute(
-            """select s.id as system_id, p.full_name, s.solis_plant_name,
-                      coalesce(p.odoo_customer_name, s.odoo_lead_name) as odoo_name,
-                      u.email as login_email, s.solis_user_email,
-                      coalesce(p.odoo_email, s.odoo_lead_email) as odoo_email,
-                      s.solis_station_id, s.odoo_lead_id,
-                      (select count(*) from public.energy_readings r where r.system_id = s.id) as readings
-                 from public.solar_systems s
-                 left join public.user_profiles p on p.id = s.user_id
-                 left join auth.users u on u.id = s.user_id
-                where s.solis_station_id is not null and s.solis_plant_name is not null
-                  and s.mapping_verified_at is null""").fetchall()
+        suspects_raw = conn.execute(SUSPECT_SQL + " and s.mapping_verified_at is null").fetchall()
         # The register of mappings an engineer has ticked "manually verified".
         # Returned separately so the page can show them collapsed and a tick
         # made in error can be undone from the same place.
@@ -1162,30 +1226,9 @@ async def unresolved(authorization: str = Header(None)):
     #     verified" (mapping_verified_at) and the row leaves this scan.
     suspects = []
     for r in suspects_raw:
-        nt, pt, ot = _name_tokens(r["full_name"]), _name_tokens(r["solis_plant_name"]), _name_tokens(r["odoo_name"])
-        if not (nt and pt) or (nt & pt):
-            continue
-        signals = ["Solis plant name shares no word with the customer's name"]
-        score = 1
-        if ot and not (nt & ot):
-            signals.append("Odoo name also differs from the customer's name"); score += 1
-        le, se = (r["login_email"] or "").lower(), (r["solis_user_email"] or "").lower()
-        if se and le and se != le:
-            signals.append("Solis plant email differs from the login email"); score += 1
-        elif se and le and se == le:
-            signals.append("Solis plant email MATCHES the login email → mapping is probably right; the profile name is the odd one")
-        if pt and ot and (pt & ot):
-            signals.append("plant name matches the ODOO name → the profile name is probably what's wrong")
-        # Household: the plant carries a relative's name, and that name is in
-        # the customer's own login address (genpastrana_delacruz@ ↔ "Helen Pastrana").
-        if le and any(w in le.split("@")[0] for w in pt if len(w) > 3):
-            signals.append("the login email contains a word of the plant name → same household, mapping is probably right")
-        # Organisation: a church, shop or company plant named after the entity,
-        # with the customer as its contact person.
-        if re.search(r"\b(ministr|church|grocery|store|shop|inc|corp|co\b|school|clinic|hoa|homes|depot|station|resort|farm)",
-                     (r["solis_plant_name"] or "").lower()):
-            signals.append("plant name looks like an organisation → the customer is probably its contact person")
-        suspects.append({**dict(r), "score": score, "signals": signals, "suggested_stations": []})
+        verdict = _wrong_station_signals(r)
+        if verdict:
+            suspects.append({**dict(r), **verdict, "suggested_stations": []})
     suspects.sort(key=lambda x: (-x["score"], -(x["readings"] or 0)))
 
     # For each verified mapping, say whether the name heuristic would still
