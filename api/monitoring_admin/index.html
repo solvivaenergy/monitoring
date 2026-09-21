@@ -379,7 +379,30 @@ function field(label, name, value, type='text', attrs='', src=''){
   return `<div><label>${label}${tag}</label><input name="${name}" type="${type}" value="${esc(value ?? '')}" ${canEdit()?'':'disabled'} ${attrs}></div>`;
 }
 const synced = (ts) => ts ? `Last synced ${fmtTs(ts)}` : 'Not synced yet';
-const copyHint = (src) => `Edits here change our database only — nothing is written to ${src}, and the nightly sync brings ${src}'s value back; to make a change stick, fix it in ${src} too.`;
+const copyHint = (src) => `Edits here change our database only — nothing is written to ${src}, and the nightly sync (or the Refresh button) brings ${src}'s value back; to make a change stick, fix it in ${src} too.`;
+// Re-read ONE record from Odoo / Solis Cloud now and update our copy — what
+// the nightly jobs do for every row once a day. Reads the source, writes ours;
+// the changed fields land in Audit under the engineer's name.
+const FIELD_LABELS = {odoo_lead_id:'Odoo lead id', odoo_lead_email:'Lead email', odoo_lead_name:'Lead name', odoo_stage:'Stage',
+  odoo_partner_id:'Odoo customer id', odoo_email:'Customer email (Odoo)', odoo_customer_name:'Customer name (Odoo)',
+  solis_plant_name:'Plant name', solis_user_email:'Plant email', system_name:'System name', capacity_kwp:'Capacity kWp', battery_capacity_kwh:'Battery kWh'};
+async function refreshFrom(src, boxId, r){
+  const box = $('#'+boxId), label = src==='odoo' ? 'Odoo' : 'Solis Cloud';
+  box.hidden = false; box.textContent = src==='odoo' ? 'Reading the Odoo lead and its contact…' : 'Reading the plant and its inverter from Solis Cloud… (10–30 s)';
+  try {
+    const v = await api(`/monitoring-admin/api/systems/${r.system_id}/refresh-${src}`, {method:'POST', body:{}});
+    if (v.found === false) { box.innerHTML = `<span class="tag warn">not found</span> ${esc(v.message)}`; return; }
+    // Show the fresh copy in the inputs without re-rendering, so this box stays visible.
+    Object.entries(v.values||{}).forEach(([k,val]) => { const el = $('#panel-body [name='+k+']'); if (el) el.value = val ?? ''; });
+    Object.assign(r, v.values||{});
+    const keys = Object.keys(v.changed||{});
+    box.innerHTML = (keys.length
+        ? `<b>Updated ${keys.length} field${keys.length>1?'s':''} from ${label}</b><ul style="margin:6px 0 0 18px;padding:0">${keys.map(k => `<li>${esc(FIELD_LABELS[k]||k)}: <s>${esc(v.changed[k].old ?? '—')}</s> → <b>${esc(v.changed[k].new ?? '—')}</b></li>`).join('')}</ul>`
+        : `<span class="tag ok">up to date</span> Our copy already matched ${label}.`)
+      + `<div class="hint" style="margin-top:6px">Synced ${fmtTs(v.synced_at)}.${v.collision?` <span class="tag warn">${v.lead_ids.length} leads carry this station id in Odoo (${v.lead_ids.join(', ')}) — the newest was used; sales should remove it from the wrong one.</span>`:''}${keys.length?' Recorded in Audit under your name.':''}</div>`;
+    if (keys.length) loadRows(true);
+  } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
+}
 // Why (if at all) this record is listed under Unresolved → Possible wrong
 // station: the server sends the same signals the tab shows, for this one row.
 function wrongStationBox(r, w){
@@ -417,6 +440,7 @@ async function openPanel(systemId, opts={}){
     </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="customer" ${r.odoo_partner_id?'':'disabled'}>Validate Odoo customer</button>
+      <button class="btn sm" data-refresh="odoo" data-box="v-customer" ${canEdit()&&r.solis_station_id?'':'disabled'} title="Re-read the Odoo lead that carries this station id, and its contact, and update our copy now">Refresh from Odoo now</button>
       <span class="hint">${synced(r.profile_odoo_synced_at)}. ${copyHint('Odoo')}</span>
     </div>
     <div class="verdict" id="v-customer" hidden></div>
@@ -441,6 +465,7 @@ async function openPanel(systemId, opts={}){
     </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="station" ${r.solis_station_id?'':'disabled'}>Validate Solis station</button>
+      <button class="btn sm" data-refresh="solis" data-box="v-station" ${canEdit()&&r.solis_station_id?'':'disabled'} title="Re-read the plant from Solis Cloud (name, email, capacity, battery) and update our copy now">Refresh from Solis now</button>
       <span class="hint">${synced(r.solis_synced_at)}. ${copyHint('Solis Cloud')} A wrong <i>plant</i>, not just a wrong name, is fixed with Remap.</span>
     </div>
     <div class="verdict" id="v-station" hidden></div>
@@ -456,6 +481,7 @@ async function openPanel(systemId, opts={}){
     </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="lead" ${r.odoo_lead_id?'':'disabled'}>Validate Odoo lead</button>
+      <button class="btn sm" data-refresh="odoo" data-box="v-lead" ${canEdit()&&r.solis_station_id?'':'disabled'} title="Re-read the Odoo lead that carries this station id, and its contact, and update our copy now">Refresh from Odoo now</button>
       <span class="hint">The lead whose “CRM Design Solis Station ID” is the station id above (empty = no lead in Odoo carries it). ${synced(r.odoo_synced_at)}. ${copyHint('Odoo')}</span>
     </div>
     <div class="verdict" id="v-lead" hidden></div>
@@ -554,6 +580,7 @@ async function openPanel(systemId, opts={}){
 
   $$('#panel-body [data-open]').forEach(a => a.onclick = e => { e.preventDefault(); openPanel(a.dataset.open); });
   $$('#panel-body [data-validate]').forEach(b => b.onclick = () => validate(b.dataset.validate, r));
+  $$('#panel-body [data-refresh]').forEach(b => b.onclick = () => refreshFrom(b.dataset.refresh, b.dataset.box, r));
   $('#btn-reconcile').onclick = () => reconcileSystem(r);
   loadAccess(r);
   if (canEdit()) {
@@ -945,7 +972,7 @@ function loadGuide(){
   $('#view-guide').innerHTML = `
   <div class="card" style="max-width:980px;line-height:1.55">
     <h2 style="margin-top:0">How the engineering team fixes customer data here</h2>
-    <p class="hint">Everything you change is recorded in <b>Audit</b> with your name and the reason you typed. Nothing here writes to Odoo — Odoo is the sales team's source of truth; when Odoo is wrong, tell sales and they fix it there, and the nightly sync picks it up the following night (02:00). In a record, every field is tagged with the system it comes from: <span class="src supabase">Supabase</span> is our own data; <span class="src odoo">Odoo</span> and <span class="src solis">Solis</span> are our nightly copies of those systems. All fields can be edited for now, but an edit to a copy changes our database only — nothing is written to Odoo or Solis, and the next nightly sync brings their value back — so fix the source too. Engineering will hand over the list of fields that must stay read-only here; those will then show locked, with the reason on hover. Every table sorts by clicking a column header.</p>
+    <p class="hint">Everything you change is recorded in <b>Audit</b> with your name and the reason you typed. Nothing here writes to Odoo — Odoo is the sales team's source of truth; when Odoo is wrong, tell sales and they fix it there, and the nightly sync picks it up the following night (02:00). In a record, every field is tagged with the system it comes from: <span class="src supabase">Supabase</span> is our own data; <span class="src odoo">Odoo</span> and <span class="src solis">Solis</span> are our nightly copies of those systems. All fields can be edited for now, but an edit to a copy changes our database only — nothing is written to Odoo or Solis, and the next nightly sync brings their value back — so fix the source too. Engineering will hand over the list of fields that must stay read-only here; those will then show locked, with the reason on hover. <b>Refresh from Odoo now</b> and <b>Refresh from Solis now</b> re-read that one record from its source and update our copy immediately, so a fix made in Odoo or Solis Cloud shows here in seconds instead of the next morning; nothing is written to Odoo or Solis. Every table sorts by clicking a column header.</p>
 
     <h3>1. A customer is mapped to the wrong Solis station</h3>
     <ol>

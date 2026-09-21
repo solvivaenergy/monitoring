@@ -55,7 +55,8 @@ from pydantic import BaseModel, Field
 from . import db
 from .backfill_history import PHT, parse_month_day
 from .solis_client import SolisCloudClient
-from .validation_routes import _authenticate_staff, _get_roster
+from .onboard_from_odoo import DEFAULT_FIELD_NAME
+from .validation_routes import _authenticate_staff, _get_roster, _odoo_search_read
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/monitoring-admin", tags=["Monitoring Admin"])
@@ -1297,6 +1298,177 @@ async def suspect_suggestions(authorization: str = Header(None)):
         if hits:
             out[str(r["system_id"])] = sorted(hits, key=lambda h: (not h["email_matches_login"], h["plant_name"] or ""))
     return {"suggestions": out, "unassigned_in_roster": len(unassigned), "roster_stale": stale}
+
+
+# ---------------------------------------------------------------------------
+# on-demand refresh of our Odoo / Solis copy for ONE record
+# ---------------------------------------------------------------------------
+#
+# The nightly jobs (sync_identity_mirror, sync_to_supabase) refresh every row
+# once a day. These two endpoints do the same for one record, now, so a fix
+# made in Odoo or in Solis Cloud shows here in seconds. They READ the source
+# and WRITE our copy — never the other way round — and the 08 trigger attributes
+# every changed field to the engineer who pressed the button.
+
+def _clean_odoo(v: Any) -> Optional[str]:
+    if v in (None, False, ""):
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _diff(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """{field: {old, new}} for the fields whose value actually changes."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for k, v in new.items():
+        o = old.get(k)
+        if o in (None, "") and v in (None, ""):
+            continue
+        if _j(o) != _j(v):
+            out[k] = {"old": _j(o), "new": _j(v)}
+    return out
+
+
+@router.post("/api/systems/{system_id}/refresh-odoo")
+async def refresh_from_odoo(system_id: uuid.UUID, authorization: str = Header(None)):
+    """Re-read the Odoo lead that carries this station id (and its contact) and
+    update our odoo_* copy — the nightly mirror's logic for one row. Newest lead
+    wins when two leads carry the id, as in the mirror; the response says so."""
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "engineer")
+    with db.connect(autocommit=True) as conn:
+        s = conn.execute(
+            """select s.id, s.user_id, s.is_primary, s.solis_station_id,
+                      s.odoo_lead_id, s.odoo_lead_email, s.odoo_lead_name, s.odoo_stage,
+                      p.odoo_partner_id, p.odoo_email, p.odoo_customer_name
+                 from public.solar_systems s left join public.user_profiles p on p.id = s.user_id
+                where s.id = %s""", (system_id,)).fetchone()
+    if not s:
+        raise HTTPException(404, "No such system")
+    sid = s["solis_station_id"]
+    if not sid:
+        raise HTTPException(400, "This system has no Solis station id; the Odoo lead is found through the station id on the lead")
+    try:
+        leads = await _odoo_search_read(
+            "crm.lead", [[DEFAULT_FIELD_NAME, "=", sid]],
+            ["id", "name", "partner_name", "contact_name", "email_from", "stage_id", "partner_id"])
+    except Exception as exc:
+        raise HTTPException(502, f"Odoo did not answer: {str(exc)[:160]}")
+    if not leads:
+        return {"ok": True, "found": False, "changed": {},
+                "message": f"No lead in Odoo carries station id {sid}. Our copy was left as it was; "
+                           f"if the id was removed from the lead on purpose, sales should say which lead is right."}
+    lead = max(leads, key=lambda l: l["id"])
+    partner = None
+    if lead.get("partner_id"):
+        try:
+            found = await _odoo_search_read("res.partner", [["id", "=", lead["partner_id"][0]]], ["id", "name", "email"])
+        except Exception as exc:
+            raise HTTPException(502, f"Odoo did not answer for the contact: {str(exc)[:160]}")
+        partner = found[0] if found else None
+
+    new_sys = {
+        "odoo_lead_id": lead["id"],
+        "odoo_lead_email": _clean_odoo(lead.get("email_from")),
+        "odoo_lead_name": _clean_odoo(lead.get("partner_name")) or _clean_odoo(lead.get("contact_name")) or _clean_odoo(lead.get("name")),
+        "odoo_stage": _clean_odoo(lead["stage_id"][1]) if lead.get("stage_id") else None,
+    }
+    new_prof = None
+    if s["is_primary"] and s["user_id"]:
+        new_prof = {
+            "odoo_partner_id": partner["id"] if partner else None,
+            "odoo_email": (_clean_odoo(partner.get("email")) if partner else None) or new_sys["odoo_lead_email"],
+            "odoo_customer_name": (_clean_odoo(partner.get("name")) if partner else None) or new_sys["odoo_lead_name"],
+        }
+    changed = _diff(dict(s), new_sys)
+    if new_prof:
+        changed.update(_diff(dict(s), new_prof))
+
+    request_id = str(uuid.uuid4())
+    try:
+        with db.audited(staff["id"], staff["email"], "Refresh from Odoo now", request_id=request_id) as conn:
+            conn.execute(
+                """update public.solar_systems
+                      set odoo_lead_id = %s, odoo_lead_email = %s, odoo_lead_name = %s, odoo_stage = %s,
+                          odoo_synced_at = now(), updated_at = now()
+                    where id = %s""",
+                (new_sys["odoo_lead_id"], new_sys["odoo_lead_email"], new_sys["odoo_lead_name"], new_sys["odoo_stage"], system_id))
+            if new_prof:
+                conn.execute(
+                    """update public.user_profiles
+                          set odoo_partner_id = %s, odoo_email = %s, odoo_customer_name = %s,
+                              odoo_synced_at = now(), updated_at = now()
+                        where id = %s""",
+                    (new_prof["odoo_partner_id"], new_prof["odoo_email"], new_prof["odoo_customer_name"], s["user_id"]))
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+    _invalidate_rows()
+    return {"ok": True, "found": True, "request_id": request_id, "changed": changed,
+            "values": {**new_sys, **(new_prof or {})}, "synced_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "collision": len(leads) > 1, "lead_ids": sorted(l["id"] for l in leads),
+            "profile_updated": bool(new_prof)}
+
+
+@router.post("/api/systems/{system_id}/refresh-solis")
+async def refresh_from_solis(system_id: uuid.UUID, authorization: str = Header(None)):
+    """Re-read the plant from Solis Cloud (stationDetail, plus the inverter's
+    battery capacity) and update our solis_* / system_name / capacity copy —
+    what the nightly daily sync writes, for one row."""
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "engineer")
+    with db.connect(autocommit=True) as conn:
+        s = conn.execute(
+            """select id, solis_station_id, solis_plant_name, solis_user_email, system_name,
+                      capacity_kwp, battery_capacity_kwh
+                 from public.solar_systems where id = %s""", (system_id,)).fetchone()
+    if not s:
+        raise HTTPException(404, "No such system")
+    sid = s["solis_station_id"]
+    if not sid:
+        raise HTTPException(400, "This system has no Solis station id to read")
+    key_id, key_secret = os.getenv("SOLIS_CLOUD_KEY_ID", ""), os.getenv("SOLIS_CLOUD_KEY_SECRET", "")
+    if not key_id or not key_secret:
+        raise HTTPException(500, "Solis credentials are not configured on the server")
+    solis = SolisCloudClient(key_id, key_secret)
+    try:
+        detail = await solis.station_detail(sid)
+    except Exception as exc:
+        raise HTTPException(502, f"Solis did not answer: {str(exc)[:160]}")
+    if not detail:
+        raise HTTPException(502, "Solis returned no detail for this station id — that is either a communication error "
+                                 "or a station that does not exist, and Solis cannot tell them apart. Nothing was changed; "
+                                 "Validate Solis station checks the fleet roster instead.")
+    from .sync_to_supabase import _fetch_battery_capacity_kwh  # best-effort, same as the nightly sync
+    battery = await _fetch_battery_capacity_kwh(solis, sid)
+
+    name = _clean_odoo(detail.get("stationName"))
+    capacity = float(detail.get("capacity") or 0) or None
+    new = {
+        "solis_plant_name": name or s["solis_plant_name"],
+        "system_name": name or s["system_name"],              # the daily sync keeps these two equal
+        "solis_user_email": _clean_odoo(detail.get("userEmail")) or s["solis_user_email"],  # never blank a non-null (04a)
+        "capacity_kwp": capacity if capacity is not None else s["capacity_kwp"],
+        "battery_capacity_kwh": battery if battery is not None else s["battery_capacity_kwh"],
+    }
+    changed = _diff(dict(s), new)
+    request_id = str(uuid.uuid4())
+    try:
+        with db.audited(staff["id"], staff["email"], "Refresh from Solis now", request_id=request_id) as conn:
+            conn.execute(
+                """update public.solar_systems
+                      set solis_plant_name = %s, system_name = %s, solis_user_email = %s,
+                          capacity_kwp = %s, battery_capacity_kwh = %s,
+                          solis_synced_at = now(), updated_at = now()
+                    where id = %s""",
+                (new["solis_plant_name"], new["system_name"], new["solis_user_email"],
+                 new["capacity_kwp"], new["battery_capacity_kwh"], system_id))
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+    _invalidate_rows()
+    return {"ok": True, "request_id": request_id, "changed": changed, "values": _j(new),
+            "synced_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "solis": {"stationName": detail.get("stationName"), "capacity": detail.get("capacity"),
+                      "userEmail": detail.get("userEmail"), "state": detail.get("state")}}
 
 
 # ---------------------------------------------------------------------------
