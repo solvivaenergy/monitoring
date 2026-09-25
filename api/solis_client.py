@@ -47,6 +47,61 @@ class SolisCloudClient:
         self.key_id = key_id
         self.key_secret = key_secret
         self.base_url = base_url.rstrip("/")
+        # One HTTP client per event loop, created on first use (see _http()).
+        self._http_client: Optional[httpx.AsyncClient] = None
+        self._http_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Global request gate (see _gate()); also per loop.
+        self._gate_lock: Optional[asyncio.Lock] = None
+        self._gate_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._last_request_start = 0.0
+
+    def _http(self) -> httpx.AsyncClient:
+        """The shared HTTP client for the running event loop.
+
+        Until 2026-09-25 every call opened its own AsyncClient — a fresh TCP +
+        TLS handshake to soliscloud.com for each of the ~650 stationDay calls a
+        sync run makes. Keep-alive connections remove that from each call. The
+        client is bound to the loop that first used it: FastAPI has one loop
+        for the life of the process, a script has one per asyncio.run(), and
+        a second loop (a thread running its own asyncio.run) simply gets its
+        own client rather than an "attached to a different loop" error.
+        """
+        loop = asyncio.get_running_loop()
+        if self._http_client is None or self._http_loop is not loop:
+            self._http_client = httpx.AsyncClient(
+                timeout=30,
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=32),
+            )
+            self._http_loop = loop
+        return self._http_client
+
+    async def aclose(self) -> None:
+        """Close the shared client. Scripts call this at the end of a run;
+        leaving it open is harmless (connections close with the process)."""
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                pass
+            self._http_client = None
+            self._http_loop = None
+
+    async def _gate(self) -> None:
+        """Space request STARTS at least _MIN_INTERVAL apart across all
+        concurrent tasks, so raising SOLIS_CONCURRENCY in a caller can never
+        push the account past ~10 requests/s. The old per-task sleep after a
+        success only bounded each task, not the sum."""
+        loop = asyncio.get_running_loop()
+        if self._gate_lock is None or self._gate_loop is not loop:
+            self._gate_lock = asyncio.Lock()
+            self._gate_loop = loop
+        async with self._gate_lock:
+            now = time.monotonic()
+            wait = self._last_request_start + self._MIN_INTERVAL - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = time.monotonic()
+            self._last_request_start = now
 
     def _sign(self, body: bytes, path: str) -> Dict[str, str]:
         """Build the signed headers for a Solis Cloud API request."""
@@ -73,8 +128,9 @@ class SolisCloudClient:
             "Authorization": f"API {self.key_id}:{signature}",
         }
 
-    # Rate-limit: max 10 requests per second, with retry + exponential backoff
-    _RATE_LIMIT_DELAY = 0.1   # 100ms between requests (~10 req/s)
+    # Rate-limit: max 10 requests per second ACROSS the process (see _gate),
+    # with retry + exponential backoff.
+    _MIN_INTERVAL = 0.1       # 100ms between request starts (~10 req/s)
     _MAX_RETRIES = 3
     _BACKOFF_BASE = 2.0       # seconds
 
@@ -102,8 +158,8 @@ class SolisCloudClient:
             headers = self._sign(body_bytes, path)
 
             try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    resp = await client.post(url, content=body_bytes, headers=headers)
+                await self._gate()
+                resp = await self._http().post(url, content=body_bytes, headers=headers)
 
                 # Rate-limited (429) or server error (5xx) → retry
                 if resp.status_code == 429 or resp.status_code >= 500:
@@ -176,8 +232,6 @@ class SolisCloudClient:
                     continue
                 raise api_exc
 
-            # Throttle between successful calls
-            await asyncio.sleep(self._RATE_LIMIT_DELAY)
             return data.get("data")
 
         # All retries exhausted

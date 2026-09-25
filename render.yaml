@@ -114,24 +114,37 @@ services:
       - key: ALERT_EMAIL_TO
         sync: false
 
-  # 15-minute interval sync cron: Solis stationDay -> Supabase energy_readings_five_minutes
+  # Five-minute sync cron: Solis stationDay -> Supabase energy_readings_five_minutes
   #
-  # To run it every 5 minutes (near-live curves): change the schedule to
-  # "*/5 * * * *" — nothing else. Since 2026-09-25 a run writes only the points
-  # newer than each station's watermark (one request to five_minute_watermarks)
-  # and fetches stationAll once an hour, so a run is ~600 Solis calls and a
-  # handful of upserts. Before flipping, read one run's duration in this
-  # service's Render log: it must finish well inside 5 minutes, or Render
-  # skips the next run. If Solis starts answering 429/502 in bursts, that is
-  # the rate limit on our key — back off to */10 rather than lowering
-  # SOLIS_CONCURRENCY blindly.
+  # Every 5 minutes since 2026-09-25 (was */15). A run writes only the points
+  # newer than each station's watermark (one request to five_minute_watermarks),
+  # takes lifetime income from the 7-page fleet roster instead of a stationAll
+  # call per station, and fetches stationDay at SOLIS_CONCURRENCY (default 16;
+  # the client gates the process at ~10 calls/s regardless). Measured before
+  # this: a run was 4.5–5 min at concurrency 8, ~3.3 s per Solis call.
+  #
+  # Render never overlaps runs of one cron: if a run is still going at the
+  # next tick it DELAYS the next run, so a slow Solis only stretches the
+  # cadence — it never skips or corrupts a run. Cron time is billed per second
+  # of run time ($1/month minimum). If Solis starts answering 429/502 in
+  # bursts, lower SOLIS_CONCURRENCY in this service's env (no deploy needed)
+  # before touching the schedule.
   - type: cron
     name: solviva-five-minute-sync
     runtime: docker
     plan: starter
-    schedule: "*/15 * * * *"
+    schedule: "*/5 * * * *"
     dockerfilePath: ./Dockerfile.worker.five_minutes
     envVars:
+      # Must equal the schedule above: lifetime earning is refreshed for one
+      # slice of the fleet per run, and the slice is picked from the minute of
+      # the hour divided by this. Change both together.
+      - key: SYNC_CADENCE_MINUTES
+        value: "5"
+      # Concurrent stationDay calls. The client caps the whole process at
+      # ~10 calls/s whatever this says; lower it here first if Solis 429s.
+      - key: SOLIS_CONCURRENCY
+        value: "16"
       - key: SOLIS_CLOUD_KEY_ID
         sync: false
       - key: SOLIS_CLOUD_KEY_SECRET

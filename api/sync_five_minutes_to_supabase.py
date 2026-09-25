@@ -1,9 +1,10 @@
 """
 Solis -> Supabase interval sync.
 
-Runs on a cron (every 15 minutes today; built to run every 5) and fetches
-today's stationDay curve for every mapped Solis station, storing each 5-minute
-interval in the energy_readings_five_minutes table.
+Runs on a cron every 5 minutes (render.yaml) and fetches today's stationDay
+curve for every mapped Solis station, storing each 5-minute interval in the
+energy_readings_five_minutes table. Lifetime earning (stationAll) is refreshed
+for one twelfth of the fleet per run and carried forward for the rest.
 
 Per run, per station, it writes only what is new: the points after the
 station's WATERMARK (its latest stored timestamp today, read for all stations
@@ -27,6 +28,7 @@ import logging
 import os
 import sys
 import time
+import zlib
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -48,16 +50,29 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 PHT = timezone(timedelta(hours=8))
 SUPABASE_BATCH_SIZE = 500
 SUPABASE_PAGE_SIZE = 1000
-SOLIS_CONCURRENCY = 8
+# Concurrent Solis calls. Measured 2026-09-25 from Render: a stationDay call
+# answers in ~3.3 s, so throughput is concurrency / 3.3 s — at 8 a run's ~650
+# calls took 4.5–5 min; the pre-2026-09-25 code effectively ran 16 (two calls
+# per station in parallel) at ~4.8 calls/s with no 429s. The client's own
+# gate caps the process at ~10 calls/s whatever this says. Overridable per
+# service in Render without a deploy.
+SOLIS_CONCURRENCY = int(os.getenv("SOLIS_CONCURRENCY", "16"))
 
-# stationAll (lifetime earning) is a second Solis call per station. It is
-# fetched on the run whose start minute is below this — once an hour for any
-# cadence that divides 60 — and carried forward from the station's watermark
-# row in between. It moves by a few pesos an hour, the daily sync holds the
-# exact daily figure, and the per-run call doubled Solis traffic (1,200 calls a
-# run for ~600 stations). Stations with no watermark yet (first run of the day)
-# or no carried value fetch it regardless.
-LIFETIME_REFRESH_BEFORE_MINUTE = 5
+# stationAll (lifetime earning) is a second Solis call per station. Rather
+# than all ~650 of them in one run (an 8–9 minute run every hour, measured
+# 2026-09-25), each run refreshes one slice of the fleet and carries the rest
+# forward from the watermark rows, so every station is refreshed once an hour
+# and every run is the same size. The slice is chosen from the minute of the
+# hour, so SYNC_CADENCE_MINUTES must match this cron's schedule in render.yaml
+# (both say 5): with a mismatch some slices would never come up. Stations
+# with no carried value (first run of the day) fetch regardless.
+#
+# Not the roster's allIncome: userStationList carries a lifetime income per
+# station in 7 calls, but it runs up to ~1% (₱734 on one station) above the
+# stationAll sum we have always stored, so switching sources would move every
+# customer's number. A decision for the product owner, not a sync detail.
+SYNC_CADENCE_MINUTES = int(os.getenv("SYNC_CADENCE_MINUTES", "5"))
+LIFETIME_REFRESH_EVERY_MINUTES = 60
 
 # Purge sizing. PostgREST connects as `authenticator`, whose statement_timeout is
 # 8s, so every DELETE has to fit inside that. Rows go one hour-window at a
@@ -501,9 +516,18 @@ async def _fetch_station_day(
             return user, None, None, exc
 
 
-async def sync_once(dry_run: bool = False, limit: Optional[int] = None) -> int:
+def _lifetime_slice(system_id: str, slices: int) -> int:
+    """Stable 0..slices-1 bucket for a station (hash() is salted per process)."""
+    return zlib.crc32(str(system_id).encode("utf-8")) % max(1, slices)
+
+
+async def sync_once(
+    dry_run: bool = False,
+    limit: Optional[int] = None,
+    solis: Optional[SolisCloudClient] = None,
+) -> int:
     sb = build_supabase()
-    solis = build_solis()
+    solis = solis or build_solis()
 
     # The unit of work is a STATION, not a user. This was two queries joined by
     # a dict keyed on user_id:
@@ -593,19 +617,22 @@ async def sync_once(dry_run: bool = False, limit: Optional[int] = None) -> int:
     # Station creation belongs to onboarding; this cron only reads.
     prepared_users: List[dict] = users[:limit] if limit else users
 
-    # Lifetime earning: once an hour, carried forward in between (see
-    # LIFETIME_REFRESH_BEFORE_MINUTE). Every row in an upsert batch must carry
+    # Lifetime earning: one slice of the fleet per run, carried forward for the
+    # rest (see SYNC_CADENCE_MINUTES). Every row in an upsert batch must carry
     # the same keys, so a station either has a fetched value or a carried one;
     # a station with neither fetches now.
-    hourly_refresh = datetime.now(PHT).minute < LIFETIME_REFRESH_BEFORE_MINUTE
+    slices = max(1, LIFETIME_REFRESH_EVERY_MINUTES // max(1, SYNC_CADENCE_MINUTES))
+    this_slice = (datetime.now(PHT).minute // max(1, SYNC_CADENCE_MINUTES)) % slices
 
     def _wants_lifetime(u: dict) -> bool:
         if not has_lifetime_earning:
             return False
-        if watermarks is None or hourly_refresh:
+        if watermarks is None:
             return True
         wm = watermarks.get(u["system_id"])
-        return wm is None or wm.get("lifetime") is None
+        if wm is None or wm.get("lifetime") is None:
+            return True
+        return _lifetime_slice(u["system_id"], slices) == this_slice
 
     lifetime_fetches = 0
     fetch_plan = []
@@ -742,7 +769,11 @@ async def main() -> None:
     limit: Optional[int] = None
     if "--limit" in args:
         limit = int(args[args.index("--limit") + 1])
-    written = await sync_once(dry_run=dry_run, limit=limit)
+    solis = build_solis()
+    try:
+        written = await sync_once(dry_run=dry_run, limit=limit, solis=solis)
+    finally:
+        await solis.aclose()
     suffix = " [dry-run]" if dry_run else ""
     log.info("Done. %d row(s) processed%s.", written, suffix)
 
