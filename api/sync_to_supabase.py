@@ -27,14 +27,18 @@ import asyncio
 import os
 import sys
 import logging
+import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from api.solis_client import SolisCloudClient, SolisCloudError
+# The one stationMonth-day → energy_readings row parser, shared with the
+# backfill worker and the history backfill so all three write the same shape.
+from api.backfill_history import parse_month_day
 
 # supabase-py (sync client)
 from supabase import create_client, Client
@@ -46,6 +50,8 @@ logging.basicConfig(
 log = logging.getLogger("solis_sync")
 
 SYNC_INTERVAL_SECONDS = 900  # 15 minutes
+SUPABASE_BATCH_SIZE = 500
+PHT = timezone(timedelta(hours=8))
 
 
 def get_env(key: str) -> str:
@@ -69,34 +75,62 @@ def build_solis() -> SolisCloudClient:
     )
 
 
-def _to_float(value: object, default: float = 0.0) -> float:
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def _month_rows(user_id: str, system_id: str, month_data: list, capacity_kwp: float) -> List[dict]:
+    """One energy_readings row per stationMonth day, noon Manila (04:00Z).
 
-
-def _daily_consumption_kwh(day: dict) -> float:
-    """Compute daily consumption from Solis monthly summary fields.
-
-    Preferred formula: total grid load + backup load.
-    Solis commonly exposes this as homeGridEnergy + backUpEnergy (+ backup2Energy).
-    Fall back to homeLoadEnergy / consumeEnergy when explicit split fields are absent.
+    Same shape and the same consumption/full-load-hours rules as before (they
+    live in parse_month_day, which the backfill worker also uses). Keyed on
+    the date so a day Solis repeats under two adjacent months keeps its last
+    copy — an upsert batch with a duplicate key is rejected whole.
     """
-    total_grid_load = _to_float(day.get("homeGridEnergy"))
-    backup_load = _to_float(day.get("backUpEnergy")) + _to_float(day.get("backup2Energy"))
-    from_grid_plus_backup = total_grid_load + backup_load
+    by_day: dict = {}
+    for day in month_data:
+        parsed = parse_month_day(day, capacity_kwp)
+        if parsed is None:
+            continue
+        ds = parsed.pop("date_str")
+        y, m, d = (int(x) for x in ds.split("-"))
+        by_day[ds] = {
+            "user_id": user_id,
+            "system_id": system_id,
+            "timestamp": datetime(y, m, d, 12, 0, 0, tzinfo=PHT).isoformat(),
+            **parsed,
+        }
+    return list(by_day.values())
 
-    if from_grid_plus_backup > 0:
-        return from_grid_plus_backup
 
-    home_load_energy = _to_float(day.get("homeLoadEnergy"))
-    if home_load_energy > 0:
-        return home_load_energy
+def _upsert_batches(sb: Client, rows: List[dict]) -> int:
+    """Upsert on (system_id, "timestamp") in 500-row batches, 3 attempts each.
+    Returns the number of rows in batches that succeeded.
 
-    return _to_float(day.get("consumeEnergy"))
+    This replaces one SELECT plus one UPDATE (or INSERT) per station-day —
+    about 13,000 round trips and 13,000 single-row commits a night, each with
+    its own WAL flush (measured 2026-09-24: 95,850 selects and 158,000
+    single-row updates in 22 days). ~30 requests do the same work. Safe because
+    every current-month row sits at noon: 14,806 rows, 0 off-noon, checked the
+    same day. The 405 legacy wall-clock rows are all older than any month this
+    sync touches (see migration 12).
+    """
+    done = 0
+    for i in range(0, len(rows), SUPABASE_BATCH_SIZE):
+        batch = rows[i:i + SUPABASE_BATCH_SIZE]
+        for attempt in range(3):
+            try:
+                sb.table("energy_readings").upsert(
+                    batch, on_conflict="system_id,timestamp", returning="minimal"
+                ).execute()
+                done += len(batch)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    log.error("energy_readings upsert of %d row(s) failed after 3 attempts: %s",
+                              len(batch), str(exc)[:200])
+                else:
+                    wait = 2 ** (attempt + 1)
+                    log.warning("energy_readings upsert failed (attempt %d/3), retrying in %ds: %s",
+                                attempt + 1, wait, str(exc)[:120])
+                    time.sleep(wait)
+    return done
 
 
 async def _fetch_battery_capacity_kwh(
@@ -180,7 +214,7 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
     while True:
         page = (
             sb.table("solar_systems")
-            .select("id, user_id, solis_station_id, system_name, capacity_kwp")
+            .select("id, user_id, solis_station_id, system_name, capacity_kwp, installation_date")
             .not_.is_("solis_station_id", "null")
             .eq("status", "active")
             .order("id")
@@ -199,8 +233,9 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
     owners = {s["user_id"] for s in stations}
     log.info("Found %d station(s) across %d customer(s) to sync.", len(stations), len(owners))
     written = 0
+    pending: List[dict] = []
 
-    now = datetime.now(timezone(timedelta(hours=8)))  # PHT
+    now = datetime.now(PHT)
     current_month = now.strftime("%Y-%m")
 
     for station_row in stations:
@@ -250,15 +285,10 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
             # Correct a placeholder installation_date using this STATION's own
             # oldest reading. Keyed on system_id: for a multi-station customer,
             # the user's oldest reading may belong to a different station and
-            # would backdate this one to before it was installed.
-            sys_row = (
-                sb.table("solar_systems")
-                .select("installation_date")
-                .eq("id", system_id)
-                .single()
-                .execute()
-            )
-            current_install = sys_row.data.get("installation_date") if sys_row.data else None
+            # would backdate this one to before it was installed. The current
+            # value rides on the stations query above (one round trip per
+            # station saved, ~600 a night).
+            current_install = station_row.get("installation_date")
             if current_install and current_install >= (now - timedelta(days=30)).strftime("%Y-%m-%d"):
                 oldest = (
                     sb.table("energy_readings")
@@ -275,83 +305,28 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
 
             sb.table("solar_systems").update(update_payload).eq("id", system_id).execute()
 
-            # 4. Upsert each day's reading from stationMonth data
-            user_written = 0
-            for day in month_data:
-                date_str = day.get("dateStr")  # "2026-04-08"
-                if not date_str:
-                    continue
-
-                production_kwh = float(day.get("energy") or 0)
-                consumption_kwh = _daily_consumption_kwh(day)
-                grid_import_kwh = float(day.get("gridPurchasedEnergy") or 0)
-                grid_export_kwh = float(day.get("gridSellEnergy") or 0)
-                daily_earning = float(day.get("money") or 0)
-                battery_charge_kwh = float(day.get("batteryChargeEnergy") or 0)
-                battery_discharge_kwh = float(day.get("batteryDischargeEnergy") or 0)
-                # Solis-provided full load hours (dailyYield / rated capacity); fall back to a manual calc.
-                full_load_hours = _to_float(day.get("fullHour"))
-                if full_load_hours <= 0 and capacity_kwp > 0:
-                    full_load_hours = production_kwh / capacity_kwp
-
-                # Build noon timestamp for this date
-                parts = date_str.split("-")
-                noon = datetime(
-                    int(parts[0]), int(parts[1]), int(parts[2]),
-                    12, 0, 0, tzinfo=timezone(timedelta(hours=8)),
-                )
-
-                reading = {
-                    "user_id": user_id,
-                    "system_id": system_id,
-                    "timestamp": noon.isoformat(),
-                    "production_kwh": round(production_kwh, 4),
-                    "consumption_kwh": round(consumption_kwh, 4),
-                    "battery_level": None,
-                    "battery_status": None,
-                    "grid_import_kwh": round(grid_import_kwh, 4),
-                    "grid_export_kwh": round(grid_export_kwh, 4),
-                    "daily_earning": round(daily_earning, 2),
-                    "battery_charge_kwh": round(battery_charge_kwh, 4),
-                    "battery_discharge_kwh": round(battery_discharge_kwh, 4),
-                    "full_load_hours": round(full_load_hours, 4),
-                }
-
-                # Check if this day's reading already exists FOR THIS STATION.
-                #
-                # This filter was .eq("user_id", user_id) with no system_id,
-                # so for a customer with two stations the second station's day
-                # matched the first station's row and UPDATED it — one
-                # station's production silently replaced by the other's, with
-                # no error and nothing in the logs. Keying on system_id is the
-                # whole fix; user_id is redundant once system_id is used, since
-                # system_id functionally determines the owner.
-                existing = (
-                    sb.table("energy_readings")
-                    .select("id")
-                    .eq("system_id", system_id)
-                    .gte("timestamp", f"{date_str}T00:00:00+08:00")
-                    .lt("timestamp", f"{date_str}T23:59:59+08:00")
-                    .limit(1)
-                    .execute()
-                )
-                if existing.data:
-                    sb.table("energy_readings").update(reading).eq("id", existing.data[0]["id"]).execute()
-                else:
-                    sb.table("energy_readings").insert(reading).execute()
-
-                user_written += 1
-
-            written += user_written
-            log.info(
-                "Synced %s | %d days | month=%s",
-                name, user_written, current_month,
-            )
+            # 4. One row per stationMonth day, upserted on (system_id,
+            #    "timestamp") in batches across stations. This used to be a
+            #    SELECT ("does this station have a row on this date?") followed
+            #    by an UPDATE or INSERT, per day, per station. The station key
+            #    matters: keyed on user_id, a customer's second station
+            #    matched the first station's row and overwrote it. The unique
+            #    index energy_readings_system_ts_uk (migration 05) now carries
+            #    that guarantee inside the upsert itself.
+            rows = _month_rows(user_id, system_id, month_data, capacity_kwp)
+            pending.extend(rows)
+            log.info("Parsed %s | %d days | month=%s", name, len(rows), current_month)
+            if len(pending) >= SUPABASE_BATCH_SIZE:
+                written += _upsert_batches(sb, pending)
+                pending = []
 
         except SolisCloudError as e:
             log.error("Solis API error for %s (station %s): %s", name, station_id, e)
         except Exception as e:
             log.error("Unexpected error for %s (station %s): %s", name, station_id, e)
+
+    if pending:
+        written += _upsert_batches(sb, pending)
 
     return written
 

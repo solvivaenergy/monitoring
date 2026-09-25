@@ -1,20 +1,31 @@
 """
 Solis -> Supabase interval sync.
 
-Runs every 15 minutes and fetches today's stationDay curve for every mapped
-Solis station, storing each 5-minute interval in the energy_readings_five_minutes
-table.
+Runs on a cron (every 15 minutes today; built to run every 5) and fetches
+today's stationDay curve for every mapped Solis station, storing each 5-minute
+interval in the energy_readings_five_minutes table.
+
+Per run, per station, it writes only what is new: the points after the
+station's WATERMARK (its latest stored timestamp today, read for all stations
+in ONE request from the five_minute_watermarks view of migration 17) plus a
+refresh of the watermark point itself, which Solis revises once its interval
+completes. Everything older is left alone, so a run's write volume is the new
+points, not the day. A station found to hold fewer rows up to its watermark
+than Solis reports (an inverter that was offline and then uploaded its buffer)
+gets a one-request comparison of its own timestamps and the holes filled.
 
 Designed for Render cron:
     python -m api.sync_five_minutes_to_supabase
 
 Optional flags:
     --dry-run   Parse and log counts without writing to Supabase
+    --limit N   Only the first N stations (with --dry-run: a cheap smoke test)
 """
 
 import asyncio
 import logging
 import os
+import sys
 import time
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
@@ -38,6 +49,15 @@ PHT = timezone(timedelta(hours=8))
 SUPABASE_BATCH_SIZE = 500
 SUPABASE_PAGE_SIZE = 1000
 SOLIS_CONCURRENCY = 8
+
+# stationAll (lifetime earning) is a second Solis call per station. It is
+# fetched on the run whose start minute is below this — once an hour for any
+# cadence that divides 60 — and carried forward from the station's watermark
+# row in between. It moves by a few pesos an hour, the daily sync holds the
+# exact daily figure, and the per-run call doubled Solis traffic (1,200 calls a
+# run for ~600 stations). Stations with no watermark yet (first run of the day)
+# or no carried value fetch it regardless.
+LIFETIME_REFRESH_BEFORE_MINUTE = 5
 
 # Purge sizing. PostgREST connects as `authenticator`, whose statement_timeout is
 # 8s, so every DELETE has to fit inside that. Rows go one hour-window at a
@@ -248,6 +268,100 @@ def _load_existing_rows(
     return existing_by_system
 
 
+def _load_watermarks(sb: Client) -> Optional[Dict[str, dict]]:
+    """Per station: today's latest stored timestamp, its lifetime_earning and
+    today's row count — one request against the five_minute_watermarks view
+    (migration 17). Returns None when the view cannot be read, so the caller
+    falls back to paging through the day (the pre-17 behaviour) rather than
+    skipping the run."""
+    out: Dict[str, dict] = {}
+    offset = 0
+    while True:
+        start = offset
+        try:
+            batch = _execute_with_retry(
+                "load five-minute watermarks",
+                lambda s=start: (
+                    sb.table("five_minute_watermarks")
+                    .select("system_id, last_ts, last_lifetime_earning, n_rows")
+                    .order("system_id")
+                    .range(s, s + SUPABASE_PAGE_SIZE - 1)
+                ),
+            ).data or []
+        except Exception as exc:
+            log.warning(
+                "five_minute_watermarks unavailable (migration 17 applied?); "
+                "paging through the day instead: %s",
+                str(exc)[:160],
+            )
+            return None
+        for row in batch:
+            lifetime = row.get("last_lifetime_earning")
+            out[row["system_id"]] = {
+                "last_ts": _normalize_timestamp_key(row["last_ts"]),
+                "lifetime": _to_float(lifetime) if lifetime is not None else None,
+                "n": int(row.get("n_rows") or 0),
+            }
+        if len(batch) < SUPABASE_PAGE_SIZE:
+            break
+        offset += SUPABASE_PAGE_SIZE
+    return out
+
+
+def _load_station_timestamps(sb: Client, system_id: str, day_start: str, day_end: str) -> set:
+    """The timestamps ONE station holds today. Asked only for a station whose
+    watermark row count is below what Solis reports up to the watermark, i.e.
+    points arrived late (inverter offline, then uploaded its buffer)."""
+    keys: set = set()
+    offset = 0
+    while True:
+        start = offset
+        batch = _execute_with_retry(
+            "load one station's five-minute timestamps",
+            lambda s=start: (
+                sb.table("energy_readings_five_minutes")
+                .select("timestamp")
+                .eq("system_id", system_id)
+                .gte("timestamp", day_start)
+                .lt("timestamp", day_end)
+                .order("timestamp")
+                .range(s, s + SUPABASE_PAGE_SIZE - 1)
+            ),
+        ).data or []
+        keys.update(_normalize_timestamp_key(r["timestamp"]) for r in batch)
+        if len(batch) < SUPABASE_PAGE_SIZE:
+            break
+        offset += SUPABASE_PAGE_SIZE
+    return keys
+
+
+def _plan_station(
+    parsed_rows: List[Tuple[int, dict]],
+    watermark: Optional[dict],
+) -> Tuple[List[dict], List[dict], bool]:
+    """Decide what to send for one station. Pure: no I/O.
+
+    Returns (inserts, refreshes, holes_suspected):
+      inserts         — Solis points after the watermark (new since the last
+                        run); every point when the station has no rows today.
+      refreshes       — the point AT the watermark, re-sent because Solis
+                        revises the latest interval once it completes. Same
+                        upsert; ON CONFLICT updates it in place.
+      holes_suspected — Solis reports more points up to the watermark than we
+                        hold, so something older is missing; the caller fetches
+                        this station's stored timestamps and fills the gaps.
+    """
+    if not parsed_rows:
+        return [], [], False
+    if watermark is None:
+        return [row for _, row in parsed_rows], [], False
+    last_ts = watermark["last_ts"]
+    inserts = [row for ts, row in parsed_rows if ts > last_ts]
+    refreshes = [row for ts, row in parsed_rows if ts == last_ts]
+    up_to_watermark = sum(1 for ts, _ in parsed_rows if ts <= last_ts)
+    return inserts, refreshes, up_to_watermark > watermark["n"]
+
+
 def _purge_old_rows(sb: Client, day_start: str) -> Optional[int]:
     """Drop rows older than the current Asia/Manila day, in bounded batches.
 
@@ -300,10 +414,15 @@ def _purge_old_rows(sb: Client, day_start: str) -> Optional[int]:
 
         while window_start < cutoff and windows < PURGE_MAX_WINDOWS:
             window_end = min(window_start + PURGE_WINDOW, cutoff)
+            # return=minimal: PostgREST otherwise runs DELETE … RETURNING * and
+            # json_agg()s every deleted row to hand it back, which at ~7,000
+            # rows a window spilled to temp files on every purge (5.6 GB of
+            # temp writes over 22 days, measured 2026-09-24). Only the count
+            # was ever used, and it still comes back.
             resp = _execute_with_retry(
                 "purge old five-minute rows",
                 lambda ws=window_start, we=window_end: sb.table("energy_readings_five_minutes")
-                .delete(count="exact")
+                .delete(count="exact", returning="minimal")
                 .gte("timestamp", ws.isoformat())
                 .lt("timestamp", we.isoformat()),
             )
@@ -363,21 +482,26 @@ async def _fetch_station_day(
     sem: asyncio.Semaphore,
     user: dict,
     today_str: str,
+    with_lifetime: bool = True,
 ) -> Tuple[dict, Optional[list], Optional[float], Optional[Exception]]:
     async with sem:
         try:
             station_id = user["solis_station_id"]
-            day_data, station_all = await asyncio.gather(
-                solis.station_day(station_id, today_str),
-                solis.station_all(station_id),
-            )
-            lifetime_earning = _extract_lifetime_earning(station_all)
+            if with_lifetime:
+                day_data, station_all = await asyncio.gather(
+                    solis.station_day(station_id, today_str),
+                    solis.station_all(station_id),
+                )
+                lifetime_earning: Optional[float] = _extract_lifetime_earning(station_all)
+            else:
+                day_data = await solis.station_day(station_id, today_str)
+                lifetime_earning = None
             return user, day_data if isinstance(day_data, list) else None, lifetime_earning, None
         except Exception as exc:
             return user, None, None, exc
 
 
-async def sync_once(dry_run: bool = False) -> int:
+async def sync_once(dry_run: bool = False, limit: Optional[int] = None) -> int:
     sb = build_supabase()
     solis = build_solis()
 
@@ -447,7 +571,14 @@ async def sync_once(dry_run: bool = False) -> int:
     else:
         deleted_count = _purge_old_rows(sb, day_start)
         log.info("Purged %s old 5-minute row(s) before syncing %s.", deleted_count or 0, today_str)
-    existing_by_system = _load_existing_rows(sb, day_start, day_end)
+    # What we already hold today, per station, in ONE request (migration 17's
+    # view). Until 2026-09-25 this paged through every row of the day — ~64
+    # requests a run by evening, each one dirtying the pages it read — to
+    # build the same answer. The paging path stays as the fallback.
+    watermarks = _load_watermarks(sb)
+    existing_by_system: Dict[str, Dict[int, str]] = {}
+    if watermarks is None:
+        existing_by_system = _load_existing_rows(sb, day_start, day_end)
     has_lifetime_earning = _has_lifetime_earning_column(sb)
     if not has_lifetime_earning:
         log.warning(
@@ -455,24 +586,44 @@ async def sync_once(dry_run: bool = False) -> int:
             "5-minute sync will skip writing lifetime earnings until the column is added."
         )
 
-    prepared_users: List[dict] = []
-
     # Every station already carries its system_id, so there is nothing to
     # resolve and nothing to create. _ensure_active_system used to INSERT a
     # solar_systems row here when its user_id lookup missed — the '-' half of
     # the 104 duplicate pairs, racing the daily cron's '—' insert at 18:00 UTC.
     # Station creation belongs to onboarding; this cron only reads.
-    prepared_users = users
+    prepared_users: List[dict] = users[:limit] if limit else users
+
+    # Lifetime earning: once an hour, carried forward in between (see
+    # LIFETIME_REFRESH_BEFORE_MINUTE). Every row in an upsert batch must carry
+    # the same keys, so a station either has a fetched value or a carried one;
+    # a station with neither fetches now.
+    hourly_refresh = datetime.now(PHT).minute < LIFETIME_REFRESH_BEFORE_MINUTE
+
+    def _wants_lifetime(u: dict) -> bool:
+        if not has_lifetime_earning:
+            return False
+        if watermarks is None or hourly_refresh:
+            return True
+        wm = watermarks.get(u["system_id"])
+        return wm is None or wm.get("lifetime") is None
+
+    lifetime_fetches = 0
+    fetch_plan = []
+    for user in prepared_users:
+        wants = _wants_lifetime(user)
+        lifetime_fetches += int(wants)
+        fetch_plan.append((user, wants))
 
     fetch_sem = asyncio.Semaphore(SOLIS_CONCURRENCY)
     fetch_results = await asyncio.gather(*[
-        _fetch_station_day(solis, fetch_sem, user, today_str)
-        for user in prepared_users
+        _fetch_station_day(solis, fetch_sem, user, today_str, with_lifetime=wants)
+        for user, wants in fetch_plan
     ])
 
     total_written = 0
+    hole_fills = 0
     all_inserts: List[dict] = []
-    all_updates: List[Tuple[str, dict]] = []
+    all_refreshes: List[dict] = []
 
     for user, day_data, lifetime_earning, error in fetch_results:
         user_id = user["id"]
@@ -490,6 +641,10 @@ async def sync_once(dry_run: bool = False) -> int:
         if not day_data:
             log.info("%s: no stationDay data for %s", name, today_str)
             continue
+
+        watermark = watermarks.get(system_id) if watermarks is not None else None
+        if lifetime_earning is None and watermark is not None:
+            lifetime_earning = watermark.get("lifetime")
 
         parsed_by_ts: Dict[int, dict] = {}
         for point in day_data:
@@ -510,34 +665,50 @@ async def sync_once(dry_run: bool = False) -> int:
             log.info("%s: Solis returned no parseable 5-minute points", name)
             continue
 
-        # Look up THIS STATION's already-stored points, not the customer's.
-        existing_by_ts = existing_by_system.get(system_id, {})
-        latest_ts = max(ts_key for ts_key, _ in parsed_rows)
-        inserts: List[dict] = []
-        updates: List[Tuple[str, dict]] = []
+        if watermarks is not None:
+            inserts, refreshes, holes = _plan_station(parsed_rows, watermark)
+            if holes and watermark is not None:
+                held = _load_station_timestamps(sb, system_id, day_start, day_end)
+                fills = [row for ts, row in parsed_rows
+                         if ts <= watermark["last_ts"] and ts not in held]
+                if fills:
+                    inserts.extend(fills)
+                    hole_fills += len(fills)
+                    log.info("%s: %d late point(s) filled below the watermark", name, len(fills))
+        else:
+            # Pre-17 fallback: compare against THIS STATION's stored points
+            # (not the customer's — a second station must not hide behind the
+            # first) and refresh only the latest one.
+            existing_by_ts = existing_by_system.get(system_id, {})
+            latest_ts = max(ts_key for ts_key, _ in parsed_rows)
+            inserts, refreshes = [], []
+            for ts_key, row in parsed_rows:
+                if ts_key in existing_by_ts:
+                    if ts_key == latest_ts:
+                        refreshes.append(row)
+                    continue
+                inserts.append(row)
 
-        for ts_key, row in parsed_rows:
-            existing_id = existing_by_ts.get(ts_key)
-            if existing_id:
-                if ts_key == latest_ts:
-                    updates.append((existing_id, row))
-                continue
-            inserts.append(row)
-            existing_by_ts[ts_key] = "__pending_insert__"
-
-        total_written += len(inserts) + len(updates)
+        total_written += len(inserts) + len(refreshes)
         all_inserts.extend(inserts)
-        all_updates.extend(updates)
+        all_refreshes.extend(refreshes)
 
         suffix = " [dry-run]" if dry_run else ""
         log.info(
-            "%s: %d interval(s) parsed, %d insert(s), %d latest update(s)%s",
+            "%s: %d interval(s) parsed, %d new, %d refreshed%s",
             name,
             len(parsed_rows),
             len(inserts),
-            len(updates),
+            len(refreshes),
             suffix,
         )
+
+    log.info(
+        "Run plan: %d station(s), %d new row(s), %d refresh(es), %d late fill(s), "
+        "%d lifetime fetch(es)%s",
+        len(prepared_users), len(all_inserts), len(all_refreshes), hole_fills,
+        lifetime_fetches, " [dry-run]" if dry_run else "",
+    )
 
     if dry_run:
         return total_written
@@ -550,22 +721,28 @@ async def sync_once(dry_run: bool = False) -> int:
     # run overruns, Render skips the next one, and the feed measured on
     # 2026-09-16 was landing every ~40 minutes instead of every 15.
     #
-    # The refreshed latest rows go through the same upsert: ON CONFLICT
-    # (system_id, "timestamp") updates them in place, which is exactly what
-    # update(row).eq("id", ...) did, in 1/500th of the requests.
-    all_inserts.extend(row for _, row in all_updates)
+    # The refreshed watermark rows go through the same upsert: ON CONFLICT
+    # (system_id, "timestamp") updates them in place. return=minimal: nobody
+    # reads the 500 echoed rows, and PostgREST json_agg()s them otherwise.
+    all_inserts.extend(all_refreshes)
     for batch in _chunked(all_inserts, SUPABASE_BATCH_SIZE):
         _execute_with_retry(
             f"upsert batch of {len(batch)} five-minute rows",
-            lambda batch=batch: sb.table("energy_readings_five_minutes").upsert(batch, on_conflict="system_id,timestamp"),
+            lambda batch=batch: sb.table("energy_readings_five_minutes").upsert(
+                batch, on_conflict="system_id,timestamp", returning="minimal"
+            ),
         )
 
     return total_written
 
 
 async def main() -> None:
-    dry_run = "--dry-run" in os.sys.argv
-    written = await sync_once(dry_run=dry_run)
+    args = sys.argv[1:]
+    dry_run = "--dry-run" in args
+    limit: Optional[int] = None
+    if "--limit" in args:
+        limit = int(args[args.index("--limit") + 1])
+    written = await sync_once(dry_run=dry_run, limit=limit)
     suffix = " [dry-run]" if dry_run else ""
     log.info("Done. %d row(s) processed%s.", written, suffix)
 

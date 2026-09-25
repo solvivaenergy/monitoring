@@ -115,6 +115,16 @@ services:
         sync: false
 
   # 15-minute interval sync cron: Solis stationDay -> Supabase energy_readings_five_minutes
+  #
+  # To run it every 5 minutes (near-live curves): change the schedule to
+  # "*/5 * * * *" — nothing else. Since 2026-09-25 a run writes only the points
+  # newer than each station's watermark (one request to five_minute_watermarks)
+  # and fetches stationAll once an hour, so a run is ~600 Solis calls and a
+  # handful of upserts. Before flipping, read one run's duration in this
+  # service's Render log: it must finish well inside 5 minutes, or Render
+  # skips the next run. If Solis starts answering 429/502 in bursts, that is
+  # the rate limit on our key — back off to */10 rather than lowering
+  # SOLIS_CONCURRENCY blindly.
   - type: cron
     name: solviva-five-minute-sync
     runtime: docker
