@@ -59,7 +59,7 @@
   th,td{padding:7px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;white-space:nowrap}
   th{position:sticky;top:0;background:#fafbfc;color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.3px;cursor:pointer;user-select:none}
   tbody tr:hover{background:#f5f9ea}
-  #grid tbody tr,tr[data-row-open]{cursor:pointer}
+  #grid tbody tr,tr[data-row-open],tr[data-attach-user]{cursor:pointer}
   /* Action column pinned to the right edge of a horizontally scrolling table,
      so "Open" is reachable without scrolling. Rows also open on click. */
   /* Dim the page while a record is open; clicking the dimmed area closes it. */
@@ -705,6 +705,23 @@ async function addStation(r){
     toast('Station added and backfill queued'); await loadRows(); openPanel(res.system_id);
   } catch (e) { toast(e.message, true); }
 }
+// A profile with no station row has no record to open, so the Unresolved
+// lists attach the plant directly (same POST as "Add another Solis station").
+// The 04c station→profile trigger then replaces whatever placeholder id the
+// profile held, so the customer app and the nightly onboarding both see the
+// real station without a second step. ds = the row's dataset.
+async function attachToProfile(ds){
+  if (!canEdit()) return toast('Engineer role needed', true);
+  const sid = (prompt(`Solis station id to attach to the login of ${ds.attachName || 'this customer'} (15–20 digits)`, ds.attach || '') || '').trim();
+  if (!sid) return;
+  if (!/^\d{15,20}$/.test(sid)) return toast('Station id must be 15–20 digits', true);
+  const reason = (prompt('Reason — recorded in the audit log', ds.attachReason || '') || '').trim();
+  if (!reason) return toast('A reason is required', true);
+  try {
+    const res = await api('/monitoring-admin/api/systems', {method:'POST', body:{user_id:ds.attachUser, solis_station_id:sid, reason, backfill:{granularity:'daily', days:60}}});
+    toast('Station attached and backfill queued'); await loadRows(); openPanel(res.system_id); loadUnresolved();
+  } catch (e) { toast(e.message, true); }
+}
 async function validate(kind, r){
   const box = $('#v-'+kind); box.hidden = false;
   box.textContent = kind === 'station'
@@ -859,14 +876,23 @@ async function loadUnresolved(){
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Second-station candidates <span class="muted">— an Odoo lead carries a Solis station id that is not in our database, and the lead's email already has a login holding a different station</span></h3>
-        <p class="hint">The nightly onboarding refuses to repoint an existing login, so these wait for a person. <b>Genuine second property</b> (same customer, another plant): click the row — the record opens with <i>Add another Solis station</i> prefilled with the new id and a reason; <i>Validate</i>, then <i>Add</i>. The plant is attached to the same login and its history backfilled. <b>Duplicate lead, or a wrong id on the lead</b> (the plant is someone else's, or two leads describe one plant): nothing to add — tell sales to fix the lead; the row disappears the night after. <b>A different person behind the same email</b> (family, an installer's inbox): a view grant under <i>Who can view this station</i>, or a separate login — not a second station.</p>
+        <p class="hint">The nightly onboarding refuses to repoint an existing login, so these wait for a person. <b>Genuine second property</b> (same customer, another plant): click the row — the record opens with <i>Add another Solis station</i> prefilled with the new id and a reason; <i>Validate</i>, then <i>Add</i>. The plant is attached to the same login and its history backfilled. <b>Profile only</b> (the login exists but holds no station row — usually a placeholder id on the profile): click the row, confirm the id and the reason; the plant is attached to that login, backfilled, and the placeholder replaced. <b>Duplicate lead, or a wrong id on the lead</b> (the plant is someone else's, or two leads describe one plant): nothing to add — tell sales to fix the lead; the row disappears the night after. <b>A different person behind the same email</b> (family, an installer's inbox): a view grant under <i>Who can view this station</i>, or a separate login — not a second station.</p>
         <table><thead><tr><th>Plant name (Solis, new station)</th><th>Email on the Odoo lead = existing login</th><th>New station id (Odoo lead)</th><th>Station this login already holds</th></tr></thead><tbody>
-        ${(o.second_station_candidates||[]).map(c => { const r = byEmail[(c.email||'').toLowerCase()]; const reason = `Second-station candidate from nightly onboarding (${fmtDate(o.ran_at)}): Odoo lead for "${c.full_name}" carries station ${c.station_id}; login ${c.email} already holds ${c.existing_station_id}`; return `<tr ${r?`data-row-open="${r.system_id}" data-attach="${esc(c.station_id)}" data-attach-reason="${esc(reason)}"`:''}><td>${esc(c.full_name)}${r?'':' <span class="tag" title="This email has no station row in the grid, so there is no record to open">no login row</span>'}</td><td class="mono">${esc(c.email)}</td><td class="mono">${esc(c.station_id)}</td><td class="mono">${esc(c.existing_station_id)}</td></tr>`; }).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
+        ${(o.second_station_candidates||[]).map(c => { const r = byEmail[(c.email||'').toLowerCase()]; const reason = `Second-station candidate from nightly onboarding (${fmtDate(o.ran_at)}): Odoo lead for "${c.full_name}" carries station ${c.station_id}; login ${c.email} already holds ${c.existing_station_id}`;
+          // Three shapes: a grid row to open (normal); a profile with no station
+          // row at all (placeholder id on the profile — attach from here); no
+          // login/profile for that email (nothing we can do on this screen).
+          const attrs = r ? `data-row-open="${r.system_id}" data-attach="${esc(c.station_id)}" data-attach-reason="${esc(reason)}"`
+                      : c.user_id ? `data-attach-user="${esc(c.user_id)}" data-attach="${esc(c.station_id)}" data-attach-reason="${esc(reason)}" data-attach-name="${esc(c.full_name)}"` : '';
+          const tag = r ? '' : c.user_id ? ' <span class="tag" title="This login has a profile but no station row, so there is no record to open. Click the row: the plant is attached to this login and backfilled, and the placeholder id on the profile is replaced.">profile only — click to attach</span>'
+                                         : ' <span class="tag" title="No login or profile exists for this email in our database">no login row</span>';
+          return `<tr ${attrs}><td>${esc(c.full_name)}${tag}</td><td class="mono">${esc(c.email)}</td><td class="mono">${esc(c.station_id)}</td><td class="mono">${esc(c.existing_station_id)}</td></tr>`; }).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Profiles without a station</h3>
+        <p class="hint">A login with a profile but no station row — the syncs skip it and the customer sees nothing. Click the row to attach a Solis station to this login (the id on the profile is offered when it looks real; a placeholder such as <span class="mono">12</span> needs the real id from the Odoo lead — if the lead has one, the same person is listed under <i>Second-station candidates</i> above).</p>
         <table><thead><tr><th>Customer</th><th>Login</th><th>Station id on profile</th><th>Created</th></tr></thead><tbody>
-        ${u.profiles_without_system.map(p => `<tr><td>${esc(p.full_name)}</td><td class="mono">${esc(p.email)}</td><td class="mono">${esc(p.solis_station_id||'—')}</td><td>${fmtDate(p.created_at)}</td></tr>`).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
+        ${u.profiles_without_system.map(p => { const sid = /^\d{15,20}$/.test(p.solis_station_id||'') ? p.solis_station_id : ''; return `<tr data-attach-user="${esc(p.user_id)}" data-attach="${esc(sid)}" data-attach-name="${esc(p.full_name)}" data-attach-reason="${esc(`Profile without a station row (login ${p.email}, profile station id ${p.solis_station_id||'none'}): attaching the Solis station from Monitoring Admin`)}"><td>${esc(p.full_name)}</td><td class="mono">${esc(p.email)}</td><td class="mono">${esc(p.solis_station_id||'—')}</td><td>${fmtDate(p.created_at)}</td></tr>`; }).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Stations without a Solis id</h3>
@@ -884,8 +910,10 @@ async function loadUnresolved(){
     // suggestions column — keep their own behaviour.
     el.onclick = e => {
       if (e.target.closest('button,a,input,select,textarea,label')) return;
-      const tr = e.target.closest('tr[data-row-open]');
-      if (tr) openPanel(tr.dataset.rowOpen, tr.dataset.attach ? {attach: tr.dataset.attach, reason: tr.dataset.attachReason} : {});
+      const tr = e.target.closest('tr[data-row-open],tr[data-attach-user]');
+      if (!tr) return;
+      if (tr.dataset.rowOpen) openPanel(tr.dataset.rowOpen, tr.dataset.attach ? {attach: tr.dataset.attach, reason: tr.dataset.attachReason} : {});
+      else attachToProfile(tr.dataset);
     };
     // The Verified checkboxes (both tables). The row objects carry what the
     // prompt needs; the tab reloads afterwards so the row moves between lists.
@@ -990,7 +1018,7 @@ function loadGuide(){
     <p>Signals: the Solis plant email matches the login email, and Check data vs Solis agrees. Edit the <b>Customer profile</b> fields, type a reason, Save. Do not remap.</p>
 
     <h3>3. A customer has a second plant</h3>
-    <p>These are Odoo leads whose station id is not in our database yet, while the lead's email already has a login holding another station. Unresolved → <i>Second-station candidates</i> → click the row: the record opens with <b>Add another Solis station</b> already filled with the new station id and a reason → <i>Validate Solis station</i> → Add. Name and capacity come from Solis; a 60-day backfill is queued. Their login stays the same. (The customer app shows one station until the station selector ships.)</p>
+    <p>These are Odoo leads whose station id is not in our database yet, while the lead's email already has a login holding another station. Unresolved → <i>Second-station candidates</i> → click the row: the record opens with <b>Add another Solis station</b> already filled with the new station id and a reason → <i>Validate Solis station</i> → Add. Name and capacity come from Solis; a 60-day backfill is queued. Their login stays the same. (The customer app shows one station until the station selector ships.) A row tagged <i>profile only</i> is a login with no station row at all (a placeholder id on the profile): clicking it asks for the id and a reason and attaches the plant straight away — the placeholder is replaced by the real id. The same login is also listed under <i>Profiles without a station</i>, which works the same way.</p>
 
     <h3>4. Missing days / refreshing history</h3>
     <p>In the customer panel, pick a date range → <b>Queue backfill</b>. The worker runs every 15 minutes; progress is in <b>Backfills</b>, and the row shows "backfill running/succeeded". A backfill overwrites the dates it fetches with Solis's current values.</p>

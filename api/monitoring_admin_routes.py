@@ -1185,6 +1185,21 @@ async def unresolved(authorization: str = Header(None)):
         run = conn.execute(
             "select ran_at, candidates, created, failed, duplicate_email, missing_email, duplicate_station, report "
             "from public.onboarding_runs order by ran_at desc limit 1").fetchone()
+        # A second-station candidate normally opens the login's existing station
+        # record. When the login has a profile but NO station row (a placeholder
+        # id on the profile — Amelita Canta's '12', found 2026-10-01) the grid
+        # has nothing to open, so the page needs the profile id to attach the
+        # plant directly; the 04c trigger then replaces the placeholder.
+        report = run["report"] if run and isinstance(run["report"], dict) else json.loads((run and run["report"]) or "{}")
+        results = report.get("results") or []
+        repoint_emails = [str(r.get("email") or "").lower() for r in results if r.get("status") == "skipped_would_repoint"]
+        login_by_email: Dict[str, Dict[str, Any]] = {}
+        if repoint_emails:
+            login_by_email = {r["email"]: dict(r) for r in conn.execute(
+                """select lower(u.email) as email, u.id::text as user_id,
+                          exists (select 1 from public.solar_systems s where s.user_id = u.id) as has_system
+                     from auth.users u join public.user_profiles p on p.id = u.id
+                    where lower(u.email) = any(%s)""", (repoint_emails,)).fetchall()}
         suspects_raw = conn.execute(SUSPECT_SQL + " and s.mapping_verified_at is null").fetchall()
         # The register of mappings an engineer has ticked "manually verified".
         # Returned separately so the page can show them collapsed and a tick
@@ -1203,15 +1218,15 @@ async def unresolved(authorization: str = Header(None)):
                 order by s.mapping_verified_at desc""").fetchall()
     onboarding: Dict[str, Any] = {}
     if run:
-        report = run["report"] if isinstance(run["report"], dict) else json.loads(run["report"] or "{}")
-        results = report.get("results") or []
         onboarding = {
             "ran_at": run["ran_at"], "candidates": run["candidates"], "created": run["created"],
             "failed": run["failed"],
             "failures": [{k: r.get(k) for k in ("full_name", "email", "station_id", "error")}
                          for r in results if r.get("status") == "failed"],
             "second_station_candidates": [
-                {k: r.get(k) for k in ("full_name", "email", "station_id", "existing_station_id")}
+                {**{k: r.get(k) for k in ("full_name", "email", "station_id", "existing_station_id")},
+                 **{k: (login_by_email.get(str(r.get("email") or "").lower()) or {}).get(k)
+                    for k in ("user_id", "has_system")}}
                 for r in results if r.get("status") == "skipped_would_repoint"],
         }
     # Possible wrong station: the Solis plant name shares no word with the
