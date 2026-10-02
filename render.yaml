@@ -176,6 +176,23 @@ services:
       - key: SUPABASE_DB_POOLER_URL
         sync: false
 
+  # Monthly accuracy run: on the 1st at 09:00 Manila, queue a daily backfill of
+  # the PREVIOUS month for every active station; solviva-backfill-worker drains
+  # it over the following hour or so. Same image as the worker, different
+  # command. See api/enqueue_fleet_backfill.py for why.
+  - type: cron
+    name: solviva-monthly-refresh
+    runtime: docker
+    plan: starter
+    schedule: "0 1 1 * *"  # 01:00 UTC on the 1st = 09:00 PHT
+    dockerfilePath: ./Dockerfile.worker.backfill
+    dockerCommand: python -m api.enqueue_fleet_backfill
+    envVars:
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_DB_POOLER_URL
+        sync: false
+
   # Cross-system MCP server for Claude Teams (read-only, shared service token).
   # Must NOT be plan: free — a cold start blows Claude's 10s connector timeout.
   - type: web

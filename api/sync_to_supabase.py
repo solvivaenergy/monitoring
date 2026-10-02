@@ -237,6 +237,17 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
 
     now = datetime.now(PHT)
     current_month = now.strftime("%Y-%m")
+    # On the first days of a month re-read the PREVIOUS month as well. Solis's
+    # figure for "yesterday" at 02:00 Manila is provisional (often still 0, or
+    # an inverter value it later settles to a whole kWh). Inside a month that
+    # heals by itself because the whole month is re-upserted every night —
+    # but across a month boundary nothing re-read the old month, so its last
+    # day kept the placeholder for good (2026-09-30: 603 of 621 rows were 0,
+    # 2026-09-29: 115; found 2026-10-02). One extra Solis call per station on
+    # these nights.
+    months = [current_month]
+    if now.day <= int(os.getenv("PREVIOUS_MONTH_REFRESH_DAYS", "3")):
+        months.insert(0, (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m"))
 
     for station_row in stations:
         system_id: str = station_row["id"]
@@ -253,10 +264,15 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
             # 2a-bis. Best-effort battery capacity from inverterDetail (kWh)
             battery_capacity_kwh = await _fetch_battery_capacity_kwh(solis, station_id)
 
-            # 2b. Fetch current month's daily summaries (1 API call, all days)
-            month_data = await solis.station_month(station_id, current_month)
+            # 2b. Fetch the daily summaries (1 API call per month, all days;
+            #     the previous month too on the first days of a month).
+            month_data: list = []
+            for mon in months:
+                data = await solis.station_month(station_id, mon)
+                if data and isinstance(data, list):
+                    month_data.extend(data)
 
-            if not month_data or not isinstance(month_data, list):
+            if not month_data:
                 log.warning("No stationMonth data for %s — skipping.", name)
                 continue
 
@@ -315,7 +331,7 @@ async def sync_once(solis: SolisCloudClient, sb: Client) -> int:
             #    that guarantee inside the upsert itself.
             rows = _month_rows(user_id, system_id, month_data, capacity_kwp)
             pending.extend(rows)
-            log.info("Parsed %s | %d days | month=%s", name, len(rows), current_month)
+            log.info("Parsed %s | %d days | month=%s", name, len(rows), "+".join(months))
             if len(pending) >= SUPABASE_BATCH_SIZE:
                 written += _upsert_batches(sb, pending)
                 pending = []

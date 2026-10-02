@@ -212,18 +212,40 @@ async function boot(){
   sb.auth.onAuthStateChange(async (event, s) => {
     session = s;
     if (event === 'PASSWORD_RECOVERY') { show('recovery'); return; }
-    if (session) await afterLogin(); else show('login');
+    // supabase-js fires SIGNED_IN on every tab refocus and TOKEN_REFRESHED
+    // about hourly. Only a real sign-in or sign-out changes the page; a refresh
+    // just updates the token api() sends. Before this, every refocus re-ran
+    // afterLogin(), which threw the engineer back onto Customers and reloaded
+    // the grid ("the page keeps refreshing", 2026-10-02).
+    if (!session) { if (me) { me = null; show('login'); } return; }
+    await ensureLoggedIn();
   });
   const {data} = await sb.auth.getSession();
   session = data.session;
-  if (session) await afterLogin(); else show('login');
+  if (session) await ensureLoggedIn(); else show('login');
 }
+
+const TABS = ['customers', 'unresolved', 'jobs', 'audit', 'guide', 'staff'];
+const TAB_LOADERS = {unresolved: () => loadUnresolved(), jobs: () => loadJobs(), audit: () => loadAudit(), staff: () => loadStaff(), guide: () => loadGuide()};
 
 function show(view){
   $$('main > section').forEach(s => s.hidden = true);
   const el = $('#view-'+view); if (el) el.hidden = false;
   $('#topbar').hidden = !(me && view!=='login' && view!=='recovery');
   $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab===view));
+  // The tab lives in the URL (#unresolved) so a reload lands on the same tab.
+  if (TABS.includes(view)) history.replaceState(null, '', '#' + view);
+}
+
+function openTab(tab){ show(tab); (TAB_LOADERS[tab] || (() => {}))(); }
+
+// One afterLogin() at a time: boot() and the auth listener both arrive here on
+// a fresh sign-in, and the second caller must wait for the first, not repeat it.
+let loginPending = null;
+async function ensureLoggedIn(){
+  if (me) return;
+  if (!loginPending) loginPending = afterLogin().finally(() => { loginPending = null; });
+  return loginPending;
 }
 
 async function afterLogin(){
@@ -236,8 +258,11 @@ async function afterLogin(){
   }
   $('#who').innerHTML = `<b>${esc(me.email)}</b> · ${esc(me.role)}`;
   $('#tab-staff').hidden = me.role !== 'admin';
-  show('customers');
-  await loadRows();
+  const wanted = (location.hash || '').slice(1);
+  const tab = TABS.includes(wanted) && (wanted !== 'staff' || me.role === 'admin') ? wanted : 'customers';
+  show(tab);
+  await loadRows();                 // the grid feeds the other tabs (byEmail in Unresolved)
+  if (tab !== 'customers') openTab(tab);
 }
 
 async function signOut(){ try { await sb.auth.signOut(); } catch(e){} session=null; me=null; show('login'); }
@@ -264,7 +289,7 @@ $('#btn-set-password').onclick = async () => {
 };
 $('#btn-password').onclick = () => { show('recovery'); };
 $('#btn-signout').onclick = signOut;
-$$('#tabs button').forEach(b => b.onclick = () => { show(b.dataset.tab); ({unresolved:loadUnresolved, jobs:loadJobs, audit:loadAudit, staff:loadStaff, guide:loadGuide}[b.dataset.tab]||(()=>{}))(); });
+$$('#tabs button').forEach(b => b.onclick = () => openTab(b.dataset.tab));
 
 /* ------------------------------------------------------------------ */
 /* customers grid                                                       */
@@ -744,10 +769,16 @@ async function reconcileSystem(r){
   try {
     const v = await api('/monitoring-admin/api/systems/'+r.system_id+'/reconcile', {method:'POST', body:{months: Number($('#rec-months').value)}});
     const cls = v.agreement_pct==null ? '' : v.agreement_pct>=97 ? 'ok' : v.agreement_pct>=80 ? 'warn' : 'bad';
-    box.innerHTML = `<span class="tag ${cls}">${esc(v.verdict)}</span> ${v.days_compared} day(s) compared, ${v.mismatched} differ${v.agreement_pct!=null?` — <b>${v.agreement_pct}% agreement</b>`:''}.`
+    // Yesterday is "provisional": Solis still settles it during the day (a
+    // precise inverter figure becomes a whole kWh, or a 0 becomes the real
+    // value) and our copy is re-read tonight. Shown, but not counted.
+    const prov = v.provisional || [];
+    const rows = [...v.mismatches.map(m => ({...m, prov:false})), ...prov.map(m => ({...m, prov:true}))];
+    box.innerHTML = `<span class="tag ${cls}">${esc(v.verdict)}</span> ${v.days_compared} settled day(s) compared, ${v.mismatched} differ${v.agreement_pct!=null?` — <b>${v.agreement_pct}% agreement</b>`:''}.`
+      + (prov.length ? ` <span class="tag warn" title="Solis revises the most recent day during the day; the nightly sync re-reads it. Not counted in the agreement.">${prov.length} day(s) provisional</span> <span class="muted">— yesterday's figure is still being settled by Solis and is re-read tonight.</span>` : '')
       + (v.only_in_ours.length ? ` <span class="muted">${v.only_in_ours.length} day(s) we hold that Solis has no data for.</span>` : '')
       + (v.only_in_solis.length ? ` <span class="muted">${v.only_in_solis.length} day(s) Solis has that we don't (queue a backfill).</span>` : '')
-      + (v.mismatches.length ? `<table style="margin-top:6px"><thead><tr><th>Day</th><th>Ours kWh</th><th>Solis kWh</th><th>Diff</th></tr></thead><tbody>${v.mismatches.slice(0,12).map(m => `<tr><td>${m.day}</td><td>${m.ours_kwh}</td><td>${m.solis_kwh}</td><td>${m.diff_kwh>0?'+':''}${m.diff_kwh}</td></tr>`).join('')}</tbody></table>` : '')
+      + (rows.length ? `<table style="margin-top:6px"><thead><tr><th>Day</th><th>Ours kWh</th><th>Solis kWh</th><th>Diff</th></tr></thead><tbody>${rows.slice(0,12).map(m => `<tr><td>${m.day}${m.prov?' <span class="tag warn">provisional</span>':''}</td><td>${m.ours_kwh}</td><td>${m.solis_kwh}</td><td>${m.diff_kwh>0?'+':''}${m.diff_kwh}</td></tr>`).join('')}</tbody></table>` : '')
       + (v.solis_errors.length ? `<div class="tag warn">Solis errors: ${esc(v.solis_errors.join('; '))}</div>` : '');
   } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
 }
@@ -903,8 +934,9 @@ async function loadUnresolved(){
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Active stations dark for more than 3 days</h3>
-        <table><thead><tr><th>Customer</th><th>System</th><th>Station</th><th>Last daily</th><th>Days dark</th></tr></thead><tbody>
-        ${u.dark_systems.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td class="mono">${esc(s.solis_station_id)}</td><td>${fmtDate(s.last_daily)}</td><td>${s.days_dark??'∞'}</td></tr>`).join('') || '<tr><td colspan=5 class="muted">none</td></tr>'}
+        <p class="hint"><b>Helpdesk</b> shows the customer's Odoo tickets (any team), open ones first, matched on the Odoo partner id with the login email as fallback — so you can see whether someone is already on it before opening a new one. Tickets are created and worked in Odoo; this is a read-only view.</p>
+        <table><thead><tr><th>Customer</th><th>System</th><th>Station</th><th>Last daily</th><th>Days dark</th><th>Helpdesk (Odoo)</th></tr></thead><tbody>
+        ${u.dark_systems.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td class="mono">${esc(s.solis_station_id)}</td><td>${fmtDate(s.last_daily)}</td><td>${s.days_dark??'∞'}</td><td class="wrap" data-helpdesk="${s.system_id}"><span class="muted">checking Odoo…</span></td></tr>`).join('') || '<tr><td colspan=6 class="muted">none</td></tr>'}
         </tbody></table></div>`;
     // One delegated handler: a click anywhere on a row that has a record
     // behind it opens the panel (the Open column was dropped 2026-09-19 as
@@ -922,6 +954,7 @@ async function loadUnresolved(){
     const byId = {}; [...(u.suspect_mappings||[]), ...(u.verified_mappings||[])].forEach(s => byId[s.system_id] = s);
     $$('#view-unresolved [data-verify]').forEach(cb => cb.onchange = () => setMappingVerified(byId[cb.dataset.verify], cb.checked, loadUnresolved));
     if ((u.suspect_mappings||[]).length) fillSuggestions();
+    if ((u.dark_systems||[]).length) fillHelpdesk();
   } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
 }
 // The Solis roster walk can take a minute and fails when Solis is unwell, so
@@ -942,15 +975,63 @@ async function fillSuggestions(){
   }
 }
 
+// Odoo helpdesk tickets for the dark list — filled after the page renders so
+// an Odoo hiccup never blanks the Unresolved tab (same shape as fillSuggestions).
+async function fillHelpdesk(){
+  const cells = $$('#view-unresolved [data-helpdesk]'); if (!cells.length) return;
+  try {
+    const res = await api('/monitoring-admin/api/unresolved/helpdesk');
+    const line = x => `<div><a href="${esc(x.url||'#')}" target="_blank" rel="noopener">#${x.id}</a> ${esc(String(x.name||'').slice(0,70))} <span class="tag ${x.closed?'':'warn'}">${esc(x.team||'')}${x.stage?' · '+esc(x.stage):''}</span> <span class="muted">${x.closed?'closed '+fmtDate(x.closed):'opened '+fmtDate(x.created)}${x.assigned?' · '+esc(x.assigned):''}</span></div>`;
+    cells.forEach(td => {
+      const h = res.helpdesk[td.dataset.helpdesk] || {open:[], closed_recent:[], app_open:0};
+      td.innerHTML = (h.open.length ? h.open.map(line).join('') : '<span class="muted">no open ticket</span>')
+        + (h.closed_recent.length ? `<details><summary class="muted">${h.closed_recent.length} closed</summary>${h.closed_recent.map(line).join('')}</details>` : '')
+        + (h.app_open ? `<div><span class="tag warn">${h.app_open} open in the customer app</span></div>` : '');
+    });
+  } catch (e) {
+    cells.forEach(td => { td.innerHTML = `<span class="muted">${esc(e.message)}</span> <button class="btn sm" data-retry-hd>Retry</button>`; });
+    $$('#view-unresolved [data-retry-hd]').forEach(b => b.onclick = () => { cells.forEach(td => td.innerHTML = '<span class="muted">checking Odoo…</span>'); fillHelpdesk(); });
+  }
+}
+
 async function loadJobs(){
   const el = $('#view-jobs'); el.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const {jobs} = await api('/monitoring-admin/api/jobs');
-    el.innerHTML = `<div class="card"><p class="hint">Jobs are drained by the backfill worker; a station can have one queued or running job per granularity.</p>
+    const {jobs, batches} = await api('/monitoring-admin/api/jobs');
+    // Default range = the previous calendar month (local dates, not UTC).
+    const ymd = x => `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}-${String(x.getDate()).padStart(2,'0')}`;
+    const now = new Date(), pmFirst = new Date(now.getFullYear(), now.getMonth()-1, 1), pmLast = new Date(now.getFullYear(), now.getMonth(), 0);
+    el.innerHTML = `
+      ${canEdit() ? `<div class="card sect"><h3 style="margin-top:0">Backfill the whole fleet</h3>
+        <p class="hint">One daily job per active station with a Solis id, all for the same date range — after a Solis outage, for a month-end re-read, or whenever the whole fleet should be re-checked against Solis. Existing rows in the range are overwritten with Solis's current values. Stations that already have a daily job queued are skipped. The worker gets through roughly 680 station-months an hour. <b>The monthly accuracy run queues the previous month by itself on the 1st</b> (09:00 Manila); use this for anything else. At most 93 days per run.</p>
+        <div class="row"><label>From <input type="date" id="fl-from" value="${ymd(pmFirst)}"></label><label>To <input type="date" id="fl-to" value="${ymd(pmLast)}"></label><input id="fl-reason" placeholder="Reason — recorded in the audit log" style="min-width:300px"><button class="btn" id="fl-preview">Preview</button><button class="btn primary" id="fl-run" disabled>Queue for every station</button></div>
+        <div class="verdict" id="fl-result" hidden></div></div>` : ''}
+      ${(batches||[]).length ? `<div class="card sect"><h3 style="margin-top:0">Fleet batches</h3>
+        <table><thead><tr><th>Queued</th><th>By</th><th>Range</th><th>Stations</th><th>Done</th><th>Running</th><th>Waiting</th><th>Failed</th><th>Rows</th><th>Reason</th></tr></thead><tbody>
+        ${batches.map(b => `<tr><td>${fmtTs(b.queued_at)}</td><td class="mono">${esc(b.requested_by||'monthly run')}</td><td>${fmtDate(b.date_from)} → ${fmtDate(b.date_to)}</td><td>${b.jobs}</td><td>${b.succeeded===b.jobs?`<span class="tag ok">${b.succeeded}</span>`:b.succeeded}</td><td>${b.running}</td><td>${b.queued}</td><td>${b.failed?`<span class="tag bad">${b.failed}</span>`:'0'}</td><td>${b.rows_written}</td><td class="wrap muted">${esc(b.reason||'')}</td></tr>`).join('')}
+        </tbody></table></div>` : ''}
+      <div class="card"><p class="hint">Jobs are drained by the backfill worker; a station can have one queued or running job per granularity.</p>
       <table><thead><tr><th>Queued</th><th>Customer</th><th>System</th><th>Granularity</th><th>Range</th><th>Status</th><th>Rows</th><th>Error</th><th></th></tr></thead><tbody>
       ${jobs.map(j => `<tr><td>${fmtTs(j.queued_at)}</td><td>${esc(j.full_name)}</td><td>${esc(j.system_name)}</td><td>${esc(j.granularity)}</td><td>${fmtDate(j.date_from)} → ${fmtDate(j.date_to)}</td><td><span class="tag ${j.status==='succeeded'?'ok':j.status==='failed'?'bad':'warn'}">${esc(j.status)}</span></td><td>${j.rows_written??''}</td><td class="muted">${esc(String(j.error||'').slice(0,100))}</td><td>${j.status==='queued'&&canEdit()?`<button class="btn sm danger" data-cancel="${j.id}">Cancel</button>`:''}</td></tr>`).join('') || '<tr><td colspan=9 class="muted">No jobs yet.</td></tr>'}
       </tbody></table></div>`;
     $$('#view-jobs [data-cancel]').forEach(b => b.onclick = async () => { try { await api('/monitoring-admin/api/jobs/'+b.dataset.cancel+'/cancel', {method:'POST'}); loadJobs(); } catch(e) { toast(e.message, true); } });
+    const flBody = () => ({date_from: $('#fl-from').value, date_to: $('#fl-to').value, reason: $('#fl-reason').value.trim()});
+    if ($('#fl-preview')) $('#fl-preview').onclick = async () => {
+      const box = $('#fl-result'); box.hidden = false; box.textContent = 'Counting…';
+      try {
+        const p = await api('/monitoring-admin/api/backfill/fleet', {method:'POST', body:{...flBody(), dry_run:true}});
+        const mins = Math.max(1, Math.round(p.to_queue * p.months_per_station * 4 / 60));
+        box.innerHTML = `<b>${p.to_queue}</b> station(s) would be queued, ${p.months_per_station} month(s) each — about ${mins} min of worker time${p.skipped_busy?`; <b>${p.skipped_busy}</b> skipped because a daily job is already queued or running`:''}.`;
+        $('#fl-run').disabled = !p.to_queue;
+      } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; $('#fl-run').disabled = true; }
+    };
+    if ($('#fl-run')) $('#fl-run').onclick = async () => {
+      const b = flBody();
+      if (b.reason.length < 3) return toast('Type a reason first — it goes into the audit log', true);
+      if (!confirm(`Queue a daily backfill ${b.date_from} → ${b.date_to} for every active station?\n\nRows already stored for those days are overwritten with Solis's current values. The worker needs up to an hour per month of range.`)) return;
+      try { const r = await api('/monitoring-admin/api/backfill/fleet', {method:'POST', body:b}); toast(`${r.queued} job(s) queued`); loadJobs(); }
+      catch (e) { toast(e.message, true); }
+    };
   } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
 }
 
@@ -1024,12 +1105,13 @@ function loadGuide(){
 
     <h3>4. Missing days / refreshing history</h3>
     <p>In the customer panel, pick a date range → <b>Queue backfill</b>. The worker runs every 15 minutes; progress is in <b>Backfills</b>, and the row shows "backfill running/succeeded". A backfill overwrites the dates it fetches with Solis's current values.</p>
+    <p><b>Whole fleet:</b> Backfills → <i>Backfill the whole fleet</i> → range, reason, Preview, Queue. One job per active station; progress shows as one line under <i>Fleet batches</i>. <b>Every 1st of the month at 09:00</b> the previous month is queued for every station automatically (the "monthly accuracy run"), so month-ends are re-read once Solis has settled them. <b>Yesterday is provisional:</b> Solis keeps adjusting the most recent day during the day and the nightly sync re-reads it, so <i>Check data vs Solis</i> lists it separately and does not count it.</p>
 
     <h3>5. A new customer isn't appearing</h3>
     <p>Accounts are created automatically every night from Odoo leads that have a valid email and a station id. Unresolved → <i>Nightly onboarding failures</i> lists the leads that were rejected and why (usually two emails in one field, or a placeholder). Those are fixed in Odoo by sales; the account appears the night after.</p>
 
     <h3>6. Dark stations</h3>
-    <p>Unresolved → <i>Active stations dark &gt;3 days</i>. If the plant is really offline or decommissioned, set its <b>Status</b> in the panel (inactive / decommissioned) with a reason, so it stops counting as a data problem.</p>
+    <p>Unresolved → <i>Active stations dark &gt;3 days</i>. The <b>Helpdesk</b> column lists the customer's Odoo tickets (open first, any team) with a link into Odoo, so you know whether the outage is already being handled before you open another ticket. If the plant is really offline or decommissioned, set its <b>Status</b> in the panel (inactive / decommissioned) with a reason, so it stops counting as a data problem.</p>
 
     <h3>7. Several people must watch one station (SME staff, a family member)</h3>
     <p>Open the station → <b>Who can view this station</b> → <i>Give another login view access</i> → email, name, reason → Grant. If the email has no login yet, one is created and a temporary password is shown once — pass it on privately and have them change it. The viewer sees this station in the portal exactly as the owner does, read-only, without the owner's contact details. Revoke from the same list. Ownership does not move: the Odoo mapping, the syncs and the backfills still follow the owner. Never give the second person a second station row or a second Odoo lead — that is the duplicate pattern Retire cleans up.</p>

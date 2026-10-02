@@ -605,29 +605,40 @@ async def reconcile_system(system_id: uuid.UUID, body: ReconcileRequest, authori
             if p and p["date_str"] < today.isoformat():
                 theirs[p["date_str"]] = p["production_kwh"]
 
+    # Yesterday is PROVISIONAL: at 02:00 Manila Solis still carries a running
+    # inverter figure (15.7) that it settles to a whole kWh (15.0) later in the
+    # day — or a 0 it fills in later. The nightly sync re-upserts the whole
+    # month, so the stored value catches up the next night. Reported
+    # separately and left out of the agreement, otherwise every check run
+    # during the day flagged a day that was never wrong (2026-10-02).
+    provisional_from = (today - dt.timedelta(days=1)).isoformat()
     compared = sorted(set(ours) & set(theirs))
-    mism = []
+    mism, provisional = [], []
     for day_s in compared:
         a, b = ours[day_s], theirs[day_s]
         if abs(a - b) > max(MISMATCH_ABS_KWH, MISMATCH_REL * max(abs(a), abs(b))):
-            mism.append({"day": day_s, "ours_kwh": round(a, 2), "solis_kwh": round(b, 2), "diff_kwh": round(b - a, 2)})
-    pct = round(100.0 * (len(compared) - len(mism)) / len(compared), 1) if compared else None
+            entry = {"day": day_s, "ours_kwh": round(a, 2), "solis_kwh": round(b, 2), "diff_kwh": round(b - a, 2)}
+            (provisional if day_s >= provisional_from else mism).append(entry)
+    settled = [d for d in compared if d < provisional_from]
+    pct = round(100.0 * (len(settled) - len(mism)) / len(settled), 1) if settled else None
     # This compares OUR rows with Solis for the station id WE HOLD. It proves
     # data integrity for that id (stale rows, a past remap never backfilled),
     # not identity: a customer wrongly mapped to another plant still agrees
     # 99% here, because the rows are that plant's data faithfully copied.
     # Identity is judged from the plant name and Solis email vs the customer.
-    if not compared:
-        verdict = "nothing to compare — no overlapping days"
+    if not settled:
+        verdict = ("only provisional day(s) to compare — check again tomorrow" if provisional
+                   else "nothing to compare — no overlapping days")
     elif pct >= 97:
         verdict = "stored data matches Solis for this station id"
     elif pct >= 80:
-        verdict = "mostly matches — look at the mismatched days (Solis revises recent days)"
+        verdict = "mostly matches — look at the mismatched days"
     else:
         verdict = "stored data does NOT match this station's Solis history — stale rows, or a remap that was never backfilled; queue a backfill"
     return _j({
-        "station_id": sys_row["solis_station_id"], "months": months, "days_compared": len(compared),
+        "station_id": sys_row["solis_station_id"], "months": months, "days_compared": len(settled),
         "mismatched": len(mism), "agreement_pct": pct, "verdict": verdict,
+        "provisional": provisional, "days_provisional": len(provisional),
         "only_in_ours": sorted(set(ours) - set(theirs))[:30], "only_in_solis": sorted(set(theirs) - set(ours))[:30],
         "mismatches": sorted(mism, key=lambda x: -abs(x["diff_kwh"]))[:40], "solis_errors": errors,
     })
@@ -1039,10 +1050,98 @@ async def enqueue_backfill(body: BackfillRequest, authorization: str = Header(No
     return {"ok": True, "job": _j(job)}
 
 
+class FleetBackfillRequest(BaseModel):
+    date_from: dt.date
+    date_to: dt.date
+    reason: str = ""
+    dry_run: bool = False
+
+
+FLEET_BACKFILL_MAX_DAYS = 93
+
+# Every active station with a Solis id, and whether a daily job is already
+# queued or running for it (backfill_jobs_one_active_uk allows one per station).
+# Shared with api/enqueue_fleet_backfill.py, the monthly accuracy run.
+FLEET_TARGETS_SQL = """
+    select s.id, s.solis_station_id,
+           exists (select 1 from public.backfill_jobs j
+                    where j.system_id = s.id and j.granularity = 'daily'
+                      and j.status in ('queued', 'running')) as busy
+      from public.solar_systems s
+     where s.status = 'active' and s.solis_station_id is not null
+     order by s.id"""
+
+
+@router.post("/api/backfill/fleet")
+async def enqueue_fleet_backfill(body: FleetBackfillRequest, authorization: str = Header(None)):
+    """One daily backfill job per active station, all for the same date range —
+    engineering's "backfill all clients, only the range varies" (2026-10-02).
+    The worker drains them like any other job (~3–4 s per station-month, so
+    ~680 one-month jobs take about an hour over its 15-minute runs). Stations
+    with a daily job already queued or running are skipped, not failed. Capped
+    at 93 days so one click cannot queue a year of Solis calls for the fleet."""
+    staff = await _authenticate_staff(authorization)
+    _require(staff, "engineer")
+    today = dt.datetime.now(PHT).date()
+    if body.date_to < body.date_from:
+        raise HTTPException(400, "date_to is before date_from")
+    if body.date_to >= today:
+        raise HTTPException(400, "date_to must be before today — today's row is a placeholder until tonight's sync")
+    if (body.date_to - body.date_from).days + 1 > FLEET_BACKFILL_MAX_DAYS:
+        raise HTTPException(400, f"At most {FLEET_BACKFILL_MAX_DAYS} days per fleet backfill")
+    months = (body.date_to.year - body.date_from.year) * 12 + body.date_to.month - body.date_from.month + 1
+    if body.dry_run:
+        with db.connect(autocommit=True) as conn:
+            rows = conn.execute(FLEET_TARGETS_SQL).fetchall()
+        busy = sum(1 for r in rows if r["busy"])
+        return {"dry_run": True, "stations": len(rows), "to_queue": len(rows) - busy, "skipped_busy": busy,
+                "months_per_station": months}
+    reason = _reason(body.reason)
+    request_id = str(uuid.uuid4())
+    try:
+        with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
+            rows = conn.execute(FLEET_TARGETS_SQL).fetchall()
+            targets = [r for r in rows if not r["busy"]]
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """insert into public.backfill_jobs
+                         (system_id, solis_station_id, granularity, date_from, date_to,
+                          requested_by, requested_reason, request_id)
+                       values (%s, %s, 'daily', %s, %s, %s, %s, %s)
+                       on conflict do nothing""",
+                    [(r["id"], r["solis_station_id"], body.date_from, body.date_to, staff["id"], reason, request_id)
+                     for r in targets])
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise _db_error(exc)
+    return {"ok": True, "request_id": request_id, "stations": len(rows), "queued": len(targets),
+            "skipped_busy": len(rows) - len(targets), "months_per_station": months}
+
+
+# Fleet batches (several jobs under one request id): progress per batch, so a
+# 680-job run reads as one line instead of 680.
+BATCHES_SQL = """
+    select j.request_id, min(j.queued_at) as queued_at, count(*) as jobs,
+           count(*) filter (where j.status = 'queued') as queued,
+           count(*) filter (where j.status = 'running') as running,
+           count(*) filter (where j.status = 'succeeded') as succeeded,
+           count(*) filter (where j.status = 'failed') as failed,
+           count(*) filter (where j.status not in ('queued', 'running', 'succeeded', 'failed')) as other,
+           min(j.date_from) as date_from, max(j.date_to) as date_to,
+           max(j.requested_reason) as reason, max(u.email) as requested_by,
+           coalesce(sum(j.rows_written), 0) as rows_written
+      from public.backfill_jobs j
+      left join auth.users u on u.id = j.requested_by
+     group by j.request_id having count(*) > 1
+     order by min(j.queued_at) desc limit 12"""
+
+
 @router.get("/api/jobs")
 async def jobs(status: Optional[str] = None, limit: int = 200, authorization: str = Header(None)):
     await _authenticate_staff(authorization)
     with db.connect(autocommit=True) as conn:
+        batches = conn.execute(BATCHES_SQL).fetchall()
         if status:
             data = conn.execute(
                 """select j.*, s.system_name, p.full_name from public.backfill_jobs j
@@ -1055,7 +1154,7 @@ async def jobs(status: Optional[str] = None, limit: int = 200, authorization: st
                      join public.solar_systems s on s.id = j.system_id
                      left join public.user_profiles p on p.id = s.user_id
                     order by j.queued_at desc limit %s""", (min(limit, 1000),)).fetchall()
-    return {"jobs": _j(data)}
+    return {"jobs": _j(data), "batches": _j(batches)}
 
 
 @router.post("/api/jobs/{job_id}/cancel")
@@ -1177,16 +1276,7 @@ async def unresolved(authorization: str = Header(None)):
                  left join public.user_profiles p on p.id = s.user_id
                  left join auth.users u on u.id = s.user_id
                 where s.solis_station_id is null order by s.created_at""").fetchall()
-        dark = conn.execute(
-            """select s.id as system_id, s.system_name, s.solis_station_id, p.full_name, s.status,
-                      r.last_daily, (current_date - r.last_daily::date) as days_dark
-                 from public.solar_systems s
-                 left join public.user_profiles p on p.id = s.user_id
-                 left join lateral (select max("timestamp") as last_daily
-                                      from public.energy_readings r where r.system_id = s.id) r on true
-                where s.status = 'active' and s.solis_station_id is not null
-                  and (r.last_daily is null or r.last_daily < now() - interval '3 days')
-                order by r.last_daily nulls first""").fetchall()
+        dark = conn.execute(DARK_SQL).fetchall()
         run = conn.execute(
             "select ran_at, candidates, created, failed, duplicate_email, missing_email, duplicate_station, report "
             "from public.onboarding_runs order by ran_at desc limit 1").fetchone()
@@ -1272,6 +1362,74 @@ async def unresolved(authorization: str = Header(None)):
         "suspect_mappings": suspects,
         "verified_mappings": verified,
     })
+
+
+# Active stations with no daily row for 3+ days (or none ever). Carries the
+# customer's Odoo partner id and emails so the helpdesk lookup below can match.
+DARK_SQL = """
+    select s.id as system_id, s.user_id, s.system_name, s.solis_station_id, p.full_name, s.status,
+           p.odoo_partner_id, p.odoo_email, u.email as login_email,
+           r.last_daily, (current_date - r.last_daily::date) as days_dark
+      from public.solar_systems s
+      left join public.user_profiles p on p.id = s.user_id
+      left join auth.users u on u.id = s.user_id
+      left join lateral (select max("timestamp") as last_daily
+                           from public.energy_readings r where r.system_id = s.id) r on true
+     where s.status = 'active' and s.solis_station_id is not null
+       and (r.last_daily is null or r.last_daily < now() - interval '3 days')
+     order by r.last_daily nulls first"""
+
+
+@router.get("/api/unresolved/helpdesk")
+async def dark_helpdesk(authorization: str = Header(None)):
+    """Odoo helpdesk tickets for the customers in the dark list, so engineering
+    sees whether a dark station is already being handled (asked 2026-10-02).
+    Any helpdesk team. Matched on the partner id the nightly mirror holds, with
+    the login / Odoo email as fallback. Read-only toward Odoo, and separate
+    from /api/unresolved so the page never waits on Odoo (same shape as
+    /api/suspects/suggestions). Also counts the customer's open tickets from
+    the mobile app (public.support_tickets)."""
+    await _authenticate_staff(authorization)
+    with db.connect(autocommit=True) as conn:
+        dark = conn.execute(DARK_SQL).fetchall()
+        app_open = {str(r["user_id"]): r["n"] for r in conn.execute(
+            """select user_id, count(*) as n from public.support_tickets
+                where coalesce(status, '') not in ('closed', 'resolved') group by user_id""").fetchall()}
+    if not dark:
+        return {"helpdesk": {}, "tickets_matched": 0}
+    partner_ids = sorted({int(r["odoo_partner_id"]) for r in dark if r["odoo_partner_id"]})
+    emails = sorted({e.lower() for r in dark for e in (r["login_email"], r["odoo_email"]) if e})
+    domain = ["|", ["partner_id", "in", partner_ids], ["partner_email", "in", emails]]
+    fields = ["id", "name", "partner_id", "partner_email", "team_id", "stage_id", "create_date", "close_date", "user_id"]
+    try:
+        tickets = await _odoo_search_read("helpdesk.ticket", domain, fields, limit=1000)
+    except Exception as exc:
+        raise HTTPException(503, f"Odoo helpdesk unavailable right now — {str(exc)[:120]}")
+
+    base = (os.getenv("ODOO_SH_URL") or os.getenv("ODOO_URL") or "").rstrip("/")
+
+    def _m2o(v: Any) -> Optional[str]:
+        return v[1] if isinstance(v, (list, tuple)) and len(v) > 1 else None
+
+    def _ticket(t: Dict[str, Any]) -> Dict[str, Any]:
+        return {"id": t["id"], "name": t.get("name"), "team": _m2o(t.get("team_id")), "stage": _m2o(t.get("stage_id")),
+                "assigned": _m2o(t.get("user_id")), "created": t.get("create_date"), "closed": t.get("close_date") or None,
+                "url": f"{base}/web#id={t['id']}&model=helpdesk.ticket&view_type=form" if base else None}
+
+    out: Dict[str, Any] = {}
+    for r in dark:
+        pid = int(r["odoo_partner_id"]) if r["odoo_partner_id"] else None
+        mine_emails = [e.lower() for e in (r["login_email"], r["odoo_email"]) if e]
+        mine = [t for t in tickets
+                if (pid and isinstance(t.get("partner_id"), (list, tuple)) and t["partner_id"][0] == pid)
+                or any(e in str(t.get("partner_email") or "").lower() for e in mine_emails)]
+        mine.sort(key=lambda t: t.get("create_date") or "", reverse=True)
+        out[str(r["system_id"])] = {
+            "open": [_ticket(t) for t in mine if not t.get("close_date")],
+            "closed_recent": [_ticket(t) for t in mine if t.get("close_date")][:3],
+            "app_open": app_open.get(str(r["user_id"]), 0),
+        }
+    return {"helpdesk": out, "tickets_matched": len(tickets)}
 
 
 @router.get("/api/suspects/suggestions")
