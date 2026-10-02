@@ -2,13 +2,23 @@
 Mirror customer-identity fields from Odoo and Solis into OUR cached columns.
 
     solar_systems.odoo_lead_id / odoo_lead_email / odoo_lead_name / odoo_stage
+    solar_systems.electricity_provider_id          (migration 18)
     solar_systems.solis_plant_name / solis_user_email
     user_profiles.odoo_partner_id / odoo_email / odoo_customer_name
+    user_profiles.electricity_provider_id          (legacy copy, filled only when NULL)
 
 Migration 04a created these columns so Monitoring Admin could show, side by
 side, what each system believes about a customer — and where they disagree.
 Nothing populated them: on 2026-09-17 all four odoo_* columns were empty on
 every one of 627 rows. This job fills them and keeps them current.
+
+The electricity provider (migration 18, 2026-10-02) is the lead's
+x_studio_crm_electricity_provider, carried as a plain-text code that matches
+electricity_providers.code exactly (MERALCO, BATELEC II, PELCO I, ...). It is
+per station because a lead is per project and a customer's plants can sit in
+different franchise areas; the monthly_energy_sync_* views price each station
+with it. A code we do not have is logged once and leaves our value alone, so a
+new cooperative in Odoo shows up in the log instead of blanking a station.
 
 READ-ONLY toward Odoo and Solis. Odoo is the sales team's source of truth and is
 never written from this project (see api/monitoring_admin_routes.py); this copies
@@ -23,10 +33,13 @@ db.audited() with source='sync_identity_mirror', so the 08 audit trigger
 records every changed value as actor_kind='job'. Only rows whose values differ
 are touched.
 
-    python -m api.sync_identity_mirror            # dry-run: counts only
-    python -m api.sync_identity_mirror --apply    # write
+    python -m api.sync_identity_mirror                 # dry-run: counts only
+    python -m api.sync_identity_mirror --apply         # write
+    python -m api.sync_identity_mirror --skip-solis    # Odoo half only (Solis down, or a provider backfill)
 
-Runs nightly at the end of api.sync_to_supabase; safe to run any time.
+Runs nightly at the end of api.sync_to_supabase; safe to run any time. A Solis
+timeout no longer aborts the run: the Odoo half proceeds and the Solis columns
+keep their current values (since 2026-10-02).
 """
 
 from __future__ import annotations
@@ -47,8 +60,10 @@ from api.onboard_from_odoo import DEFAULT_FIELD_NAME, _build_odoo_config, _conne
 
 log = logging.getLogger("identity_mirror")
 
+PROVIDER_CODE_FIELD = "x_studio_crm_electricity_provider_code"
+PROVIDER_M2O_FIELD = "x_studio_crm_electricity_provider"
 LEAD_FIELDS = ["id", "name", "partner_name", "contact_name", "email_from", "stage_id",
-               "partner_id", "write_date", DEFAULT_FIELD_NAME]
+               "partner_id", "write_date", DEFAULT_FIELD_NAME, PROVIDER_CODE_FIELD, PROVIDER_M2O_FIELD]
 PARTNER_FIELDS = ["id", "name", "email"]
 
 
@@ -57,6 +72,27 @@ def _clean(v: Any) -> Optional[str]:
         return None
     s = str(v).strip()
     return s or None
+
+
+def load_provider_maps(conn) -> Dict[str, Dict[str, int]]:
+    """{'code': {CODE: id}, 'name': {NAME: id}} from electricity_providers, upper-cased."""
+    rows = conn.execute("select id, code, name from public.electricity_providers").fetchall()
+    return {
+        "code": {str(r["code"]).strip().upper(): r["id"] for r in rows if r["code"]},
+        "name": {str(r["name"]).strip().upper(): r["id"] for r in rows if r["name"]},
+    }
+
+
+def resolve_provider(code: Optional[str], name: Optional[str], maps: Dict[str, Dict[str, int]]) -> Optional[int]:
+    """Our electricity_providers.id for an Odoo lead's provider: by code first
+    (the field sales fills), then by the many2one's display name. None when the
+    lead has no provider or names one we do not carry."""
+    if code and code.strip().upper() in maps["code"]:
+        return maps["code"][code.strip().upper()]
+    for cand in (name, code):
+        if cand and cand.strip().upper() in maps["name"]:
+            return maps["name"][cand.strip().upper()]
+    return None
 
 
 def fetch_odoo() -> Dict[str, Dict[str, Any]]:
@@ -88,6 +124,7 @@ def fetch_odoo() -> Dict[str, Dict[str, Any]]:
             log.warning("Odoo: station %s is on leads %s and %s — keeping the newer",
                         sid, by_station[sid]["lead_id"], lead["id"])
         partner = partners.get(lead["partner_id"][0]) if lead.get("partner_id") else None
+        m2o = lead.get(PROVIDER_M2O_FIELD)
         by_station[sid] = {
             "lead_id": lead["id"],
             "lead_email": _clean(lead.get("email_from")),
@@ -96,6 +133,8 @@ def fetch_odoo() -> Dict[str, Dict[str, Any]]:
             "partner_id": partner["id"] if partner else None,
             "partner_email": _clean(partner.get("email")) if partner else None,
             "partner_name": _clean(partner.get("name")) if partner else None,
+            "provider_code": _clean(lead.get(PROVIDER_CODE_FIELD)),
+            "provider_name": _clean(m2o[1]) if isinstance(m2o, (list, tuple)) and len(m2o) > 1 else None,
         }
     log.info("Odoo: %d leads with a station id -> %d distinct stations, %d partners",
              len(leads), len(by_station), len(partners))
@@ -113,22 +152,41 @@ async def fetch_solis() -> Dict[str, Dict[str, Any]]:
     return out
 
 
-async def run(apply: bool) -> Dict[str, int]:
+async def run(apply: bool, skip_solis: bool = False) -> Dict[str, int]:
     odoo = fetch_odoo()
-    solis = await fetch_solis()
+    if skip_solis:
+        solis: Dict[str, Dict[str, Any]] = {}
+        log.info("Solis skipped (--skip-solis): plant name / email are left as they are")
+    else:
+        try:
+            solis = await fetch_solis()
+        except Exception as exc:
+            # Solis Cloud times out often enough (userStationList is ~7 calls of
+            # 100 stations) that it must not take the Odoo half down with it:
+            # until 2026-10-02 one Solis timeout meant no lead, partner or
+            # provider refresh that night either. With an empty roster every
+            # station reads as "not in Solis", so plant name / email keep their
+            # current value and solis_synced_at is not stamped — see `new` below.
+            log.error("Solis roster unavailable (%s) — plant name / email left as they are tonight; "
+                      "the Odoo mirror runs anyway", str(exc)[:160])
+            solis = {}
     now = datetime.now(timezone.utc)
 
     with db.connect(autocommit=True) as conn:
         systems = conn.execute(
             """select id, user_id, solis_station_id, is_primary,
                       odoo_lead_id, odoo_lead_email, odoo_lead_name, odoo_stage,
+                      electricity_provider_id,
                       solis_plant_name, solis_user_email
                  from public.solar_systems where solis_station_id is not null""").fetchall()
         profiles = {p["id"]: p for p in conn.execute(
-            "select id, odoo_partner_id, odoo_email, odoo_customer_name from public.user_profiles").fetchall()}
+            """select id, odoo_partner_id, odoo_email, odoo_customer_name, electricity_provider_id
+                 from public.user_profiles""").fetchall()}
+        provider_maps = load_provider_maps(conn)
 
     sys_updates: List[tuple] = []
     prof_updates: Dict[Any, tuple] = {}
+    unknown_provider_codes: Dict[str, int] = {}
     # Rows whose values were confirmed tonight, changed or not. Monitoring Admin
     # shows odoo_synced_at / solis_synced_at as "last synced", so the stamp must
     # mean "the copy was checked against the source", not "a value changed" —
@@ -138,7 +196,8 @@ async def run(apply: bool) -> Dict[str, int]:
     solis_ok_systems: List[Any] = []
     odoo_ok_profiles: List[Any] = []
     counts = {"systems_seen": len(systems), "systems_changed": 0, "profiles_changed": 0,
-              "stations_in_odoo": 0, "stations_in_solis": 0}
+              "stations_in_odoo": 0, "stations_in_solis": 0,
+              "providers_resolved": 0, "providers_unknown_code": 0, "providers_lead_blank": 0}
 
     for s in systems:
         sid = str(s["solis_station_id"])
@@ -149,16 +208,32 @@ async def run(apply: bool) -> Dict[str, int]:
             odoo_ok_systems.append(s["id"])
         if z:
             solis_ok_systems.append(s["id"])
+        # Provider: Odoo's value wins when the lead names one we carry; a blank
+        # lead or an unknown code keeps ours (migration 18 seeded it from the
+        # profile, and an engineer may have set it by hand).
+        provider_id = None
+        if o:
+            provider_id = resolve_provider(o["provider_code"], o["provider_name"], provider_maps)
+            if provider_id is not None:
+                counts["providers_resolved"] += 1
+            elif o["provider_code"] or o["provider_name"]:
+                counts["providers_unknown_code"] += 1
+                label = o["provider_code"] or o["provider_name"]
+                unknown_provider_codes[label] = unknown_provider_codes.get(label, 0) + 1
+            else:
+                counts["providers_lead_blank"] += 1
         new = {
             "odoo_lead_id": o["lead_id"] if o else s["odoo_lead_id"],
             "odoo_lead_email": o["lead_email"] if o else s["odoo_lead_email"],
             "odoo_lead_name": o["lead_name"] if o else s["odoo_lead_name"],
             "odoo_stage": o["stage"] if o else s["odoo_stage"],
+            "electricity_provider_id": provider_id if provider_id is not None else s["electricity_provider_id"],
             "solis_plant_name": (z["plant_name"] if z else None) or s["solis_plant_name"],
             "solis_user_email": z["user_email"] if z else s["solis_user_email"],
         }
         if any(new[k] != s[k] for k in new):
             sys_updates.append((new["odoo_lead_id"], new["odoo_lead_email"], new["odoo_lead_name"], new["odoo_stage"],
+                                new["electricity_provider_id"],
                                 now if o else None, new["solis_plant_name"], new["solis_user_email"],
                                 now if z else None, s["id"]))
         if o and s["is_primary"] and s["user_id"] in profiles:
@@ -166,12 +241,22 @@ async def run(apply: bool) -> Dict[str, int]:
             odoo_ok_profiles.append(p["id"])
             pn = {"odoo_partner_id": o["partner_id"],
                   "odoo_email": o["partner_email"] or o["lead_email"],
-                  "odoo_customer_name": o["partner_name"] or o["lead_name"]}
+                  "odoo_customer_name": o["partner_name"] or o["lead_name"],
+                  # Legacy per-customer copy: fill it from the primary station
+                  # only while it is empty. Never overwrite — the station column
+                  # is the one that is read now, and this one may be hand-set.
+                  "electricity_provider_id": (p["electricity_provider_id"]
+                                              if p["electricity_provider_id"] is not None
+                                              else new["electricity_provider_id"])}
             if any(pn[k] != p[k] for k in pn):
-                prof_updates[p["id"]] = (pn["odoo_partner_id"], pn["odoo_email"], pn["odoo_customer_name"], now, p["id"])
+                prof_updates[p["id"]] = (pn["odoo_partner_id"], pn["odoo_email"], pn["odoo_customer_name"],
+                                         pn["electricity_provider_id"], now, p["id"])
 
     counts["systems_changed"], counts["profiles_changed"] = len(sys_updates), len(prof_updates)
     log.info("mirror: %s", counts)
+    for label, n in sorted(unknown_provider_codes.items(), key=lambda kv: -kv[1]):
+        log.warning("Odoo names electricity provider %r on %d lead(s) but electricity_providers has no such code "
+                    "or name — add it there (code must match Odoo's) and the next run fills those stations", label, n)
     if not apply:
         log.info("dry-run — nothing written. Pass --apply to write.")
         return counts
@@ -181,6 +266,7 @@ async def run(apply: bool) -> Dict[str, int]:
             cur.executemany(
                 """update public.solar_systems
                       set odoo_lead_id = %s, odoo_lead_email = %s, odoo_lead_name = %s, odoo_stage = %s,
+                          electricity_provider_id = %s,
                           odoo_synced_at = coalesce(%s, odoo_synced_at),
                           solis_plant_name = %s, solis_user_email = %s,
                           solis_synced_at = coalesce(%s, solis_synced_at),
@@ -189,6 +275,7 @@ async def run(apply: bool) -> Dict[str, int]:
             cur.executemany(
                 """update public.user_profiles
                       set odoo_partner_id = %s, odoo_email = %s, odoo_customer_name = %s,
+                          electricity_provider_id = %s,
                           odoo_synced_at = %s, updated_at = now()
                     where id = %s""", list(prof_updates.values()))
             # Freshness stamp for the unchanged rows. The *_synced_at columns are
@@ -209,8 +296,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     ap = argparse.ArgumentParser(description="Mirror Odoo/Solis identity fields into our cached columns (read-only toward Odoo/Solis).")
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--skip-solis", action="store_true",
+                    help="Odoo half only: do not call Solis Cloud (plant name / email keep their current value)")
     args = ap.parse_args()
-    counts = asyncio.run(run(apply=args.apply))
+    counts = asyncio.run(run(apply=args.apply, skip_solis=args.skip_solis))
     print(counts)
 
 

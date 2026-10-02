@@ -3,6 +3,14 @@
 -- These existed only in the database; no migration file created them.
 -- Migration 11 recreates them with security_invoker and revokes anon.
 -- Grants at dump time are recorded per view so 11 can be checked against them.
+--
+-- 2026-10-02: monthly_energy_sync_base re-dumped after migration 18. Two
+-- differences from the 2026-09-16 dump: (1) the target month had been changed
+-- in the database to CURRENT_DATE - 1 month (was - 2 months; not done through a
+-- file in this repo), and (2) file 18 repointed the electricity_providers join
+-- from user_profiles to solar_systems, so each station is priced with its own
+-- provider. All six views now carry security_invoker=on and no anon/authenticated
+-- grant (file 11). The five child views are unchanged.
 
 -- ===== public.monthly_energy_sync   owner=postgres   reloptions=None
 --   grant: anon -> DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE
@@ -49,9 +57,10 @@ create or replace view public.monthly_energy_sync_admin_gaps as
 --   grant: authenticated -> DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE
 --   grant: postgres -> DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE
 --   grant: service_role -> DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE
-create or replace view public.monthly_energy_sync_base as
+create or replace view public.monthly_energy_sync_base
+with (security_invoker = on) as
  WITH target_month AS (
-         SELECT date_trunc('month'::text, CURRENT_DATE::timestamp with time zone - '2 mons'::interval) AS month_start
+         SELECT date_trunc('month'::text, CURRENT_DATE::timestamp with time zone - '1 mon'::interval) AS month_start
         )
  SELECT e.user_id,
     up.full_name AS customer_name,
@@ -78,7 +87,7 @@ create or replace view public.monthly_energy_sync_base as
      CROSS JOIN target_month tm
      JOIN solar_systems ss ON e.system_id = ss.id
      LEFT JOIN user_profiles up ON e.user_id = up.id
-     LEFT JOIN electricity_providers ep ON up.electricity_provider_id = ep.id
+     LEFT JOIN electricity_providers ep ON ss.electricity_provider_id = ep.id
      LEFT JOIN LATERAL ( SELECT rates.rate
            FROM electricity_rates rates
           WHERE rates.provider_id = ep.id AND rates.effective_date <= (tm.month_start + '1 mon'::interval - '1 day'::interval)

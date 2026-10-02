@@ -76,6 +76,9 @@ SYSTEM_FIELDS = {
     "solis_station_id", "system_name", "capacity_kwp", "installation_date", "status",
     "address", "battery_capacity_kwh", "is_primary",
     "odoo_lead_id", "odoo_lead_email", "odoo_lead_name", "odoo_stage",
+    # migration 18: the tariff's utility is per station (franchise area of the
+    # plant), mirrored nightly from the Odoo lead like the other odoo_* fields.
+    "electricity_provider_id",
     "solis_plant_name", "solis_user_email",
 }
 PROFILE_FIELDS = {
@@ -229,6 +232,7 @@ select s.id as system_id, s.user_id, s.system_name, s.capacity_kwp, s.installati
        s.status, s.is_primary, s.address, s.battery_capacity_kwh,
        s.solis_station_id, s.solis_plant_name, s.solis_user_email, s.solis_validated_at, s.solis_validation,
        s.odoo_lead_id, s.odoo_lead_email, s.odoo_lead_name, s.odoo_stage,
+       s.electricity_provider_id, ep.code as electricity_provider_code, ep.name as electricity_provider_name,
        s.odoo_synced_at, s.solis_synced_at, p.odoo_synced_at as profile_odoo_synced_at,
        (select count(*) from public.system_access a where a.system_id = s.id) as viewer_count,
        s.last_backfill_at, s.last_backfill_status, s.created_at,
@@ -241,6 +245,7 @@ select s.id as system_id, s.user_id, s.system_name, s.capacity_kwp, s.installati
        j.id as active_job_id, j.status as active_job_status, j.granularity as active_job_granularity
   from public.solar_systems s
   left join public.user_profiles p on p.id = s.user_id
+  left join public.electricity_providers ep on ep.id = s.electricity_provider_id
   left join auth.users u on u.id = s.user_id
   left join daily r on r.system_id = s.id
   left join fm f on f.system_id = s.id
@@ -369,7 +374,7 @@ async def edit_system(system_id: uuid.UUID, body: EditRequest, authorization: st
         if sid and not STATION_ID_RE.match(sid):
             raise HTTPException(400, "Solis station id must be 15–20 digits")
         fields["solis_station_id"] = sid
-    for k in ("odoo_lead_id", "capacity_kwp", "battery_capacity_kwh", "installation_date"):
+    for k in ("odoo_lead_id", "capacity_kwp", "battery_capacity_kwh", "installation_date", "electricity_provider_id"):
         if k in fields and fields[k] in ("", None):
             fields[k] = None
 
@@ -1351,13 +1356,16 @@ async def refresh_from_odoo(system_id: uuid.UUID, authorization: str = Header(No
     wins when two leads carry the id, as in the mirror; the response says so."""
     staff = await _authenticate_staff(authorization)
     _require(staff, "engineer")
+    from api.sync_identity_mirror import PROVIDER_CODE_FIELD, PROVIDER_M2O_FIELD, load_provider_maps, resolve_provider
     with db.connect(autocommit=True) as conn:
         s = conn.execute(
             """select s.id, s.user_id, s.is_primary, s.solis_station_id,
                       s.odoo_lead_id, s.odoo_lead_email, s.odoo_lead_name, s.odoo_stage,
+                      s.electricity_provider_id,
                       p.odoo_partner_id, p.odoo_email, p.odoo_customer_name
                  from public.solar_systems s left join public.user_profiles p on p.id = s.user_id
                 where s.id = %s""", (system_id,)).fetchone()
+        provider_maps = load_provider_maps(conn)
     if not s:
         raise HTTPException(404, "No such system")
     sid = s["solis_station_id"]
@@ -1366,7 +1374,8 @@ async def refresh_from_odoo(system_id: uuid.UUID, authorization: str = Header(No
     try:
         leads = await _odoo_search_read(
             "crm.lead", [[DEFAULT_FIELD_NAME, "=", sid]],
-            ["id", "name", "partner_name", "contact_name", "email_from", "stage_id", "partner_id"])
+            ["id", "name", "partner_name", "contact_name", "email_from", "stage_id", "partner_id",
+             PROVIDER_CODE_FIELD, PROVIDER_M2O_FIELD])
     except Exception as exc:
         raise HTTPException(502, f"Odoo did not answer: {str(exc)[:160]}")
     if not leads:
@@ -1382,11 +1391,19 @@ async def refresh_from_odoo(system_id: uuid.UUID, authorization: str = Header(No
             raise HTTPException(502, f"Odoo did not answer for the contact: {str(exc)[:160]}")
         partner = found[0] if found else None
 
+    m2o = lead.get(PROVIDER_M2O_FIELD)
+    provider_id = resolve_provider(
+        _clean_odoo(lead.get(PROVIDER_CODE_FIELD)),
+        _clean_odoo(m2o[1]) if isinstance(m2o, (list, tuple)) and len(m2o) > 1 else None,
+        provider_maps)
     new_sys = {
         "odoo_lead_id": lead["id"],
         "odoo_lead_email": _clean_odoo(lead.get("email_from")),
         "odoo_lead_name": _clean_odoo(lead.get("partner_name")) or _clean_odoo(lead.get("contact_name")) or _clean_odoo(lead.get("name")),
         "odoo_stage": _clean_odoo(lead["stage_id"][1]) if lead.get("stage_id") else None,
+        # Same rule as the nightly mirror: a lead without a provider, or with a
+        # code we do not carry, leaves our value alone.
+        "electricity_provider_id": provider_id if provider_id is not None else s["electricity_provider_id"],
     }
     new_prof = None
     if s["is_primary"] and s["user_id"]:
@@ -1405,9 +1422,11 @@ async def refresh_from_odoo(system_id: uuid.UUID, authorization: str = Header(No
             conn.execute(
                 """update public.solar_systems
                       set odoo_lead_id = %s, odoo_lead_email = %s, odoo_lead_name = %s, odoo_stage = %s,
+                          electricity_provider_id = %s,
                           odoo_synced_at = now(), updated_at = now()
                     where id = %s""",
-                (new_sys["odoo_lead_id"], new_sys["odoo_lead_email"], new_sys["odoo_lead_name"], new_sys["odoo_stage"], system_id))
+                (new_sys["odoo_lead_id"], new_sys["odoo_lead_email"], new_sys["odoo_lead_name"], new_sys["odoo_stage"],
+                 new_sys["electricity_provider_id"], system_id))
             if new_prof:
                 conn.execute(
                     """update public.user_profiles

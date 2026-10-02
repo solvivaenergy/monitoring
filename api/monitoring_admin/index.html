@@ -385,6 +385,7 @@ const copyHint = (src) => `Edits here change our database only — nothing is wr
 // the changed fields land in Audit under the engineer's name.
 const FIELD_LABELS = {odoo_lead_id:'Odoo lead id', odoo_lead_email:'Lead email', odoo_lead_name:'Lead name', odoo_stage:'Stage',
   odoo_partner_id:'Odoo customer id', odoo_email:'Customer email (Odoo)', odoo_customer_name:'Customer name (Odoo)',
+  electricity_provider_id:'Electricity provider (id in electricity_providers)',
   solis_plant_name:'Plant name', solis_user_email:'Plant email', system_name:'System name', capacity_kwp:'Capacity kWp', battery_capacity_kwh:'Battery kWh'};
 async function refreshFrom(src, boxId, r){
   const box = $('#'+boxId), label = src==='odoo' ? 'Odoo' : 'Solis Cloud';
@@ -478,6 +479,7 @@ async function openPanel(systemId, opts={}){
       ${field('Lead name','odoo_lead_name',r.odoo_lead_name,'text','form="f-system"','Odoo')}
       ${field('Lead email','odoo_lead_email',r.odoo_lead_email,'email','form="f-system"','Odoo')}
       ${field('Stage','odoo_stage',r.odoo_stage,'text','form="f-system"','Odoo')}
+      <div class="ro"><label>Electricity provider<span class="src odoo">Odoo</span></label><div class="val" title="The utility whose tariff this plant offsets — per station, from the lead's Electricity Provider field. The monthly performance views price this station with it. Blank = the lead has no provider; sales fills it in Odoo and the nightly sync (or Refresh from Odoo now) copies it.">${r.electricity_provider_code ? `${esc(r.electricity_provider_code)} <span class="muted">— ${esc(r.electricity_provider_name||'')}</span>` : '<span class="muted">— none on the lead yet</span>'}</div></div>
     </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="lead" ${r.odoo_lead_id?'':'disabled'}>Validate Odoo lead</button>
