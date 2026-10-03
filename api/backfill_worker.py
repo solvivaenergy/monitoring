@@ -27,6 +27,10 @@ Granularities:
                 a rolling one-Manila-day cache purged every midnight, so only
                 the current Manila day is meaningful; earlier days in the range
                 are skipped and reported in the job's error field.
+  hourly        stationDay per day → energy_readings_hourly (migration 20), one
+                row per Manila hour, the same sums the live roll-up makes from
+                the five-minute cache. Today is excluded (served live). One
+                Solis call per station-day.
 
 Job status changes are written through db.audited() with source
 'backfill_worker', so the audit trail shows the worker acting on the
@@ -77,13 +81,13 @@ def _months(d0: date, d1: date) -> List[str]:
     return out
 
 
-def _upsert(sb, table: str, rows: List[dict]) -> int:
+def _upsert(sb, table: str, rows: List[dict], on_conflict: str = "system_id,timestamp") -> int:
     written = 0
     for i in range(0, len(rows), SUPABASE_BATCH_SIZE):
         batch = rows[i:i + SUPABASE_BATCH_SIZE]
         for attempt in range(5):
             try:
-                sb.table(table).upsert(batch, on_conflict="system_id,timestamp").execute()
+                sb.table(table).upsert(batch, on_conflict=on_conflict).execute()
                 written += len(batch)
                 break
             except Exception as exc:
@@ -158,6 +162,69 @@ async def run_five_minutes(job: Dict[str, Any], sb, solis: SolisCloudClient, sem
     return (_upsert(sb, "energy_readings_five_minutes", rows) if rows else 0), notes
 
 
+def _hourly_rows(system: Dict[str, Any], day_data: list) -> List[dict]:
+    """Solis stationDay points → one energy_readings_hourly row per Manila hour.
+    Same arithmetic as the live roll-up (migration 20's rollup_hourly): sums of
+    the 5-minute slices, the biggest slice as peak kW, the last SoC, and
+    `points` so a thin hour is visibly thin."""
+    by_ts: Dict[int, dict] = {}
+    for point in day_data:
+        built = _build_row(str(system["user_id"]), str(system["id"]), point)
+        if built is not None:
+            by_ts[built[0]] = built[1]           # Solis can repeat a timestamp; keep the latest copy
+    hours: Dict[datetime, dict] = {}
+    for ts, row in sorted(by_ts.items()):
+        hour = datetime.fromtimestamp(ts, tz=PHT).replace(minute=0, second=0, microsecond=0)
+        h = hours.setdefault(hour, {
+            "user_id": row["user_id"], "system_id": row["system_id"], "hour_start": hour.isoformat(),
+            "production_kwh": 0.0, "consumption_kwh": 0.0, "grid_import_kwh": 0.0, "grid_export_kwh": 0.0,
+            "peak_power_kw": 0.0, "battery_level_end": None, "points": 0, "source": "backfill",
+        })
+        for k in ("production_kwh", "consumption_kwh", "grid_import_kwh", "grid_export_kwh"):
+            h[k] += float(row[k] or 0)
+        h["peak_power_kw"] = max(h["peak_power_kw"], float(row["production_kwh"] or 0) * 12)
+        if row.get("battery_level") is not None:
+            h["battery_level_end"] = row["battery_level"]
+        h["points"] = min(12, h["points"] + 1)
+    for h in hours.values():
+        for k in ("production_kwh", "consumption_kwh", "grid_import_kwh", "grid_export_kwh", "peak_power_kw"):
+            h[k] = round(h[k], 3)
+    return list(hours.values())
+
+
+async def run_hourly(job: Dict[str, Any], sb, solis: SolisCloudClient, sem: asyncio.Semaphore,
+                     system: Dict[str, Any]) -> tuple[int, List[str]]:
+    """stationDay per day in the range → energy_readings_hourly. One Solis call
+    per station-day (a 90-day job is ~90 calls, ~3 min at this worker's pace).
+    Today is excluded: it is served live and rolled up by the five-minute cron."""
+    today = datetime.now(PHT).date()
+    d0, d1 = job["date_from"], job["date_to"]
+    notes: List[str] = []
+    if d1 >= today:
+        notes.append(f"today ({today}) skipped — rolled up live by the five-minute sync")
+        d1 = today - timedelta(days=1)
+    if d1 < d0:
+        return 0, notes + ["nothing to fetch"]
+    sid = job["solis_station_id"]
+    days = [d0 + timedelta(days=i) for i in range((d1 - d0).days + 1)]
+    results = await asyncio.gather(*(_fetch(sem, lambda d=d: solis.station_day(sid, d.isoformat())) for d in days),
+                                   return_exceptions=True)
+    rows: List[dict] = []
+    empty = 0
+    for d, data in zip(days, results):
+        if isinstance(data, Exception):
+            notes.append(f"{d}: {str(data)[:80]}")
+            continue
+        if not isinstance(data, list) or not data:
+            empty += 1
+            continue
+        rows.extend(_hourly_rows(system, data))
+    if empty:
+        notes.append(f"{empty} day(s) with no stationDay data (inverter offline, or before Solis's retention)")
+    written = _upsert(sb, "energy_readings_hourly", rows, on_conflict="system_id,hour_start") if rows else 0
+    return written, notes
+
+
 def claim_next(conn) -> Optional[Dict[str, Any]]:
     row = conn.execute(
         """update public.backfill_jobs
@@ -185,6 +252,8 @@ async def process(job: Dict[str, Any], sb, solis, sem) -> None:
     try:
         if job["granularity"] == "five_minutes":
             written, notes = await run_five_minutes(job, sb, solis, sem, system)
+        elif job["granularity"] == "hourly":
+            written, notes = await run_hourly(job, sb, solis, sem, system)
         else:
             written, notes = await run_daily(job, sb, solis, sem, system)
         status = "succeeded" if (written > 0 or not notes) else "failed"

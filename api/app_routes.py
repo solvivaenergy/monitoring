@@ -12,8 +12,9 @@ import asyncio
 import os
 import logging
 from datetime import date, datetime, timezone, timedelta
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Query
 from supabase import create_client
 
 from .solis_client import SolisCloudClient, SolisCloudError
@@ -155,6 +156,91 @@ async def _authenticate(authorization: str = Header(...)) -> dict:
         }
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+HOURLY_FIELDS = ("production_kwh", "consumption_kwh", "grid_import_kwh", "grid_export_kwh")
+
+
+def _empty_hour(day_start: datetime, hour: int) -> dict:
+    return {"hour": hour, "hour_start": (day_start + timedelta(hours=hour)).isoformat(),
+            "production_kwh": None, "consumption_kwh": None, "grid_import_kwh": None, "grid_export_kwh": None,
+            "peak_power_kw": None, "battery_level_end": None, "points": 0, "partial": False}
+
+
+@router.get("/hourly")
+async def get_hourly(day: Optional[str] = Query(None, alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                     authorization: str = Header(...)):
+    """Hourly energy for one Manila day (default today): 24 buckets.
+
+    Today comes LIVE from the five-minute table (the current hour grows every
+    five minutes, `partial: true`); earlier days from energy_readings_hourly,
+    which the five-minute sync rolls up as hours close and the backfill worker
+    fills from Solis for history (migration 20). An hour with no data has null
+    values and points = 0; `points` < 12 means the inverter reported only part
+    of the hour.
+    """
+    user = await _authenticate(authorization)
+    station_id = await _resolve_station_id(user)
+    sb = _get_supabase()
+    sys_rows = (sb.table("solar_systems").select("id").eq("solis_station_id", station_id)
+                .limit(1).execute().data or [])
+    if not sys_rows:
+        raise HTTPException(status_code=404, detail="No station row for this login")
+    system_id = sys_rows[0]["id"]
+
+    today = datetime.now(PHT).date()
+    try:
+        the_day = date.fromisoformat(day) if day else today
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    if the_day > today:
+        raise HTTPException(status_code=400, detail="date is in the future")
+    day_start = datetime.combine(the_day, datetime.min.time(), tzinfo=PHT)
+    day_end = day_start + timedelta(days=1)
+    hours = {h: _empty_hour(day_start, h) for h in range(24)}
+
+    if the_day == today:
+        rows = (sb.table("energy_readings_five_minutes")
+                .select("timestamp,production_kwh,consumption_kwh,grid_import_kwh,grid_export_kwh,battery_level")
+                .eq("system_id", system_id).gte("timestamp", day_start.isoformat()).lt("timestamp", day_end.isoformat())
+                .order("timestamp").limit(2000).execute().data or [])
+        for r in rows:
+            ts = datetime.fromisoformat(str(r["timestamp"]).replace("Z", "+00:00")).astimezone(PHT)
+            h = hours[ts.hour]
+            if h["points"] == 0:
+                for k in HOURLY_FIELDS:
+                    h[k] = 0.0
+                h["peak_power_kw"] = 0.0
+            for k in HOURLY_FIELDS:
+                h[k] = round(h[k] + float(r.get(k) or 0), 3)
+            h["peak_power_kw"] = round(max(h["peak_power_kw"], float(r.get("production_kwh") or 0) * 12), 3)
+            if r.get("battery_level") is not None:
+                h["battery_level_end"] = float(r["battery_level"])
+            h["points"] = min(12, h["points"] + 1)
+        current_hour = datetime.now(PHT).hour
+        for h in hours.values():
+            h["partial"] = h["hour"] == current_hour or (0 < h["points"] < 12)
+        source = "live"
+    else:
+        rows = (sb.table("energy_readings_hourly")
+                .select("hour_start,production_kwh,consumption_kwh,grid_import_kwh,grid_export_kwh,"
+                        "peak_power_kw,battery_level_end,points")
+                .eq("system_id", system_id).gte("hour_start", day_start.isoformat()).lt("hour_start", day_end.isoformat())
+                .order("hour_start").execute().data or [])
+        for r in rows:
+            ts = datetime.fromisoformat(str(r["hour_start"]).replace("Z", "+00:00")).astimezone(PHT)
+            h = hours[ts.hour]
+            for k in HOURLY_FIELDS + ("peak_power_kw", "battery_level_end"):
+                h[k] = float(r[k]) if r.get(k) is not None else None
+            h["points"] = int(r.get("points") or 0)
+            h["partial"] = 0 < h["points"] < 12
+        source = "stored"
+
+    return {
+        "date": the_day.isoformat(), "source": source, "station_id": station_id,
+        "totals": {k: round(sum(h[k] or 0 for h in hours.values()), 3) for k in HOURLY_FIELDS},
+        "hours": [hours[h] for h in range(24)],
+    }
 
 
 @router.get("/live")

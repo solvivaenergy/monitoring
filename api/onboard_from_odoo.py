@@ -268,6 +268,11 @@ async def onboard(
                 backfill["rows"],
                 backfill_days,
             )
+            # Hourly history (migration 20) is too slow to fetch here: queue it
+            # for the backfill worker instead, 90 days per new station.
+            from api.backfill_newly_onboarded import enqueue_hourly_jobs
+
+            backfill["hourly_jobs"] = enqueue_hourly_jobs(sb, {c.station_id for c in candidates})
         except Exception as exc:  # never let backfill block onboarding
             log.error("Onboarding backfill failed: %s", exc)
 

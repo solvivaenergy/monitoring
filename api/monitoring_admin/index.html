@@ -541,7 +541,7 @@ async function openPanel(systemId, opts={}){
     <div class="row">
       <label class="row"><input type="checkbox" id="bf-after"> also backfill</label>
       <input type="number" id="bf-days" value="60" min="1" max="730" style="width:80px"> days
-      <select id="bf-gran"><option value="daily">daily</option><option value="five_minutes">five-minute</option></select>
+      <select id="bf-gran"><option value="daily">daily</option><option value="hourly">hourly</option><option value="five_minutes">five-minute</option></select>
       <div class="spacer"></div>
       <button class="btn primary" id="btn-save">Save</button>
     </div>` : '<p class="hint">Your role is read-only.</p>'}
@@ -556,7 +556,7 @@ async function openPanel(systemId, opts={}){
     ${canEdit() ? `
     <div class="row" style="margin-top:8px">
       <input type="date" id="bf-from"> → <input type="date" id="bf-to">
-      <select id="bf-gran2"><option value="daily">daily</option><option value="five_minutes">five-minute</option></select>
+      <select id="bf-gran2"><option value="daily">daily</option><option value="hourly">hourly</option><option value="five_minutes">five-minute (today only)</option></select>
       <button class="btn sm" id="btn-backfill" ${r.solis_station_id?'':'disabled'}>Queue backfill</button>
     </div>` : ''}
     ${d.jobs.length ? `<ul class="plain audit">${d.jobs.map(j => `<li><span class="tag ${j.status==='succeeded'?'ok':j.status==='failed'?'bad':'warn'}">${esc(j.status)}</span> ${esc(j.granularity)} ${fmtDate(j.date_from)} → ${fmtDate(j.date_to)} <span class="when">queued ${fmtTs(j.queued_at)}</span>${j.rows_written!=null?` · ${j.rows_written} rows`:''}${j.error?` · <span class="tag bad">${esc(String(j.error).slice(0,120))}</span>`:''}</li>`).join('')}</ul>` : ''}
@@ -1003,32 +1003,32 @@ async function loadJobs(){
     const now = new Date(), pmFirst = new Date(now.getFullYear(), now.getMonth()-1, 1), pmLast = new Date(now.getFullYear(), now.getMonth(), 0);
     el.innerHTML = `
       ${canEdit() ? `<div class="card sect"><h3 style="margin-top:0">Backfill the whole fleet</h3>
-        <p class="hint">One daily job per active station with a Solis id, all for the same date range — after a Solis outage, for a month-end re-read, or whenever the whole fleet should be re-checked against Solis. Existing rows in the range are overwritten with Solis's current values. Stations that already have a daily job queued are skipped. The worker gets through roughly 680 station-months an hour. <b>The monthly accuracy run queues the previous month by itself on the 1st</b> (09:00 Manila); use this for anything else. At most 93 days per run.</p>
-        <div class="row"><label>From <input type="date" id="fl-from" value="${ymd(pmFirst)}"></label><label>To <input type="date" id="fl-to" value="${ymd(pmLast)}"></label><input id="fl-reason" placeholder="Reason — recorded in the audit log" style="min-width:300px"><button class="btn" id="fl-preview">Preview</button><button class="btn primary" id="fl-run" disabled>Queue for every station</button></div>
+        <p class="hint">One job per active station with a Solis id, all for the same date range — after a Solis outage, for a month-end re-read, or whenever the whole fleet should be re-checked against Solis. Existing rows in the range are overwritten with Solis's current values. Stations that already have a job of that kind queued are skipped. <b>Daily</b> = one Solis call per station-month (the fleet takes ~2 hours per month). <b>Hourly</b> = one call per station-day (the fleet takes ~1 hour per day of range — a 90-day load runs for about 3 days in the background). <b>The monthly accuracy run queues the previous month (daily) by itself on the 1st</b> (09:00 Manila); use this for anything else. At most 93 days per run.</p>
+        <div class="row"><select id="fl-gran"><option value="daily">daily</option><option value="hourly">hourly</option></select><label>From <input type="date" id="fl-from" value="${ymd(pmFirst)}"></label><label>To <input type="date" id="fl-to" value="${ymd(pmLast)}"></label><input id="fl-reason" placeholder="Reason — recorded in the audit log" style="min-width:300px"><button class="btn" id="fl-preview">Preview</button><button class="btn primary" id="fl-run" disabled>Queue for every station</button></div>
         <div class="verdict" id="fl-result" hidden></div></div>` : ''}
       ${(batches||[]).length ? `<div class="card sect"><h3 style="margin-top:0">Fleet batches</h3>
-        <table><thead><tr><th>Queued</th><th>By</th><th>Range</th><th>Stations</th><th>Done</th><th>Running</th><th>Waiting</th><th>Failed</th><th>Rows</th><th>Reason</th></tr></thead><tbody>
-        ${batches.map(b => `<tr><td>${fmtTs(b.queued_at)}</td><td class="mono">${esc(b.requested_by||'monthly run')}</td><td>${fmtDate(b.date_from)} → ${fmtDate(b.date_to)}</td><td>${b.jobs}</td><td>${b.succeeded===b.jobs?`<span class="tag ok">${b.succeeded}</span>`:b.succeeded}</td><td>${b.running}</td><td>${b.queued}</td><td>${b.failed?`<span class="tag bad">${b.failed}</span>`:'0'}</td><td>${b.rows_written}</td><td class="wrap muted">${esc(b.reason||'')}</td></tr>`).join('')}
+        <table><thead><tr><th>Queued</th><th>By</th><th>Kind</th><th>Range</th><th>Stations</th><th>Done</th><th>Running</th><th>Waiting</th><th>Failed</th><th>Rows</th><th>Reason</th></tr></thead><tbody>
+        ${batches.map(b => `<tr><td>${fmtTs(b.queued_at)}</td><td class="mono">${esc(b.requested_by||'scheduled run')}</td><td>${esc(b.granularity||'')}</td><td>${fmtDate(b.date_from)} → ${fmtDate(b.date_to)}</td><td>${b.jobs}</td><td>${b.succeeded===b.jobs?`<span class="tag ok">${b.succeeded}</span>`:b.succeeded}</td><td>${b.running}</td><td>${b.queued}</td><td>${b.failed?`<span class="tag bad">${b.failed}</span>`:'0'}</td><td>${b.rows_written}</td><td class="wrap muted">${esc(b.reason||'')}</td></tr>`).join('')}
         </tbody></table></div>` : ''}
       <div class="card"><p class="hint">Jobs are drained by the backfill worker; a station can have one queued or running job per granularity.</p>
       <table><thead><tr><th>Queued</th><th>Customer</th><th>System</th><th>Granularity</th><th>Range</th><th>Status</th><th>Rows</th><th>Error</th><th></th></tr></thead><tbody>
       ${jobs.map(j => `<tr><td>${fmtTs(j.queued_at)}</td><td>${esc(j.full_name)}</td><td>${esc(j.system_name)}</td><td>${esc(j.granularity)}</td><td>${fmtDate(j.date_from)} → ${fmtDate(j.date_to)}</td><td><span class="tag ${j.status==='succeeded'?'ok':j.status==='failed'?'bad':'warn'}">${esc(j.status)}</span></td><td>${j.rows_written??''}</td><td class="muted">${esc(String(j.error||'').slice(0,100))}</td><td>${j.status==='queued'&&canEdit()?`<button class="btn sm danger" data-cancel="${j.id}">Cancel</button>`:''}</td></tr>`).join('') || '<tr><td colspan=9 class="muted">No jobs yet.</td></tr>'}
       </tbody></table></div>`;
     $$('#view-jobs [data-cancel]').forEach(b => b.onclick = async () => { try { await api('/monitoring-admin/api/jobs/'+b.dataset.cancel+'/cancel', {method:'POST'}); loadJobs(); } catch(e) { toast(e.message, true); } });
-    const flBody = () => ({date_from: $('#fl-from').value, date_to: $('#fl-to').value, reason: $('#fl-reason').value.trim()});
+    const flBody = () => ({granularity: $('#fl-gran').value, date_from: $('#fl-from').value, date_to: $('#fl-to').value, reason: $('#fl-reason').value.trim()});
     if ($('#fl-preview')) $('#fl-preview').onclick = async () => {
       const box = $('#fl-result'); box.hidden = false; box.textContent = 'Counting…';
       try {
         const p = await api('/monitoring-admin/api/backfill/fleet', {method:'POST', body:{...flBody(), dry_run:true}});
-        const mins = Math.max(1, Math.round(p.to_queue * p.months_per_station * 4 / 60));
-        box.innerHTML = `<b>${p.to_queue}</b> station(s) would be queued, ${p.months_per_station} month(s) each — about ${mins} min of worker time${p.skipped_busy?`; <b>${p.skipped_busy}</b> skipped because a daily job is already queued or running`:''}.`;
+        const span = p.est_minutes >= 120 ? `${(p.est_minutes/60).toFixed(1)} hours` : `${p.est_minutes} min`;
+        box.innerHTML = `<b>${p.to_queue}</b> station(s) would be queued (${esc(p.granularity)}, ${p.calls_per_station} Solis call(s) each) — about ${span} of worker time${p.skipped_busy?`; <b>${p.skipped_busy}</b> skipped because a ${esc(p.granularity)} job is already queued or running`:''}.`;
         $('#fl-run').disabled = !p.to_queue;
       } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; $('#fl-run').disabled = true; }
     };
     if ($('#fl-run')) $('#fl-run').onclick = async () => {
       const b = flBody();
       if (b.reason.length < 3) return toast('Type a reason first — it goes into the audit log', true);
-      if (!confirm(`Queue a daily backfill ${b.date_from} → ${b.date_to} for every active station?\n\nRows already stored for those days are overwritten with Solis's current values. The worker needs up to an hour per month of range.`)) return;
+      if (!confirm(`Queue a ${b.granularity} backfill ${b.date_from} → ${b.date_to} for every active station?\n\nRows already stored for those days are overwritten with Solis's current values. The worker runs it in the background; progress shows under Fleet batches.`)) return;
       try { const r = await api('/monitoring-admin/api/backfill/fleet', {method:'POST', body:b}); toast(`${r.queued} job(s) queued`); loadJobs(); }
       catch (e) { toast(e.message, true); }
     };
@@ -1105,7 +1105,8 @@ function loadGuide(){
 
     <h3>4. Missing days / refreshing history</h3>
     <p>In the customer panel, pick a date range → <b>Queue backfill</b>. The worker runs every 15 minutes; progress is in <b>Backfills</b>, and the row shows "backfill running/succeeded". A backfill overwrites the dates it fetches with Solis's current values.</p>
-    <p><b>Whole fleet:</b> Backfills → <i>Backfill the whole fleet</i> → range, reason, Preview, Queue. One job per active station; progress shows as one line under <i>Fleet batches</i>. <b>Every 1st of the month at 09:00</b> the previous month is queued for every station automatically (the "monthly accuracy run"), so month-ends are re-read once Solis has settled them. <b>Yesterday is provisional:</b> Solis keeps adjusting the most recent day during the day and the nightly sync re-reads it, so <i>Check data vs Solis</i> lists it separately and does not count it.</p>
+    <p><b>Hourly data:</b> the portal's hourly view reads <i>energy_readings_hourly</i> for past days and the five-minute table live for today. Closed hours are rolled up automatically by the five-minute sync; history (90 days at launch) comes from an <i>hourly</i> backfill, one Solis call per station-day. A new or re-attached station gets 90 days of hourly history queued together with its daily backfill. Pick <i>hourly</i> in either backfill form to rebuild it for one station or the fleet.</p>
+    <p><b>Whole fleet:</b> Backfills → <i>Backfill the whole fleet</i> → kind (daily / hourly), range, reason, Preview, Queue. One job per active station; progress shows as one line under <i>Fleet batches</i>. <b>Every 1st of the month at 09:00</b> the previous month is queued for every station automatically (the "monthly accuracy run"), so month-ends are re-read once Solis has settled them. <b>Yesterday is provisional:</b> Solis keeps adjusting the most recent day during the day and the nightly sync re-reads it, so <i>Check data vs Solis</i> lists it separately and does not count it.</p>
 
     <h3>5. A new customer isn't appearing</h3>
     <p>Accounts are created automatically every night from Odoo leads that have a valid email and a station id. Unresolved → <i>Nightly onboarding failures</i> lists the leads that were rejected and why (usually two emails in one field, or a placeholder). Those are fixed in Odoo by sales; the account appears the night after.</p>

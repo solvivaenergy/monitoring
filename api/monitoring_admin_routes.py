@@ -321,8 +321,13 @@ async def row_detail(system_id: uuid.UUID, authorization: str = Header(None)):
 # ---------------------------------------------------------------------------
 
 class BackfillSpec(BaseModel):
-    granularity: str = Field("daily", pattern="^(daily|five_minutes)$")
+    granularity: str = Field("daily", pattern="^(daily|five_minutes|hourly)$")
     days: int = Field(60, ge=1, le=730)
+
+
+# Hourly history a new or re-attached station gets alongside its daily backfill
+# (migration 20). 90 days: one Solis call per station-day.
+HOURLY_HISTORY_DAYS = 90
 
 
 class EditRequest(BaseModel):
@@ -543,12 +548,16 @@ async def add_station(body: AddStationRequest, authorization: str = Header(None)
                  body.installation_date or (dt.date.today() - dt.timedelta(days=body.backfill.days if body.backfill else 60)),
                  sid, name)).fetchone()
             job = _enqueue(conn, row["id"], sid, body.backfill, staff, reason, request_id) if body.backfill else None
+            # Hourly history for the new station as well, under the same request id.
+            hourly_job = (_enqueue(conn, row["id"], sid, BackfillSpec(granularity="hourly", days=HOURLY_HISTORY_DAYS),
+                                   staff, reason, request_id) if body.backfill else None)
     except HTTPException:
         raise
     except psycopg.Error as exc:
         raise _db_error(exc)
     _invalidate_rows()
-    return {"ok": True, "system_id": str(row["id"]), "request_id": request_id, "backfill_job": job}
+    return {"ok": True, "system_id": str(row["id"]), "request_id": request_id, "backfill_job": job,
+            "hourly_job": hourly_job}
 
 
 # ---------------------------------------------------------------------------
@@ -1013,7 +1022,7 @@ async def merge_customer(user_id: uuid.UUID, body: MergeRequest, authorization: 
 
 class BackfillRequest(BaseModel):
     system_id: uuid.UUID
-    granularity: str = Field("daily", pattern="^(daily|five_minutes)$")
+    granularity: str = Field("daily", pattern="^(daily|five_minutes|hourly)$")
     date_from: dt.date
     date_to: dt.date
     reason: str
@@ -1054,22 +1063,27 @@ class FleetBackfillRequest(BaseModel):
     date_from: dt.date
     date_to: dt.date
     reason: str = ""
+    granularity: str = Field("daily", pattern="^(daily|hourly)$")
     dry_run: bool = False
 
 
 FLEET_BACKFILL_MAX_DAYS = 93
 
-# Every active station with a Solis id, and whether a daily job is already
-# queued or running for it (backfill_jobs_one_active_uk allows one per station).
-# Shared with api/enqueue_fleet_backfill.py, the monthly accuracy run.
+# Every active station with a Solis id, and whether a job of this granularity
+# is already queued or running for it (backfill_jobs_one_active_uk allows one
+# per station and granularity). Parameter: the granularity. Shared with
+# api/enqueue_fleet_backfill.py, the monthly accuracy run.
 FLEET_TARGETS_SQL = """
     select s.id, s.solis_station_id,
            exists (select 1 from public.backfill_jobs j
-                    where j.system_id = s.id and j.granularity = 'daily'
+                    where j.system_id = s.id and j.granularity = %s
                       and j.status in ('queued', 'running')) as busy
       from public.solar_systems s
      where s.status = 'active' and s.solis_station_id is not null
      order by s.id"""
+
+# Measured 2026-10-02/03: ~11 s per station-month (daily), ~2 s per station-day (hourly).
+_FLEET_SECONDS_PER_CALL = {"daily": 11, "hourly": 2}
 
 
 @router.post("/api/backfill/fleet")
@@ -1090,39 +1104,44 @@ async def enqueue_fleet_backfill(body: FleetBackfillRequest, authorization: str 
     if (body.date_to - body.date_from).days + 1 > FLEET_BACKFILL_MAX_DAYS:
         raise HTTPException(400, f"At most {FLEET_BACKFILL_MAX_DAYS} days per fleet backfill")
     months = (body.date_to.year - body.date_from.year) * 12 + body.date_to.month - body.date_from.month + 1
+    days = (body.date_to - body.date_from).days + 1
+    # Solis calls per station: one per month (daily) or one per day (hourly).
+    calls = months if body.granularity == "daily" else days
     if body.dry_run:
         with db.connect(autocommit=True) as conn:
-            rows = conn.execute(FLEET_TARGETS_SQL).fetchall()
+            rows = conn.execute(FLEET_TARGETS_SQL, (body.granularity,)).fetchall()
         busy = sum(1 for r in rows if r["busy"])
-        return {"dry_run": True, "stations": len(rows), "to_queue": len(rows) - busy, "skipped_busy": busy,
-                "months_per_station": months}
+        to_queue = len(rows) - busy
+        return {"dry_run": True, "granularity": body.granularity, "stations": len(rows), "to_queue": to_queue,
+                "skipped_busy": busy, "months_per_station": months, "calls_per_station": calls,
+                "est_minutes": max(1, round(to_queue * calls * _FLEET_SECONDS_PER_CALL[body.granularity] / 60))}
     reason = _reason(body.reason)
     request_id = str(uuid.uuid4())
     try:
         with db.audited(staff["id"], staff["email"], reason, request_id=request_id) as conn:
-            rows = conn.execute(FLEET_TARGETS_SQL).fetchall()
+            rows = conn.execute(FLEET_TARGETS_SQL, (body.granularity,)).fetchall()
             targets = [r for r in rows if not r["busy"]]
             with conn.cursor() as cur:
                 cur.executemany(
                     """insert into public.backfill_jobs
                          (system_id, solis_station_id, granularity, date_from, date_to,
                           requested_by, requested_reason, request_id)
-                       values (%s, %s, 'daily', %s, %s, %s, %s, %s)
+                       values (%s, %s, %s, %s, %s, %s, %s, %s)
                        on conflict do nothing""",
-                    [(r["id"], r["solis_station_id"], body.date_from, body.date_to, staff["id"], reason, request_id)
-                     for r in targets])
+                    [(r["id"], r["solis_station_id"], body.granularity, body.date_from, body.date_to,
+                      staff["id"], reason, request_id) for r in targets])
     except HTTPException:
         raise
     except psycopg.Error as exc:
         raise _db_error(exc)
-    return {"ok": True, "request_id": request_id, "stations": len(rows), "queued": len(targets),
-            "skipped_busy": len(rows) - len(targets), "months_per_station": months}
+    return {"ok": True, "request_id": request_id, "granularity": body.granularity, "stations": len(rows),
+            "queued": len(targets), "skipped_busy": len(rows) - len(targets), "calls_per_station": calls}
 
 
 # Fleet batches (several jobs under one request id): progress per batch, so a
 # 680-job run reads as one line instead of 680.
 BATCHES_SQL = """
-    select j.request_id, min(j.queued_at) as queued_at, count(*) as jobs,
+    select j.request_id, min(j.queued_at) as queued_at, count(*) as jobs, max(j.granularity) as granularity,
            count(*) filter (where j.status = 'queued') as queued,
            count(*) filter (where j.status = 'running') as running,
            count(*) filter (where j.status = 'succeeded') as succeeded,

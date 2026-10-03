@@ -377,6 +377,31 @@ def _plan_station(
     return inserts, refreshes, up_to_watermark > watermark["n"]
 
 
+def _rollup_hourly(sb: Client, start: datetime, end: datetime) -> Optional[int]:
+    """Aggregate the five-minute rows in [start, end) into energy_readings_hourly
+    (migration 20's rollup_hourly()). The hourly table is how the portal shows
+    past days by the hour; today is read live from the five-minute table, so
+    this only has to be right by the time a day is purged.
+
+    Called three ways from sync_once: for YESTERDAY right before the midnight
+    purge removes it, for the two hours just closed on every run (the function
+    skips identical rows, so this is ~no writes), and for the whole day in the
+    last runs before midnight. Never fatal — like the purge, it is housekeeping
+    around the actual job of writing today's curve.
+    """
+    try:
+        resp = _execute_with_retry(
+            f"roll up hourly {start:%Y-%m-%d %H:%M}..{end:%H:%M}",
+            lambda: sb.rpc("rollup_hourly", {"p_from": start.isoformat(), "p_to": end.isoformat()}),
+        )
+        n = resp.data if isinstance(resp.data, int) else None
+        log.info("Hourly roll-up %s..%s: %s row(s) written.", start.strftime("%m-%d %H:%M"), end.strftime("%H:%M"), n)
+        return n
+    except Exception as exc:
+        log.warning("Hourly roll-up %s..%s failed (continuing): %s", start, end, str(exc)[:160])
+        return None
+
+
 def _purge_old_rows(sb: Client, day_start: str) -> Optional[int]:
     """Drop rows older than the current Asia/Manila day, in bounded batches.
 
@@ -593,6 +618,11 @@ async def sync_once(
         )
         log.info("Would purge %s old 5-minute row(s) [dry-run].", stale.count or 0)
     else:
+        # Yesterday's last hours into the hourly table BEFORE the purge takes
+        # them away (migration 20). Cheap on every run but the first of the day:
+        # the range is empty once the purge has run.
+        day_start_dt = datetime.combine(today, datetime.min.time(), tzinfo=PHT)
+        _rollup_hourly(sb, day_start_dt - timedelta(days=1), day_start_dt)
         deleted_count = _purge_old_rows(sb, day_start)
         log.info("Purged %s old 5-minute row(s) before syncing %s.", deleted_count or 0, today_str)
     # What we already hold today, per station, in ONE request (migration 17's
@@ -759,6 +789,18 @@ async def sync_once(
                 batch, on_conflict="system_id,timestamp", returning="minimal"
             ),
         )
+
+    # Hourly roll-up (migration 20): the two hours just closed, every run — the
+    # second one only to catch late points filled below the watermark. The
+    # current, still-open hour is deliberately NOT written: /app/hourly builds
+    # it live from this table, and writing partial hours every five minutes
+    # would be ~180k extra row writes a day. In the last runs of the day the
+    # whole day is passed once more so nothing is missing when it is purged.
+    now_pht = datetime.now(PHT)
+    hour_floor = now_pht.replace(minute=0, second=0, microsecond=0)
+    _rollup_hourly(sb, hour_floor - timedelta(hours=2), hour_floor)
+    if now_pht.hour == 23 and now_pht.minute >= 60 - 2 * max(1, SYNC_CADENCE_MINUTES):
+        _rollup_hourly(sb, datetime.combine(today, datetime.min.time(), tzinfo=PHT), hour_floor)
 
     return total_written
 

@@ -109,6 +109,40 @@ async def fetch_station_month(
             return None
 
 
+def enqueue_hourly_jobs(sb: Client, station_ids: Set[str], days: int = 90,
+                        reason: str = "new customer: hourly history") -> int:
+    """Queue an HOURLY backfill (backfill_jobs, drained by the worker) for the
+    stations just onboarded — migration 20's energy_readings_hourly needs one
+    Solis stationDay call per station-day, too slow to run inline here. One
+    job per station; a station that already has an hourly job queued is left
+    alone (the partial unique index rejects the duplicate). Returns the number
+    queued."""
+    if not station_ids:
+        return 0
+    today = datetime.now(PHT).date()
+    systems = (
+        sb.table("solar_systems")
+        .select("id,solis_station_id")
+        .in_("solis_station_id", sorted(station_ids))
+        .execute()
+        .data
+        or []
+    )
+    queued = 0
+    for s in systems:
+        try:
+            sb.table("backfill_jobs").insert({
+                "system_id": s["id"], "solis_station_id": s["solis_station_id"], "granularity": "hourly",
+                "date_from": (today - timedelta(days=days)).isoformat(),
+                "date_to": (today - timedelta(days=1)).isoformat(),
+                "requested_reason": reason,
+            }).execute()
+            queued += 1
+        except Exception as exc:  # duplicate active job, or a transient error — never block onboarding
+            log.warning("hourly job for station %s not queued: %s", s["solis_station_id"], str(exc)[:120])
+    return queued
+
+
 async def backfill_station_ids(
     sb: Client,
     solis: SolisCloudClient,
