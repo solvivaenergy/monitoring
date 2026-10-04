@@ -124,6 +124,25 @@ class Runs:
         except Exception as exc:
             log.warning("sync_runs finish failed: %s", str(exc)[:120])
 
+    def close_interrupted(self) -> int:
+        """Rows left at 'running' by a previous process (a redeploy kills the
+        worker mid-pass). The advisory lock means no other worker is alive, so
+        every 'running' row at start-up is stale."""
+        try:
+            with db.connect(autocommit=True) as conn:
+                cur = conn.execute(
+                    """update public.sync_runs
+                          set status = 'failed', finished_at = now(),
+                              error = coalesce(error, 'interrupted — the worker restarted before this run finished')
+                        where status = 'running'""")
+                n = cur.rowcount
+            if n:
+                log.info("closed %d interrupted run(s) from a previous worker process", n)
+            return n
+        except Exception as exc:
+            log.warning("could not close interrupted runs: %s", str(exc)[:120])
+            return 0
+
     def exists_since(self, task: str, since: datetime, statuses=("running", "succeeded")) -> bool:
         with db.connect(autocommit=True) as conn:
             row = conn.execute(
@@ -353,6 +372,8 @@ class Worker:
         log.info("worker starting on %s: tasks=%s cadence=%d fleet_every=%d hot=%d min stale=%d min nightly=%s monthly=%s",
                  HOST, ",".join(sorted(self.tasks)), CADENCE_MINUTES, FLEET_EVERY_MINUTES, HOT_STATION_MINUTES,
                  FEED_STALE_MINUTES, NIGHTLY_AT, MONTHLY_AT)
+        if not self.dry_run:
+            self.runs.close_interrupted()
         coros = [self.ticker()]
         if "jobs" in self.tasks:
             coros.append(self.jobs_loop())
