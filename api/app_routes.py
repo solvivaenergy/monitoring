@@ -161,6 +161,24 @@ async def _authenticate(authorization: str = Header(...)) -> dict:
 HOURLY_FIELDS = ("production_kwh", "consumption_kwh", "grid_import_kwh", "grid_export_kwh")
 
 
+def _touch_activity(station_id: str) -> None:
+    """Record that a portal login looked at this station (migration 23's
+    station_activity). The worker polls Solis every 5 minutes only for stations
+    viewed in the last hour, and every 15 minutes for the rest. Fire-and-forget:
+    a failure here never affects the response."""
+    try:
+        _get_supabase().rpc("touch_station_activity", {"p_station_id": station_id}).execute()
+    except Exception as exc:
+        log.debug("touch_station_activity failed: %s", exc)
+
+
+def _touch_activity_later(station_id: str) -> None:
+    try:
+        asyncio.get_running_loop().create_task(asyncio.to_thread(_touch_activity, station_id))
+    except RuntimeError:
+        pass
+
+
 def _empty_hour(day_start: datetime, hour: int) -> dict:
     return {"hour": hour, "hour_start": (day_start + timedelta(hours=hour)).isoformat(),
             "production_kwh": None, "consumption_kwh": None, "grid_import_kwh": None, "grid_export_kwh": None,
@@ -181,6 +199,7 @@ async def get_hourly(day: Optional[str] = Query(None, alias="date", pattern=r"^\
     """
     user = await _authenticate(authorization)
     station_id = await _resolve_station_id(user)
+    _touch_activity_later(station_id)
     sb = _get_supabase()
     sys_rows = (sb.table("solar_systems").select("id").eq("solis_station_id", station_id)
                 .limit(1).execute().data or [])
@@ -255,6 +274,7 @@ async def get_live_data(authorization: str = Header(...)):
     user = await _authenticate(authorization)
     user_id = str(user["id"])
     station_id = await _resolve_station_id(user)
+    _touch_activity_later(station_id)
     solis = _get_solis()
 
     try:

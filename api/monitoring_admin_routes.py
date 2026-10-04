@@ -210,6 +210,51 @@ async def me(authorization: str = Header(None)):
     return {**staff, "locked_fields": LOCKED_FIELDS}
 
 
+@router.get("/api/health")
+async def health(authorization: str = Header(None)):
+    """Feed freshness and worker activity for the Health tab (migration 23):
+    the newest five-minute point, the last rolled-up hour, the last daily row,
+    the last run of each worker task, the backfill queue, stations viewed in
+    the last hour, and the five-minute partitions. Ages are computed by the
+    page from the timestamps."""
+    await _authenticate_staff(authorization)
+    with db.connect(autocommit=True) as conn:
+        five = conn.execute(
+            "select max(last_ts) as last_ts, count(*) as stations_today, sum(n_rows) as rows_today "
+            "from public.five_minute_watermarks").fetchone()
+        hourly = conn.execute(
+            "select max(hour_start) as last_hour, count(distinct system_id) filter (where hour_start >= now() - interval '3 hours') as stations_3h "
+            "from public.energy_readings_hourly where source = 'rollup'").fetchone()
+        daily = conn.execute(
+            """select max("timestamp") as last_day,
+                      count(*) filter (where "timestamp" >= now() - interval '36 hours' and production_kwh > 0) as nonzero_recent
+                 from public.energy_readings where "timestamp" >= now() - interval '3 days'""").fetchone()
+        last_runs = conn.execute(
+            """select distinct on (task) task, started_at, finished_at, status, stats, left(error, 200) as error, host
+                 from public.sync_runs order by task, started_at desc""").fetchall()
+        recent = conn.execute(
+            """select task, started_at, finished_at, status, stats, left(error, 200) as error
+                 from public.sync_runs order by started_at desc limit 40""").fetchall()
+        queue = conn.execute(
+            "select status, count(*) as n from public.backfill_jobs where status in ('queued', 'running') group by status").fetchall()
+        hot = conn.execute(
+            "select count(*) as n from public.station_activity where last_viewed_at > now() - interval '60 minutes'").fetchone()
+        parts = conn.execute(
+            """select c.relname, pg_size_pretty(pg_total_relation_size(c.oid)) as size
+                 from pg_inherits i join pg_class c on c.oid = i.inhrelid
+                where i.inhparent = 'public.energy_readings_five_minutes'::regclass order by 1""").fetchall()
+        active = conn.execute(
+            "select count(*) as n from public.solar_systems where status = 'active' and solis_station_id is not null").fetchone()
+    return _j({
+        "now": dt.datetime.now(dt.timezone.utc),
+        "five_minute": dict(five), "hourly": dict(hourly), "daily": dict(daily),
+        "last_runs": last_runs, "recent_runs": recent,
+        "queue": {r["status"]: r["n"] for r in queue},
+        "hot_stations": hot["n"], "active_stations": active["n"],
+        "five_minute_partitions": parts,
+    })
+
+
 # ---------------------------------------------------------------------------
 # the grid
 # ---------------------------------------------------------------------------

@@ -116,6 +116,7 @@
     <button data-tab="unresolved">Unresolved</button>
     <button data-tab="jobs">Backfills</button>
     <button data-tab="audit">Audit</button>
+    <button data-tab="health">Health</button>
     <button data-tab="guide">Guide</button>
     <button data-tab="staff" id="tab-staff" hidden>Staff</button>
   </nav>
@@ -168,6 +169,7 @@
   <section id="view-unresolved" hidden></section>
   <section id="view-jobs" hidden></section>
   <section id="view-audit" hidden></section>
+  <section id="view-health" hidden></section>
   <section id="view-staff" hidden></section>
   <section id="view-guide" hidden></section>
 </main>
@@ -225,8 +227,8 @@ async function boot(){
   if (session) await ensureLoggedIn(); else show('login');
 }
 
-const TABS = ['customers', 'unresolved', 'jobs', 'audit', 'guide', 'staff'];
-const TAB_LOADERS = {unresolved: () => loadUnresolved(), jobs: () => loadJobs(), audit: () => loadAudit(), staff: () => loadStaff(), guide: () => loadGuide()};
+const TABS = ['customers', 'unresolved', 'jobs', 'audit', 'health', 'guide', 'staff'];
+const TAB_LOADERS = {unresolved: () => loadUnresolved(), jobs: () => loadJobs(), audit: () => loadAudit(), health: () => loadHealth(), staff: () => loadStaff(), guide: () => loadGuide()};
 
 function show(view){
   $$('main > section').forEach(s => s.hidden = true);
@@ -975,6 +977,46 @@ async function fillSuggestions(){
   }
 }
 
+// Health: feed freshness + worker runs (migration 23, api/worker.py).
+function ageMin(ts, now){ return ts ? Math.round((new Date(now) - new Date(ts)) / 60000) : null; }
+function ageText(min){ if (min == null) return 'never'; if (min < 60) return `${min} min ago`; if (min < 48*60) return `${(min/60).toFixed(1)} h ago`; return `${Math.round(min/1440)} d ago`; }
+async function loadHealth(){
+  const el = $('#view-health'); el.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const h = await api('/monitoring-admin/api/health');
+    const now = h.now;
+    const fiveAge = ageMin(h.five_minute.last_ts, now), hourAge = ageMin(h.hourly.last_hour, now), dayAge = ageMin(h.daily.last_day, now);
+    const byTask = {}; (h.last_runs||[]).forEach(r => byTask[r.task] = r);
+    const lastAny = (h.last_runs||[]).map(r => r.started_at).sort().pop();
+    const tile = (n, l, cls='') => `<div class="card"><div class="n ${cls}">${n}</div><div class="l">${l}</div></div>`;
+    const cls = (min, warn, bad) => min == null ? 'bad' : min > bad ? 'bad' : min > warn ? 'warn' : 'ok';
+    const q = h.queue || {};
+    el.innerHTML = `
+      <div class="kpi">
+        ${tile(ageText(fiveAge), `five-minute feed · newest point (${h.five_minute.stations_today||0} stations today)`, cls(fiveAge, 20, 45))}
+        ${tile(h.hourly.last_hour ? new Date(h.hourly.last_hour).toLocaleTimeString('en-PH',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Manila'}) : 'never', `hourly roll-up · last closed hour (${h.hourly.stations_3h||0} stations in 3 h)`, cls(hourAge, 150, 240))}
+        ${tile(h.daily.last_day ? fmtDate(h.daily.last_day) : 'never', `daily readings · newest day (${h.daily.nonzero_recent||0} stations with production in 36 h)`, cls(dayAge, 30*60, 54*60))}
+        ${tile(lastAny ? ageText(ageMin(lastAny, now)) : 'no runs yet', 'worker · last recorded run', lastAny ? cls(ageMin(lastAny, now), 20, 60) : 'warn')}
+        ${tile(`${q.queued||0} / ${q.running||0}`, 'backfill jobs · queued / running')}
+        ${tile(`${h.hot_stations} / ${h.active_stations}`, 'stations viewed in the last hour / active')}
+      </div>
+      <div class="card sect"><h3 style="margin-top:0">Last run of each task</h3>
+        <p class="hint"><b>five_minute</b> runs every 5 min (a full fleet pass every 15 min, "hot" stations in between); <b>nightly</b> at 02:00 (onboarding → daily readings → referral codes → identity mirror); <b>monthly</b> on the 1st at 09:00 (previous month re-read for every station); <b>health</b> rows appear only when the five-minute feed goes stale (&gt;30 min) or recovers — those also go out as alerts. Backfill jobs are not listed here; see <i>Backfills</i>. Until the worker is deployed and the crons retired, this table stays empty while the feeds above keep moving.</p>
+        <table><thead><tr><th>Task</th><th>Started</th><th>Took</th><th>Status</th><th>Stats</th><th>Error</th><th>Host</th></tr></thead><tbody>
+        ${(h.last_runs||[]).map(r => `<tr><td><b>${esc(r.task)}</b></td><td>${fmtTs(r.started_at)}</td><td>${r.stats&&r.stats.seconds!=null?r.stats.seconds+' s':''}</td><td><span class="tag ${r.status==='succeeded'?'ok':r.status==='failed'?'bad':'warn'}">${esc(r.status)}</span></td><td class="wrap mono" style="font-size:12px">${esc(JSON.stringify(Object.fromEntries(Object.entries(r.stats||{}).filter(([k])=>k!=='seconds'))))}</td><td class="wrap muted">${esc(r.error||'')}</td><td class="muted">${esc(r.host||'')}</td></tr>`).join('') || '<tr><td colspan=7 class="muted">no runs recorded yet</td></tr>'}
+        </tbody></table></div>
+      <div class="card sect"><h3 style="margin-top:0">Recent runs</h3>
+        <table><thead><tr><th>Started</th><th>Task</th><th>Took</th><th>Status</th><th>Stats</th><th>Error</th></tr></thead><tbody>
+        ${(h.recent_runs||[]).map(r => `<tr><td>${fmtTs(r.started_at)}</td><td>${esc(r.task)}</td><td>${r.stats&&r.stats.seconds!=null?r.stats.seconds+' s':''}</td><td><span class="tag ${r.status==='succeeded'?'ok':r.status==='failed'?'bad':'warn'}">${esc(r.status)}</span></td><td class="wrap mono" style="font-size:12px">${esc(JSON.stringify(Object.fromEntries(Object.entries(r.stats||{}).filter(([k])=>k!=='seconds'))))}</td><td class="wrap muted">${esc(r.error||'')}</td></tr>`).join('') || '<tr><td colspan=6 class="muted">none</td></tr>'}
+        </tbody></table></div>
+      <div class="card sect"><h3 style="margin-top:0">Five-minute partitions</h3>
+        <p class="hint">One partition per UTC day; pg_cron creates the next two and drops anything older than two days (migration 21). Expect 4–5 rows here.</p>
+        <table><thead><tr><th>Partition</th><th>Size</th></tr></thead><tbody>
+        ${(h.five_minute_partitions||[]).map(p => `<tr><td class="mono">${esc(p.relname)}</td><td>${esc(p.size)}</td></tr>`).join('')}
+        </tbody></table></div>`;
+  } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
+}
+
 // Odoo helpdesk tickets for the dark list — filled after the page renders so
 // an Odoo hiccup never blanks the Unresolved tab (same shape as fillSuggestions).
 async function fillHelpdesk(){
@@ -1116,6 +1158,9 @@ function loadGuide(){
 
     <h3>7. Several people must watch one station (SME staff, a family member)</h3>
     <p>Open the station → <b>Who can view this station</b> → <i>Give another login view access</i> → email, name, reason → Grant. If the email has no login yet, one is created and a temporary password is shown once — pass it on privately and have them change it. The viewer sees this station in the portal exactly as the owner does, read-only, without the owner's contact details. Revoke from the same list. Ownership does not move: the Odoo mapping, the syncs and the backfills still follow the owner. Never give the second person a second station row or a second Odoo lead — that is the duplicate pattern Retire cleans up.</p>
+
+    <h3>8. Is the data flowing? (Health tab)</h3>
+    <p>The <b>Health</b> tab shows how old the newest five-minute point is (green under 20 minutes), the last hour rolled up, the newest daily row, the backfill queue, and the last run of every worker task with its outcome. One always-on worker runs all the pipelines (five-minute loop, nightly chain at 02:00, monthly re-read on the 1st, backfill jobs); when the five-minute feed is more than 30 minutes stale it alerts the team by webhook/email and again when it recovers. Red tile = look at the worker's logs in Render first, then at Solis Cloud's own status.</p>
 
     <h3>Roles</h3>
     <p><b>readonly</b> sees everything; <b>engineer</b> can edit, remap, add stations and queue backfills; <b>admin</b> also manages staff. Admins add colleagues in <b>Staff</b> — a solvivaenergy.com Google account signs in directly once added.</p>

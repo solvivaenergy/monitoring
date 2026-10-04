@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY api/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY api/ ./api/
+# The always-on worker: five-minute loop, nightly chain, monthly run, backfill
+# queue and feed health in one process with one Solis rate gate. See api/worker.py.
+CMD ["python", "-m", "api.worker"]

@@ -359,6 +359,52 @@ async def run_loop(solis: SolisCloudClient, sb: Client) -> None:
         await asyncio.sleep(SYNC_INTERVAL_SECONDS)
 
 
+async def run_nightly(solis: SolisCloudClient, sb: Client, onboard: bool = True, mirror: bool = True) -> dict:
+    """The nightly chain, in order: Odoo onboarding → daily readings → referral
+    codes → identity mirror. Each step is isolated so a failure in one never
+    stops the next; the returned dict says what happened to each. Called by the
+    02:00 cron (main) and by api/worker.py."""
+    stats: dict = {}
+
+    # Pre-step: onboard any Odoo lead that has a Solis station id so its
+    # readings are included in this same sync run.
+    if onboard:
+        try:
+            from api.onboard_from_odoo import auto_onboard_from_odoo
+            log.info("Starting Odoo → Supabase auto-onboarding…")
+            await auto_onboard_from_odoo(sb, solis)
+            stats["onboarding"] = "ok"
+        except Exception as e:
+            log.error("Odoo auto-onboarding failed: %s", e)
+            stats["onboarding"] = f"failed: {str(e)[:120]}"
+
+    count = await sync_once(solis, sb)
+    log.info("Done — %d reading(s) written.", count)
+    stats["daily_rows"] = count
+
+    # Sync referral codes from Odoo → user_profiles
+    try:
+        from api.sync_referral_codes import sync_referral_codes
+        log.info("Starting referral code sync from Odoo…")
+        stats["referral_codes"] = sync_referral_codes(sb)
+    except Exception as e:
+        log.error("Referral code sync failed: %s", e)
+        stats["referral_codes"] = f"failed: {str(e)[:120]}"
+
+    # Mirror Odoo lead/partner fields and Solis plant name/email into our
+    # cached identity columns for Monitoring Admin. Read-only toward Odoo.
+    # Last, so a failure here never delays the readings above.
+    if mirror:
+        try:
+            from api.sync_identity_mirror import run as mirror_identity
+            log.info("Starting identity mirror (Odoo + Solis → cached columns)…")
+            stats["identity_mirror"] = await mirror_identity(apply=True)
+        except Exception as e:
+            log.error("Identity mirror failed: %s", e)
+            stats["identity_mirror"] = f"failed: {str(e)[:120]}"
+    return stats
+
+
 async def main() -> None:
     sb = build_supabase()
     solis = build_solis()
@@ -366,37 +412,7 @@ async def main() -> None:
     if "--loop" in sys.argv:
         await run_loop(solis, sb)
     else:
-        # Pre-step: onboard any Odoo lead that has a Solis station id so its
-        # readings are included in this same sync run.
-        if "--no-onboard" not in sys.argv:
-            try:
-                from api.onboard_from_odoo import auto_onboard_from_odoo
-                log.info("Starting Odoo → Supabase auto-onboarding…")
-                await auto_onboard_from_odoo(sb, solis)
-            except Exception as e:
-                log.error("Odoo auto-onboarding failed: %s", e)
-
-        count = await sync_once(solis, sb)
-        log.info("Done — %d reading(s) written.", count)
-
-        # Sync referral codes from Odoo → user_profiles
-        try:
-            from api.sync_referral_codes import sync_referral_codes
-            log.info("Starting referral code sync from Odoo…")
-            sync_referral_codes(sb)
-        except Exception as e:
-            log.error("Referral code sync failed: %s", e)
-
-        # Mirror Odoo lead/partner fields and Solis plant name/email into our
-        # cached identity columns for Monitoring Admin. Read-only toward Odoo.
-        # Last, so a failure here never delays the readings above.
-        if "--no-mirror" not in sys.argv:
-            try:
-                from api.sync_identity_mirror import run as mirror_identity
-                log.info("Starting identity mirror (Odoo + Solis → cached columns)…")
-                await mirror_identity(apply=True)
-            except Exception as e:
-                log.error("Identity mirror failed: %s", e)
+        await run_nightly(solis, sb, onboard="--no-onboard" not in sys.argv, mirror="--no-mirror" not in sys.argv)
 
 
 if __name__ == "__main__":

@@ -58,37 +58,21 @@ def month_bounds(ym: str | None) -> tuple[date, date]:
     return first, nxt - timedelta(days=1)
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    ap = argparse.ArgumentParser(description="Queue a backfill job for every active station.")
-    ap.add_argument("month", nargs="?", help="YYYY-MM for a daily re-read (default: the previous month)")
-    ap.add_argument("--hourly", action="store_true", help="hourly history instead of a daily month")
-    ap.add_argument("--days", type=int, default=90, help="with --hourly: how many days back (default 90)")
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
-
-    today = datetime.now(PHT).date()
-    if args.hourly:
-        granularity = "hourly"
-        date_from, date_to = today - timedelta(days=args.days), today - timedelta(days=1)
-        reason = f"hourly history: {args.days} days of stationDay curves for every active station"
-        source = "fleet_script"
-    else:
-        granularity = "daily"
-        date_from, date_to = month_bounds(args.month)
-        if date_to >= today:
-            sys.exit(f"{date_from:%Y-%m} is not over yet — today's row is a placeholder until tonight's sync")
-        reason = f"monthly accuracy run: re-read {date_from:%B %Y} from Solis for every active station"
-        source = "monthly_refresh"
+def enqueue_fleet(granularity: str, date_from: date, date_to: date, reason: str, source: str,
+                  dry_run: bool = False) -> dict:
+    """One job per active station (stations with a job of this kind already
+    queued or running are skipped). Returns counts and the batch's request id.
+    Used by the CLI below and by api/worker.py's monthly task."""
     request_id = str(uuid.uuid4())
-
     with db.connect(autocommit=True) as conn:
         rows = conn.execute(FLEET_TARGETS_SQL, (granularity,)).fetchall()
     targets = [r for r in rows if not r["busy"]]
     log.info("%s %s → %s: %d active station(s); %d to queue, %d skipped (a %s job is already queued or running).",
              granularity, date_from, date_to, len(rows), len(targets), len(rows) - len(targets), granularity)
-    if args.dry_run or not targets:
-        return
+    result = {"granularity": granularity, "date_from": date_from.isoformat(), "date_to": date_to.isoformat(),
+              "stations": len(rows), "queued": 0, "skipped_busy": len(rows) - len(targets), "request_id": request_id}
+    if dry_run or not targets:
+        return result
 
     with db.audited(None, None, reason, source=source, request_id=request_id) as conn:
         with conn.cursor() as cur:
@@ -100,7 +84,32 @@ def main() -> None:
                    on conflict do nothing""",
                 [(r["id"], r["solis_station_id"], granularity, date_from, date_to, reason, request_id)
                  for r in targets])
+    result["queued"] = len(targets)
     log.info("Queued %d %s job(s) for %s → %s under request %s.", len(targets), granularity, date_from, date_to, request_id)
+    return result
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    ap = argparse.ArgumentParser(description="Queue a backfill job for every active station.")
+    ap.add_argument("month", nargs="?", help="YYYY-MM for a daily re-read (default: the previous month)")
+    ap.add_argument("--hourly", action="store_true", help="hourly history instead of a daily month")
+    ap.add_argument("--days", type=int, default=90, help="with --hourly: how many days back (default 90)")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    today = datetime.now(PHT).date()
+    if args.hourly:
+        enqueue_fleet("hourly", today - timedelta(days=args.days), today - timedelta(days=1),
+                      f"hourly history: {args.days} days of stationDay curves for every active station",
+                      "fleet_script", dry_run=args.dry_run)
+    else:
+        date_from, date_to = month_bounds(args.month)
+        if date_to >= today:
+            sys.exit(f"{date_from:%Y-%m} is not over yet — today's row is a placeholder until tonight's sync")
+        enqueue_fleet("daily", date_from, date_to,
+                      f"monthly accuracy run: re-read {date_from:%B %Y} from Solis for every active station",
+                      "monthly_refresh", dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

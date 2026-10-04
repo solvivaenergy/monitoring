@@ -550,7 +550,11 @@ async def sync_once(
     dry_run: bool = False,
     limit: Optional[int] = None,
     solis: Optional[SolisCloudClient] = None,
+    only_system_ids: Optional[set] = None,
 ) -> int:
+    """One pass over the fleet (or, with `only_system_ids`, over those stations
+    only — the worker's "hot" pass for stations someone is watching in the
+    portal, between its full-fleet passes). Returns rows written."""
     sb = build_supabase()
     solis = solis or build_solis()
 
@@ -600,6 +604,13 @@ async def sync_once(
         }
         for s in stations
     ]
+
+    if only_system_ids is not None:
+        users = [u for u in users if u["system_id"] in only_system_ids]
+        if not users:
+            log.info("No station in the requested subset — nothing to sync.")
+            return 0
+        log.info("Subset pass: %d station(s).", len(users))
 
     today = datetime.now(PHT).date()
     day_start = f"{today.isoformat()}T00:00:00+08:00"

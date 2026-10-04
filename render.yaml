@@ -193,6 +193,80 @@ services:
       - key: SUPABASE_DB_POOLER_URL
         sync: false
 
+  # The always-on worker (2026-10-04): the five-minute loop, the nightly chain,
+  # the monthly run, the backfill queue and feed health in ONE process with ONE
+  # Solis rate gate — api/worker.py. It replaces the four crons above: once its
+  # first five-minute runs show in Monitoring Admin → Health, SUSPEND the crons
+  # in the dashboard (a Blueprint sync never deletes or stops a service). While
+  # both run, the only cost is a double Solis fetch; every write is idempotent.
+  # Singapore: ~55 ms to the database in Mumbai instead of ~220 ms from Oregon.
+  - type: worker
+    name: solviva-worker
+    runtime: docker
+    region: singapore
+    plan: starter
+    dockerfilePath: ./Dockerfile.worker.all
+    envVars:
+      - key: WORKER_TASKS
+        value: five_minute,nightly,monthly,jobs,health
+      - key: SYNC_CADENCE_MINUTES
+        value: "5"
+      - key: FLEET_EVERY_MINUTES
+        value: "15"
+      - key: HOT_STATION_MINUTES
+        value: "60"
+      - key: FEED_STALE_MINUTES
+        value: "30"
+      - key: SOLIS_CONCURRENCY
+        value: "16"
+      - key: ONBOARD_BACKFILL_DAYS
+        value: "60"
+      # Same secrets as solviva-sync + solviva-api; copy them in the dashboard.
+      - key: SOLIS_CLOUD_KEY_ID
+        sync: false
+      - key: SOLIS_CLOUD_KEY_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_DB_POOLER_URL
+        sync: false
+      - key: ODOO_SH_URL
+        sync: false
+      - key: ODOO_SH_DB
+        sync: false
+      - key: ODOO_SH_USER
+        sync: false
+      - key: ODOO_SH_API_KEY
+        sync: false
+      - key: ODOO_URL
+        sync: false
+      - key: ODOO_DB
+        sync: false
+      - key: ODOO_USER
+        sync: false
+      - key: ODOO_API_KEY
+        sync: false
+      - key: DEFAULT_USER_PASSWORD
+        sync: false
+      - key: ALERT_WEBHOOK_URL
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: ALERT_EMAIL_FROM
+        sync: false
+      - key: ALERT_EMAIL_TO
+        sync: false
+
   # Cross-system MCP server for Claude Teams (read-only, shared service token).
   # Must NOT be plan: free — a cold start blows Claude's 10s connector timeout.
   - type: web
