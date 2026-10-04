@@ -57,12 +57,15 @@ def build_supabase() -> Client:
 
 def _odoo_connect() -> Tuple[str, int, str, xmlrpc.client.ServerProxy]:
     """Authenticate to Odoo and return (db, uid, auth, models_proxy)."""
-    url = get_env("ODOO_URL")
-    db = get_env("ODOO_DB")
-    user = get_env("ODOO_USER")
-    auth = os.getenv("ODOO_API_KEY") or os.getenv("ODOO_PASSWORD")
+    # ODOO_SH_* is the production odoo.sh instance; ODOO_* is the older naming
+    # for the same thing (kept as a fallback). Same order as onboard_from_odoo,
+    # so the worker only needs the ODOO_SH_* set.
+    url = os.getenv("ODOO_SH_URL") or get_env("ODOO_URL")
+    db = os.getenv("ODOO_SH_DB") or get_env("ODOO_DB")
+    user = os.getenv("ODOO_SH_USER") or get_env("ODOO_USER")
+    auth = os.getenv("ODOO_SH_API_KEY") or os.getenv("ODOO_API_KEY") or os.getenv("ODOO_PASSWORD")
     if not auth:
-        raise RuntimeError("Missing ODOO_API_KEY or ODOO_PASSWORD")
+        raise RuntimeError("Missing ODOO_SH_API_KEY (or ODOO_API_KEY / ODOO_PASSWORD)")
 
     common = xmlrpc.client.ServerProxy(f"{url.rstrip('/')}/xmlrpc/2/common")
     uid = common.authenticate(db, user, auth, {})

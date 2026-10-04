@@ -242,14 +242,8 @@ services:
         sync: false
       - key: ODOO_SH_API_KEY
         sync: false
-      - key: ODOO_URL
-        sync: false
-      - key: ODOO_DB
-        sync: false
-      - key: ODOO_USER
-        sync: false
-      - key: ODOO_API_KEY
-        sync: false
+      # (ODOO_URL/DB/USER/API_KEY are the OLD names for the same thing; every
+      # module now reads ODOO_SH_* first, so the worker does not need them.)
       - key: DEFAULT_USER_PASSWORD
         sync: false
       - key: ALERT_WEBHOOK_URL
