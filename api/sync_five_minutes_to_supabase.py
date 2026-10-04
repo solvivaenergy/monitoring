@@ -618,13 +618,14 @@ async def sync_once(
         )
         log.info("Would purge %s old 5-minute row(s) [dry-run].", stale.count or 0)
     else:
-        # Yesterday's last hours into the hourly table BEFORE the purge takes
-        # them away (migration 20). Cheap on every run but the first of the day:
-        # the range is empty once the purge has run.
+        # Yesterday's last hours into the hourly table (migration 20). Cheap on
+        # every run but the first of the day: the roll-up skips identical rows.
         day_start_dt = datetime.combine(today, datetime.min.time(), tzinfo=PHT)
         _rollup_hourly(sb, day_start_dt - timedelta(days=1), day_start_dt)
-        deleted_count = _purge_old_rows(sb, day_start)
-        log.info("Purged %s old 5-minute row(s) before syncing %s.", deleted_count or 0, today_str)
+        # Retention moved into the database on 2026-10-04 (migration 21): the
+        # table is partitioned by UTC day and pg_cron drops partitions older
+        # than two days, so there is nothing to DELETE here any more.
+        # _purge_old_rows stays below for the history it documents.
     # What we already hold today, per station, in ONE request (migration 17's
     # view). Until 2026-09-25 this paged through every row of the day — ~64
     # requests a run by evening, each one dirtying the pages it read — to
