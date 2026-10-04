@@ -143,6 +143,26 @@ class Runs:
             log.warning("could not close interrupted runs: %s", str(exc)[:120])
             return 0
 
+    def release_orphaned_jobs(self) -> int:
+        """backfill_jobs left at 'running' by a killed process go back to the
+        queue. The claim already counted the attempt, so a job interrupted
+        MAX_ATTEMPTS times ends up failed rather than looping forever."""
+        try:
+            with db.audited(None, None, "re-queued: left at 'running' when the worker restarted",
+                            source="backfill_worker") as conn:
+                cur = conn.execute(
+                    """update public.backfill_jobs
+                          set status = 'queued', started_at = null,
+                              error = 'interrupted — the worker restarted mid-job; re-queued'
+                        where status = 'running'""")
+                n = cur.rowcount
+            if n:
+                log.info("re-queued %d job(s) left running by a previous worker process", n)
+            return n
+        except Exception as exc:
+            log.warning("could not release orphaned jobs: %s", str(exc)[:120])
+            return 0
+
     def exists_since(self, task: str, since: datetime, statuses=("running", "succeeded")) -> bool:
         with db.connect(autocommit=True) as conn:
             row = conn.execute(
@@ -374,6 +394,8 @@ class Worker:
                  FEED_STALE_MINUTES, NIGHTLY_AT, MONTHLY_AT)
         if not self.dry_run:
             self.runs.close_interrupted()
+            if "jobs" in self.tasks:
+                self.runs.release_orphaned_jobs()
         coros = [self.ticker()]
         if "jobs" in self.tasks:
             coros.append(self.jobs_loop())
