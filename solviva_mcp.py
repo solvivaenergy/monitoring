@@ -1,19 +1,43 @@
 """
-Solviva cross-system MCP server — read-only.
+Solviva Solis Cloud + cross-system MCP server — read-only.
 
-Answers questions that need Odoo, Supabase and Solis together, which neither
-the Supabase nor the Odoo connector can do on its own:
+Solis Cloud has no MCP server of its own, so this one exposes the fleet through
+the monitoring repo's signed client (api/solis_client.py: HMAC auth, rate gate,
+retries, the code-'1' guard):
 
+    solis_search_stations         find a plant by name, owner email, id or serial
+    solis_fleet_health            every plant offline or in alarm right now
+    solis_station_detail          one plant: state, power, energy totals, address, inverters
+    solis_station_day             one plant's five-minute curve for a date
+    solis_station_month / _year   per-day / per-month energy, grid and battery figures
+    solis_inverters               the inverters of a plant
+    solis_inverter_detail         live readings of one inverter (strings, AC, battery)
+    solis_inverter_day            one inverter's five-minute curve for a date
+    solis_alarms                  alarm history of a plant
+    solis_collectors              data loggers of a plant
+
+plus the checks that need Odoo, Supabase and Solis together, which no
+single-system connector can do:
+
+    client_360                    one client across all three systems
     stations_missing_recent_data  onboarded in Supabase, but no recent readings
     unmapped_leads                Odoo lead has a station id that never became a user
     reconcile_month               Solis stationMonth vs Supabase energy_readings
 
-Reuses the proven primitives in api/ rather than reimplementing them.
+Odoo records themselves are served by the MCP module inside production Odoo
+(the "Odoo SH Production" connector) and the monitoring database by its own
+Supabase connector, so the generic Odoo read tools that used to live here were
+removed on 2026-10-06.
+
+Imports from api/ are limited to the Solis client and the onboarding helpers.
+The small numeric helpers are defined here on purpose: importing private names
+from the sync modules is what broke every deploy between 2026-09-25 and
+2026-10-06 (ImportError on start; Render kept serving the 2026-09-21 image).
 
 Run locally (stdio, for Claude Code):
     python solviva_mcp.py
 
-Run as a remote server (for a hosted deployment later):
+Run as a remote server (Render, behind the claude.ai connector):
     python solviva_mcp.py --http --port 8081
 
 This server never writes. Every tool is a read, and there is no code path that
@@ -45,11 +69,9 @@ from api.onboard_from_station_csv import (
 )
 from api.onboard_from_odoo import (
     DEFAULT_FIELD_NAME,
-    _build_odoo_config,
-    _connect_odoo,
     fetch_leads_with_station_id,
 )
-from api.sync_to_supabase import _daily_consumption_kwh, _to_float
+from api.solis_client import SolisCloudError
 
 load_environment()
 
@@ -58,6 +80,85 @@ PHT = timezone(timedelta(hours=8))
 # Tolerances carried over from api/audit_jul_aug_all.py.
 TOL_PROD_KWH = 0.5
 TOL_CONS_KWH = 1.0
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _daily_consumption_kwh(day: Dict[str, Any]) -> float:
+    """Consumption for one stationMonth day record.
+
+    The same rule as api/backfill_history.parse_month_day, which is what the
+    nightly sync writes into energy_readings: reconcile_month must apply the
+    identical rule or every day would read as drift. A local copy on purpose
+    (see the module docstring): if the sync rule changes, that surfaces as
+    drift in reconcile_month, which someone sees, rather than as an
+    ImportError on start, which nobody did for eleven days.
+    """
+    total_grid_load = _to_float(day.get("homeGridEnergy"))
+    backup_load = _to_float(day.get("backUpEnergy")) + _to_float(day.get("backup2Energy"))
+    consumption = total_grid_load + backup_load
+    if consumption <= 0:
+        consumption = _to_float(day.get("homeLoadEnergy"))
+    if consumption <= 0:
+        consumption = _to_float(day.get("consumeEnergy"))
+    return consumption
+
+
+def _pht_iso(epoch_ms: Any) -> Optional[str]:
+    """Solis epoch-millisecond timestamp -> ISO string in Manila time."""
+    ms = _to_float(epoch_ms)
+    if not ms:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=PHT).isoformat()
+
+
+_SOLIS_CODE_1_NOTE = (
+    "Solis answered code '1', which it uses for BOTH an unknown station id and a "
+    "transient outage; the two responses are byte-identical. Do not conclude the "
+    "station is gone: the roster (solis_search_stations) is the authoritative check."
+)
+
+
+def _solis_error(exc: Exception, **context: Any) -> Dict[str, Any]:
+    """Shape a Solis failure as a tool result instead of a raised exception."""
+    out: Dict[str, Any] = {"error": "solis_error", **context}
+    if isinstance(exc, SolisCloudError):
+        out["code"] = exc.code
+        out["detail"] = exc.message
+        if str(exc.code) == "1":
+            out["note"] = _SOLIS_CODE_1_NOTE
+    else:
+        out["detail"] = str(exc)[:300]
+    return out
+
+
+def _records(payload: Any) -> List[Dict[str, Any]]:
+    """Solis list endpoints answer either a bare list or {page: {records: [...]}}."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        page = payload.get("page") or {}
+        return page.get("records") or payload.get("records") or []
+    return []
+
+
+def _pick(record: Dict[str, Any], keys: tuple, time_keys: tuple = ()) -> Dict[str, Any]:
+    """Only the keys present and meaningful ("--" is Solis for n/a), with
+    epoch-ms fields rendered in Manila time."""
+    out: Dict[str, Any] = {}
+    for key in keys:
+        value = record.get(key)
+        if value in (None, "", "--"):
+            continue
+        out[key] = _pht_iso(value) if key in time_keys else value
+    return out
 
 # Solis station `state` (and its mirror `alarmState`), confirmed against the live
 # fleet: 1 => generating normally, 2 => offline with no power and stale data,
@@ -69,11 +170,15 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
 mcp = MCPServer(
     name="solviva",
     instructions=(
-        "Read-only cross-system queries over Solviva's Odoo CRM, Supabase and Solis "
-        "Cloud. Use these when a question spans two systems. For single-system "
-        "queries prefer the dedicated Supabase or Odoo connectors."
+        "Read-only Solis Cloud data for Solviva's ~700 solar plants: roster search, "
+        "fleet health, and per plant the detail, five-minute day curve, monthly and "
+        "yearly energy, inverters, alarms and data loggers. Also the cross-system "
+        "checks that join Odoo, Supabase and Solis (client_360, unmapped_leads, "
+        "stations_missing_recent_data, reconcile_month). Station ids come from "
+        "solis_search_stations; times are Manila (UTC+8). For Odoo records use the "
+        "Odoo SH Production connector; for the monitoring database its Supabase connector."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 
@@ -156,181 +261,6 @@ def _station_summary(rec: Dict[str, Any], onboarded: Set[str]) -> Dict[str, Any]
     }
 
 
-# --------------------------------------------------------------------------
-# Generic Odoo reads.
-#
-# Open by default: ODOO_ALLOWED_MODELS is unset, so any model the credential can
-# read is readable here. Odoo's own record rules still apply — under the current
-# `admin` user that already denies hr.contract, hr.payslip and mail.message.
-#
-# To narrow it later, set ODOO_ALLOWED_MODELS to a comma-separated list, e.g.
-#   ODOO_ALLOWED_MODELS=crm.lead,res.partner,sale.order
-# That becomes the whole boundary again without a code change. The suggested
-# starting list is kept below for whenever that happens.
-# --------------------------------------------------------------------------
-ALLOW_ALL_MODELS = "*"
-SUGGESTED_ALLOWED_MODELS = (
-    "crm.lead,res.partner,sale.order,project.project,"
-    "helpdesk.ticket,product.template,crm.stage,crm.team"
-)
-MAX_ODOO_ROWS = 200
-
-_odoo_session: Optional[tuple] = None
-
-
-def _allowed_models() -> Set[str]:
-    """Empty set means unrestricted — every model the credential can read."""
-    raw = os.getenv("ODOO_ALLOWED_MODELS", ALLOW_ALL_MODELS).strip()
-    if raw in ("", ALLOW_ALL_MODELS):
-        return set()
-    return {m.strip() for m in raw.split(",") if m.strip()}
-
-
-def _odoo() -> tuple:
-    """(config, uid, models proxy), authenticating once per process."""
-    global _odoo_session
-    if _odoo_session is None:
-        cfg = _build_odoo_config()
-        uid, models = _connect_odoo(cfg)
-        _odoo_session = (cfg, uid, models)
-    return _odoo_session
-
-
-def _check_model(model: str) -> Optional[Dict[str, Any]]:
-    allowed = _allowed_models()
-    if allowed and model not in allowed:
-        return {
-            "error": "model_not_allowed",
-            "model": model,
-            "allowed_models": sorted(allowed),
-            "detail": (
-                "This server exposes a fixed allow-list of Odoo models. Ask an "
-                "administrator to add it to ODOO_ALLOWED_MODELS if it is needed."
-            ),
-        }
-    return None
-
-
-@mcp.tool(
-    description=(
-        "List the Odoo models this server is allowed to read, with a record count "
-        "for each. Call this first when you need Odoo data and are unsure what is "
-        "available — querying a model outside the list is refused."
-    ),
-    annotations=READ_ONLY,
-)
-def odoo_list_models() -> Dict[str, Any]:
-    cfg, uid, models = _odoo()
-    allowed = _allowed_models()
-
-    if not allowed:
-        # Unrestricted: report what Odoo itself exposes, so the caller sees the
-        # real surface rather than a curated one.
-        installed = models.execute_kw(
-            cfg.db, uid, cfg.auth, "ir.model", "search_read",
-            [[["transient", "=", False]]], {"fields": ["model", "name"], "order": "model"},
-        )
-        return {
-            "restriction": "none — every model the Odoo credential can read",
-            "note": (
-                "Odoo's own access rules still apply; some models will refuse on query. "
-                "Call odoo_model_fields before odoo_search_read to get real field names."
-            ),
-            "model_count": len(installed),
-            "models": [{"model": m["model"], "name": m["name"]} for m in installed],
-            "max_rows_per_query": MAX_ODOO_ROWS,
-        }
-
-    out = []
-    for model in sorted(allowed):
-        try:
-            count = models.execute_kw(cfg.db, uid, cfg.auth, model, "search_count", [[]])
-            out.append({"model": model, "records": count})
-        except Exception as exc:
-            out.append({"model": model, "error": str(exc)[:120]})
-    return {
-        "restriction": "ODOO_ALLOWED_MODELS is set",
-        "allowed_models": out,
-        "max_rows_per_query": MAX_ODOO_ROWS,
-    }
-
-
-@mcp.tool(
-    description=(
-        "Describe the fields of an allowed Odoo model — name, type, label and "
-        "relation. Use this before odoo_search_read so you request real field names "
-        "rather than guessing, and to discover the x_studio_* custom fields."
-    ),
-    annotations=READ_ONLY,
-)
-def odoo_model_fields(model: str) -> Dict[str, Any]:
-    blocked = _check_model(model)
-    if blocked:
-        return blocked
-    cfg, uid, models = _odoo()
-    meta = models.execute_kw(
-        cfg.db, uid, cfg.auth, model, "fields_get", [],
-        {"attributes": ["string", "type", "relation", "required"]},
-    )
-    fields = [
-        {
-            "name": name,
-            "label": info.get("string"),
-            "type": info.get("type"),
-            "relation": info.get("relation"),
-            "required": info.get("required", False),
-        }
-        for name, info in sorted(meta.items())
-    ]
-    return {"model": model, "field_count": len(fields), "fields": fields}
-
-
-@mcp.tool(
-    description=(
-        "Read records from an allowed Odoo model. `domain` is an Odoo search domain "
-        "as a list of [field, operator, value] triples, e.g. "
-        "[[\"stage_id.name\", \"=\", \"Installed\"]] — omit it to match everything. "
-        "`fields` is required: name the columns you need, since models have hundreds. "
-        "Read-only; there is no way to create, update or delete through this server."
-    ),
-    annotations=READ_ONLY,
-)
-def odoo_search_read(
-    model: str,
-    fields: List[str],
-    domain: Optional[List] = None,
-    limit: int = 50,
-    offset: int = 0,
-    order: Optional[str] = None,
-) -> Dict[str, Any]:
-    blocked = _check_model(model)
-    if blocked:
-        return blocked
-    if not fields:
-        return {"error": "fields_required", "detail": "Name the fields you need; call odoo_model_fields to discover them."}
-
-    capped = max(1, min(int(limit), MAX_ODOO_ROWS))
-    cfg, uid, models = _odoo()
-    opts: Dict[str, Any] = {"fields": list(fields), "limit": capped, "offset": max(0, int(offset))}
-    if order:
-        opts["order"] = order
-
-    try:
-        rows = models.execute_kw(cfg.db, uid, cfg.auth, model, "search_read", [domain or []], opts)
-        total = models.execute_kw(cfg.db, uid, cfg.auth, model, "search_count", [domain or []])
-    except Exception as exc:
-        return {"error": "odoo_query_failed", "model": model, "detail": str(exc)[:300]}
-
-    return {
-        "model": model,
-        "matched": total,
-        "returned": len(rows),
-        "limit_applied": capped,
-        "truncated": total > (opts["offset"] + len(rows)),
-        "records": rows,
-    }
-
-
 @mcp.tool(
     description=(
         "Search the Solis Cloud fleet by station name, owner email, station id or "
@@ -398,6 +328,420 @@ async def solis_fleet_health() -> Dict[str, Any]:
         "not_onboarded_count": sum(1 for r in unhealthy if not r["onboarded_in_supabase"]),
         "unhealthy": unhealthy,
     }
+
+
+# --------------------------------------------------------------------------
+# Single-plant Solis reads. Each is one signed call through api/solis_client.py
+# (rate-gated, retried) and never touches the fleet roster, so they answer in
+# a second or two. Output keeps Solis's own field names, plus the *Str unit
+# fields where Solis sends them, so nothing is silently re-interpreted; the
+# only transformations are epoch-ms -> Manila time and a state label.
+# --------------------------------------------------------------------------
+
+# Inverters and data loggers share the station numbering (1 online, 2 offline,
+# 3 alarm) but "normal" reads oddly for a device, hence the second label set.
+DEVICE_STATE = {1: "online", 2: "offline", 3: "alarm"}
+
+_STATION_DETAIL_KEYS = (
+    "id", "stationName", "sno", "userEmail", "state", "alarmState", "alarmLevel", "alarmMsg",
+    "capacity", "capacityStr", "power", "powerStr", "dayEnergy", "dayEnergyStr",
+    "monthEnergy", "monthEnergyStr", "yearEnergy", "yearEnergyStr", "allEnergy", "allEnergyStr",
+    "dayIncome", "allIncome", "money", "inverterCount", "inverterOnlineCount",
+    "batteryTotalChargeEnergy", "batteryTotalDischargeEnergy", "gridSwitch", "type",
+    "addr", "cityStr", "regionStr", "countryStr", "timeZone", "installer", "installerEmail",
+    "dataTimestamp", "createDate", "updateDate", "fisPowerTime", "fisGenerateTime",
+)
+_STATION_TIME_KEYS = ("dataTimestamp", "createDate", "updateDate", "fisPowerTime", "fisGenerateTime")
+
+_INVERTER_LIST_KEYS = (
+    "id", "sn", "name", "productModel", "state", "currentState", "pac", "pacStr",
+    "etoday", "etodayStr", "etotal", "etotalStr", "inverterTemperature", "collectorSn",
+    "collectorName", "version", "dataTimestamp", "fisGenerateTime",
+)
+_DEVICE_TIME_KEYS = ("dataTimestamp", "fisGenerateTime", "createDate", "updateDate")
+_INVERTER_DETAIL_KEYS = _INVERTER_LIST_KEYS + (
+    "stationId", "stationName", "eToday", "eTotal", "eMonth", "eYear",
+    "uPv1", "iPv1", "pow1", "uPv2", "iPv2", "pow2", "uPv3", "iPv3", "pow3", "uPv4", "iPv4", "pow4",
+    "uAc1", "iAc1", "uAc2", "iAc2", "uAc3", "iAc3", "fac", "facStr",
+    "psum", "psumStr", "familyLoadPower", "familyLoadPowerStr", "bypassLoadPower",
+    "gridPurchasedTodayEnergy", "gridSellTodayEnergy", "homeLoadTodayEnergy",
+    "batteryPower", "batteryPowerStr", "batteryCapacitySoc", "batteryVoltage", "batteryCurrent",
+    "batteryTodayChargeEnergy", "batteryTodayDischargeEnergy", "batteryType", "batteryHealthSoh",
+    "warningInfoData", "model", "timeZone",
+)
+_ALARM_KEYS = (
+    "id", "alarmCode", "alarmMsg", "alarmLevel", "state", "alarmBeginTime", "alarmEndTime",
+    "alarmDeviceSn", "inverterSn", "deviceType", "stationName", "advice",
+)
+_ALARM_TIME_KEYS = ("alarmBeginTime", "alarmEndTime")
+_COLLECTOR_KEYS = (
+    "id", "sn", "name", "model", "state", "version", "rssiLevel", "signal", "inverterCount",
+    "stationName", "dataTimestamp", "createDate", "updateDate",
+)
+# stationMonth days and stationYear months: Solis names kept; dateStr is
+# "YYYY-MM-DD" for days and "YYYY-MM" for months (the epoch `date` is dropped).
+_ENERGY_ROW_KEYS = (
+    "dateStr", "energy", "energyStr", "gridPurchasedEnergy", "gridSellEnergy",
+    "homeGridEnergy", "backUpEnergy", "backup2Energy", "homeLoadEnergy", "consumeEnergy",
+    "batteryChargeEnergy", "batteryDischargeEnergy", "fullHour", "money",
+)
+# stationDay / inverterDay: five-minute samples. Every power here is in WATTS
+# even though Solis's powerStr/pacStr on these points says "kW": verified
+# 2026-10-06 on a 5.04 kWp plant (curve peak 3268 with dayEnergy 7.3 kWh; the
+# same inverter's detail reports familyLoadPower 0.806 kW where the curve says
+# 806). api/app_routes.py divides by 1000 for the same reason. The misleading
+# unit strings are deliberately not passed through.
+_CURVE_KEYS = (
+    "timeStr", "power", "pac", "familyLoadPower", "bypassLoadPower",
+    "consumePower", "gridPurchasedPower", "gridSellPower", "psum",
+    "batteryPower", "batteryCapacitySoc", "energy",
+)
+_CURVE_UNIT_NOTE = (
+    "power, pac, familyLoadPower, bypassLoadPower and psum are in watts (Solis labels "
+    "these samples 'kW' but sends W); psum positive = exporting, negative = importing."
+)
+
+
+def _label_state(record: Dict[str, Any], labels: Dict[int, str]) -> None:
+    if "state" in record:
+        record["state_label"] = labels.get(int(_to_float(record.get("state"))), "unknown")
+
+
+def _point_power_w(point: Dict[str, Any]) -> float:
+    """Watts of a curve sample: stations report `power`, inverters `pac`."""
+    if point.get("power") not in (None, "", "--"):
+        return _to_float(point.get("power"))
+    return _to_float(point.get("pac"))
+
+
+def _summarise_curve(points: List[Dict[str, Any]], max_points: int) -> Dict[str, Any]:
+    """Span, peak, battery at the last sample and an evenly thinned sample.
+
+    estimated_production_kwh integrates watts over five-minute steps the way
+    the mobile API does for its Today card (api/app_routes.py); Solis's own
+    daily figure (solis_station_month) is the authoritative total and can
+    differ by a few percent.
+    """
+    if not points:
+        return {"point_count": 0, "points": []}
+    stamped = sorted(
+        ((_to_float(p.get("time") or p.get("dataTimestamp")), p) for p in points),
+        key=lambda t: t[0],
+    )
+    values = [_point_power_w(p) for _, p in stamped]
+    peak_i = max(range(len(values)), key=values.__getitem__)
+    estimate = round(sum(values) * (5 / 60) / 1000, 3)
+
+    sample: List[Dict[str, Any]] = []
+    if max_points > 0:
+        step = max(1, len(stamped) // max_points)
+        for i, (ts, p) in enumerate(stamped):
+            if i % step == 0 or i == len(stamped) - 1:
+                row = {"time_pht": _pht_iso(ts)}
+                row.update(_pick(p, _CURVE_KEYS))
+                sample.append(row)
+
+    latest = stamped[-1][1]
+    return {
+        "point_count": len(stamped),
+        "first_point": _pht_iso(stamped[0][0]),
+        "last_point": _pht_iso(stamped[-1][0]),
+        "peak_power_w": values[peak_i],
+        "peak_at": _pht_iso(stamped[peak_i][0]),
+        "estimated_production_kwh": estimate,
+        "latest_battery_soc": latest.get("batteryCapacitySoc"),
+        "latest_battery_power_w": latest.get("batteryPower"),
+        "units": _CURVE_UNIT_NOTE,
+        "points_returned": len(sample),
+        "points": sample,
+    }
+
+
+def _valid_date(text: Optional[str], fmt: str, label: str) -> tuple:
+    """(normalised value, error dict or None)."""
+    value = (text or "").strip()
+    try:
+        datetime.strptime(value, fmt)
+    except ValueError:
+        return value, {"error": f"{label} must be {fmt.replace('%Y', 'YYYY').replace('%m', 'MM').replace('%d', 'DD')}, got {text!r}"}
+    return value, None
+
+
+@mcp.tool(
+    description=(
+        "Everything Solis knows about one plant: state (normal / offline / alarm), "
+        "current power, today / month / year / lifetime energy with their units, "
+        "inverter counts, address, installer, first-generation date and the last "
+        "time data arrived (Manila time). station_id is the Solis station id; find "
+        "it with solis_search_stations. include_raw=true returns every field Solis sends."
+    ),
+    annotations=READ_ONLY,
+)
+async def solis_station_detail(station_id: str, include_raw: bool = False) -> Dict[str, Any]:
+    station_id = station_id.strip()
+    if not station_id:
+        return {"error": "station_id must not be empty"}
+    try:
+        data = await build_solis().station_detail(station_id)
+    except Exception as exc:
+        return _solis_error(exc, station_id=station_id)
+    if not data:
+        return {"station_id": station_id, "error": "empty_response", "note": _SOLIS_CODE_1_NOTE}
+    out = _pick(data, _STATION_DETAIL_KEYS, _STATION_TIME_KEYS)
+    _label_state(out, SOLIS_STATE)
+    out["station_id"] = station_id
+    out["onboarded_in_supabase"] = station_id in get_existing_station_ids(build_supabase())
+    out["field_count"] = len(data)
+    if include_raw:
+        out["raw"] = data
+    return out
+
+
+@mcp.tool(
+    description=(
+        "One plant's five-minute curve for a date (YYYY-MM-DD, Manila; default today): "
+        "first and last sample, peak power and when, battery SOC at the last sample, "
+        "an estimated production integrated from the curve, and up to max_points "
+        "evenly spaced samples with power, household load, grid power (psum: positive "
+        "= exporting, negative = importing) and battery. Use it to see whether a plant "
+        "produced today and when it stopped. max_points=0 returns the summary only."
+    ),
+    annotations=READ_ONLY,
+)
+async def solis_station_day(
+    station_id: str, date: Optional[str] = None, max_points: int = 48
+) -> Dict[str, Any]:
+    station_id = station_id.strip()
+    day, bad = _valid_date(date or datetime.now(PHT).strftime("%Y-%m-%d"), "%Y-%m-%d", "date")
+    if bad:
+        return bad
+    try:
+        data = await build_solis().station_day(station_id, day)
+    except Exception as exc:
+        return _solis_error(exc, station_id=station_id, date=day)
+    points = _records(data)
+    out: Dict[str, Any] = {"station_id": station_id, "date": day}
+    out.update(_summarise_curve(points, max_points))
+    if not points:
+        out["note"] = (
+            "No samples: the plant sent nothing that day (inverter dark or logger "
+            "offline), or the id is unknown. Check solis_search_stations."
+        )
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Per-day energy for one plant and month (YYYY-MM): production (energy), grid "
+        "import (gridPurchasedEnergy), grid export (gridSellEnergy), the load split "
+        "(homeGridEnergy / backUpEnergy / homeLoadEnergy), battery charge and "
+        "discharge, full-load hours and Solis's income figure, plus month totals. "
+        "consumption_kwh per day is computed with the same rule the nightly sync "
+        "uses. These are Solis's authoritative daily totals; the curve from "
+        "solis_station_day is an estimate."
+    ),
+    annotations=READ_ONLY,
+)
+async def solis_station_month(station_id: str, month: str) -> Dict[str, Any]:
+    station_id = station_id.strip()
+    month, bad = _valid_date(month, "%Y-%m", "month")
+    if bad:
+        return bad
+    try:
+        data = await build_solis().station_month(station_id, month)
+    except Exception as exc:
+        return _solis_error(exc, station_id=station_id, month=month)
+    rows: List[Dict[str, Any]] = []
+    for day in _records(data):
+        row = _pick(day, _ENERGY_ROW_KEYS)
+        row["consumption_kwh"] = round(_daily_consumption_kwh(day), 4)
+        rows.append(row)
+    rows.sort(key=lambda r: str(r.get("dateStr") or r.get("date") or ""))
+    out: Dict[str, Any] = {
+        "station_id": station_id,
+        "month": month,
+        "days": len(rows),
+        "total_production_kwh": round(sum(_to_float(r.get("energy")) for r in rows), 3),
+        "total_consumption_kwh": round(sum(r["consumption_kwh"] for r in rows), 3),
+        "total_grid_import_kwh": round(sum(_to_float(r.get("gridPurchasedEnergy")) for r in rows), 3),
+        "total_grid_export_kwh": round(sum(_to_float(r.get("gridSellEnergy")) for r in rows), 3),
+        "rows": rows,
+    }
+    if not rows:
+        out["note"] = "No days returned: no data that month, or an unknown id (check solis_search_stations)."
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Per-month energy for one plant and year (YYYY): production, grid import and "
+        "export, battery and income per month, with year totals. For a day-by-day "
+        "view use solis_station_month."
+    ),
+    annotations=READ_ONLY,
+)
+async def solis_station_year(station_id: str, year: str) -> Dict[str, Any]:
+    station_id = station_id.strip()
+    year, bad = _valid_date(year, "%Y", "year")
+    if bad:
+        return bad
+    try:
+        data = await build_solis().station_year(station_id, year)
+    except Exception as exc:
+        return _solis_error(exc, station_id=station_id, year=year)
+    rows = [_pick(m, _ENERGY_ROW_KEYS) for m in _records(data)]
+    rows.sort(key=lambda r: str(r.get("dateStr") or r.get("date") or ""))
+    out: Dict[str, Any] = {
+        "station_id": station_id,
+        "year": year,
+        "months": len(rows),
+        "total_production_kwh": round(sum(_to_float(r.get("energy")) for r in rows), 3),
+        "total_grid_import_kwh": round(sum(_to_float(r.get("gridPurchasedEnergy")) for r in rows), 3),
+        "total_grid_export_kwh": round(sum(_to_float(r.get("gridSellEnergy")) for r in rows), 3),
+        "rows": rows,
+    }
+    if not rows:
+        out["note"] = "No months returned: no data that year, or an unknown id (check solis_search_stations)."
+    return out
+
+
+@mcp.tool(
+    description=(
+        "The inverters of one plant: Solis inverter id (what solis_inverter_detail and "
+        "solis_inverter_day take), serial, model, state, current AC power, today's and "
+        "lifetime energy, temperature, firmware, the data logger it reports through "
+        "and its last data time."
+    ),
+    annotations=READ_ONLY,
+)
+async def solis_inverters(station_id: str) -> Dict[str, Any]:
+    station_id = station_id.strip()
+    try:
+        data = await build_solis().list_inverters(station_id, page_no=1, page_size=100)
+    except Exception as exc:
+        return _solis_error(exc, station_id=station_id)
+    rows: List[Dict[str, Any]] = []
+    for rec in _records(data):
+        row = _pick(rec, _INVERTER_LIST_KEYS, _DEVICE_TIME_KEYS)
+        _label_state(row, DEVICE_STATE)
+        rows.append(row)
+    out: Dict[str, Any] = {"station_id": station_id, "inverter_count": len(rows), "inverters": rows}
+    if not rows:
+        out["note"] = "No inverters returned: the plant has none registered, or the id is unknown (check solis_search_stations)."
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Live readings of one inverter by Solis inverter id (from solis_inverters): "
+        "state, AC power and frequency, per-string DC voltage / current / power "
+        "(uPv1, iPv1, pow1 ...), grid power (psum: positive = exporting), household "
+        "load, battery SOC / power / voltage / health, today's grid, load and battery "
+        "energies, temperature and firmware. include_raw=true returns every field "
+        "(typically 200+)."
+    ),
+    annotations=READ_ONLY,
+)
+async def solis_inverter_detail(inverter_id: str, include_raw: bool = False) -> Dict[str, Any]:
+    inverter_id = inverter_id.strip()
+    if not inverter_id:
+        return {"error": "inverter_id must not be empty"}
+    try:
+        data = await build_solis().inverter_detail(inverter_id)
+    except Exception as exc:
+        return _solis_error(exc, inverter_id=inverter_id)
+    if not data:
+        return {"inverter_id": inverter_id, "error": "empty_response", "note": _SOLIS_CODE_1_NOTE}
+    out = _pick(data, _INVERTER_DETAIL_KEYS, _DEVICE_TIME_KEYS)
+    _label_state(out, DEVICE_STATE)
+    out["inverter_id"] = inverter_id
+    out["field_count"] = len(data)
+    if include_raw:
+        out["raw"] = data
+    return out
+
+
+@mcp.tool(
+    description=(
+        "One inverter's five-minute curve for a date (YYYY-MM-DD, Manila; default "
+        "today), with the same summary and sampling as solis_station_day. Use it on "
+        "multi-inverter plants to see which unit stopped."
+    ),
+    annotations=READ_ONLY,
+)
+async def solis_inverter_day(
+    inverter_id: str, date: Optional[str] = None, max_points: int = 48
+) -> Dict[str, Any]:
+    inverter_id = inverter_id.strip()
+    day, bad = _valid_date(date or datetime.now(PHT).strftime("%Y-%m-%d"), "%Y-%m-%d", "date")
+    if bad:
+        return bad
+    try:
+        data = await build_solis().inverter_day(inverter_id, day)
+    except Exception as exc:
+        return _solis_error(exc, inverter_id=inverter_id, date=day)
+    points = _records(data)
+    out: Dict[str, Any] = {"inverter_id": inverter_id, "date": day}
+    out.update(_summarise_curve(points, max_points))
+    if not points:
+        out["note"] = "No samples: the inverter sent nothing that day, or the id is unknown (check solis_inverters)."
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Alarm history of one plant: code, message, level, whether it is still active "
+        "(state), begin and end time in Manila time, the device serial and Solis's "
+        "advice. begin and end are 'YYYY-MM-DD HH:MM:SS' (Manila); omit both for "
+        "Solis's default recent window. Returns up to limit (max 100) in Solis's order."
+    ),
+    annotations=READ_ONLY,
+)
+async def solis_alarms(
+    station_id: str, begin: Optional[str] = None, end: Optional[str] = None, limit: int = 50
+) -> Dict[str, Any]:
+    station_id = station_id.strip()
+    size = max(1, min(int(limit), 100))
+    try:
+        data = await build_solis().alarm_list(
+            station_id, page_no=1, page_size=size, begin_time=begin or None, end_time=end or None
+        )
+    except Exception as exc:
+        return _solis_error(exc, station_id=station_id, begin=begin, end=end)
+    rows = [_pick(rec, _ALARM_KEYS, _ALARM_TIME_KEYS) for rec in _records(data)]
+    total = (data.get("page") or {}).get("total") if isinstance(data, dict) else None
+    return {
+        "station_id": station_id,
+        "window": {"begin": begin, "end": end},
+        "returned": len(rows),
+        "total_in_window": total,
+        "alarms": rows,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Data loggers (the Wi-Fi / LAN sticks) of one plant: serial, model, firmware, "
+        "state, signal and last data time. When a plant is offline in Solis but the "
+        "inverter itself has power, the logger listed here is usually the culprit."
+    ),
+    annotations=READ_ONLY,
+)
+async def solis_collectors(station_id: str) -> Dict[str, Any]:
+    station_id = station_id.strip()
+    try:
+        data = await build_solis().list_collectors(station_id, page_no=1, page_size=100)
+    except Exception as exc:
+        return _solis_error(exc, station_id=station_id)
+    rows: List[Dict[str, Any]] = []
+    for rec in _records(data):
+        row = _pick(rec, _COLLECTOR_KEYS, _DEVICE_TIME_KEYS)
+        _label_state(row, DEVICE_STATE)
+        rows.append(row)
+    out: Dict[str, Any] = {"station_id": station_id, "collector_count": len(rows), "collectors": rows}
+    if not rows:
+        out["note"] = "No data loggers returned: none registered, or the id is unknown (check solis_search_stations)."
+    return out
 
 
 @mcp.tool(
