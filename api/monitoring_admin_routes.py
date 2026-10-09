@@ -264,7 +264,11 @@ async def health(authorization: str = Header(None)):
 # row: the lateral version took 7.2 s for 627 rows; this takes well under 1 s.
 ROWS_SQL = """
 with daily as (
-  select system_id, max("timestamp") as last_daily, count(*) as daily_rows
+  select system_id, max("timestamp") as last_daily, count(*) as daily_rows,
+         -- last day WITH production: the grid's "Dark" chip and the Unresolved
+         -- tab's dark list both judge on this, not on the newest row (which is
+         -- a 0 kWh placeholder for an offline plant — see DARK_SQL)
+         max("timestamp") filter (where coalesce(production_kwh, 0) > 0) as last_production
     from public.energy_readings group by system_id),
 fm as (
   select system_id, max("timestamp") as last_5m
@@ -286,7 +290,7 @@ select s.id as system_id, s.user_id, s.system_name, s.capacity_kwp, s.installati
        p.full_name, p.phone, p.address as profile_address,
        p.odoo_partner_id, p.odoo_email, p.odoo_customer_name,
        u.email as login_email, u.last_sign_in_at, u.banned_until,
-       r.last_daily, r.daily_rows, f.last_5m,
+       r.last_daily, r.last_production, r.daily_rows, f.last_5m,
        j.id as active_job_id, j.status as active_job_status, j.granularity as active_job_granularity
   from public.solar_systems s
   left join public.user_profiles p on p.id = s.user_id
@@ -1428,17 +1432,31 @@ async def unresolved(authorization: str = Header(None)):
     })
 
 
-# Active stations with no daily row for 3+ days (or none ever). Carries the
-# customer's Odoo partner id and emails so the helpdesk lookup below can match.
+# Active stations with no day of production for 3+ days (or none ever).
+# "Dark" is judged on production, not on the presence of a row: the nightly
+# sync writes a 0 kWh row for any station Solis still answers for, so an
+# offline plant can collect zero rows for months and never look dark (five
+# such on 2026-10-09, offline 77–307 days in Solis), and a listed plant's
+# "last row" could be a zero placeholder weeks after its real last data.
+# Yesterday's row is a provisional 0 until the 02:00 Manila sync, so 1–2 days
+# without production is normal; 3+ is the alarm. `last_daily` is therefore the
+# last day WITH production (the UI labels it so); `last_row` is the newest row
+# of any kind, for context. Carries the customer's Odoo partner id and emails
+# so the helpdesk lookup below can match. One grouped scan, not a lateral per
+# row (same reasoning as ROWS_SQL).
 DARK_SQL = """
+    with daily as (
+      select system_id,
+             max("timestamp") filter (where coalesce(production_kwh, 0) > 0) as last_daily,
+             max("timestamp") as last_row
+        from public.energy_readings group by system_id)
     select s.id as system_id, s.user_id, s.system_name, s.solis_station_id, p.full_name, s.status,
            p.odoo_partner_id, p.odoo_email, u.email as login_email,
-           r.last_daily, (current_date - r.last_daily::date) as days_dark
+           r.last_daily, r.last_row, (current_date - r.last_daily::date) as days_dark
       from public.solar_systems s
       left join public.user_profiles p on p.id = s.user_id
       left join auth.users u on u.id = s.user_id
-      left join lateral (select max("timestamp") as last_daily
-                           from public.energy_readings r where r.system_id = s.id) r on true
+      left join daily r on r.system_id = s.id
      where s.status = 'active' and s.solis_station_id is not null
        and (r.last_daily is null or r.last_daily < now() - interval '3 days')
      order by r.last_daily nulls first"""

@@ -147,12 +147,21 @@ def get_profile_station_ids(sb: Client) -> Dict[str, str]:
 
 
 def get_existing_station_ids(sb: Client) -> Set[str]:
+    """Every Solis station id our database already holds, from solar_systems.
+
+    Read from solar_systems, not user_profiles: a profile carries only the
+    customer's PRIMARY station, so reading profiles made every non-primary
+    station look unmapped each night and reported it as skipped_would_repoint
+    (or duplicate_email) forever — on 2026-10-09, 12 of the 17 "second-station
+    candidates" on the Unresolved tab were plants attached weeks earlier.
+    Any status counts (a decommissioned station must not be re-onboarded).
+    """
     existing: Set[str] = set()
     page_size = 1000
     offset = 0
     while True:
         page = (
-            sb.table("user_profiles")
+            sb.table("solar_systems")
             .select("solis_station_id")
             .not_.is_("solis_station_id", "null")
             .range(offset, offset + page_size - 1)

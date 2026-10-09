@@ -306,7 +306,9 @@ const COLS = [
   {key:'solis_station_id', label:'Solis station', render:r => r.solis_station_id ? `<span class="mono">${r.solis_station_id}</span>${vTag(r)}` : '<span class="tag bad">none</span>'},
   {key:'solis_plant_name', label:'Plant (Solis)', render:r => esc(r.solis_plant_name||r.system_name||'—')},
   {key:'capacity_kwp', label:'kWp', render:r => r.capacity_kwp ?? '—'},
-  {key:'last_daily', label:'Last daily', render:r => { const d = daysSince(r.last_daily); return d===null ? '<span class="tag bad">never</span>' : `${fmtDate(r.last_daily)}${d>3?` <span class="tag ${d>30?'bad':'warn'}">${d}d</span>`:''}`; }},
+  // The date is the newest daily row; the tag counts days since the last day
+  // WITH production, because an offline plant still gets a 0 kWh row nightly.
+  {key:'last_daily', label:'Last daily', render:r => { if (!r.last_daily) return '<span class="tag bad">never</span>'; const d = daysSince(r.last_production); const tag = d===null ? ' <span class="tag bad" title="No day with production above zero">no production</span>' : d>3 ? ` <span class="tag ${d>30?'bad':'warn'}" title="Days since the last day with production above zero">${d}d dark</span>` : ''; return `${fmtDate(r.last_daily)}${tag}`; }},
   {key:'last_5m', label:'Last 5-min', render:r => r.last_5m ? fmtTs(r.last_5m).slice(11,16) : '—'},
   {key:'status', label:'Status', render:r => `<span class="tag ${r.status==='active'?'ok':''}">${esc(r.status)}</span>${r.active_job_status?` <span class="tag warn">backfill ${esc(r.active_job_status)}</span>`:''}`},
 ];
@@ -328,7 +330,7 @@ function applyFilter(rows){
   const q = $('#q').value.trim().toLowerCase();
   return rows.filter(r => {
     if (FILTER==='nostation' && r.solis_station_id) return false;
-    if (FILTER==='dark' && !(daysSince(r.last_daily)===null || daysSince(r.last_daily)>3)) return false;
+    if (FILTER==='dark' && !(daysSince(r.last_production)===null || daysSince(r.last_production)>3)) return false;
     if (FILTER==='mismatch' && !mismatch(r)) return false;
     if (FILTER==='multi' && !(r._multi>1)) return false;
     if (FILTER==='backfill' && !r.active_job_status) return false;
@@ -935,10 +937,10 @@ async function loadUnresolved(){
         ${u.systems_without_station.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td>${s.capacity_kwp??''}</td><td>${fmtDate(s.last_daily)}</td></tr>`).join('') || '<tr><td colspan=4 class="muted">none</td></tr>'}
         </tbody></table></div>
 
-      <div class="card sect"><h3 style="margin-top:0">Active stations dark for more than 3 days</h3>
-        <p class="hint"><b>Helpdesk</b> shows the customer's Odoo tickets (any team), open ones first, matched on the Odoo partner id with the login email as fallback — so you can see whether someone is already on it before opening a new one. Tickets are created and worked in Odoo; this is a read-only view.</p>
-        <table><thead><tr><th>Customer</th><th>System</th><th>Station</th><th>Last daily</th><th>Days dark</th><th>Helpdesk (Odoo)</th></tr></thead><tbody>
-        ${u.dark_systems.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td class="mono">${esc(s.solis_station_id)}</td><td>${fmtDate(s.last_daily)}</td><td>${s.days_dark??'∞'}</td><td class="wrap" data-helpdesk="${s.system_id}"><span class="muted">checking Odoo…</span></td></tr>`).join('') || '<tr><td colspan=6 class="muted">none</td></tr>'}
+      <div class="card sect"><h3 style="margin-top:0">Active stations dark for more than 3 days <span class="muted">— no day with production above zero in the last 3 days</span></h3>
+        <p class="hint">A 0 kWh day counts as dark: the nightly sync still writes a zero row for a plant that is offline in Solis, so the newest row is not proof of life. Yesterday's row is a placeholder until the 02:00 sync, so 1–2 days is normal. <b>Helpdesk</b> shows the customer's Odoo tickets (any team), open ones first, matched on the Odoo partner id with the login email as fallback — so you can see whether someone is already on it before opening a new one. Tickets are created and worked in Odoo; this is a read-only view.</p>
+        <table><thead><tr><th>Customer</th><th>System</th><th>Station</th><th title="Newest daily row with production above zero">Last day with production</th><th>Days dark</th><th title="Newest daily row of any kind, including 0 kWh placeholders">Newest row</th><th>Helpdesk (Odoo)</th></tr></thead><tbody>
+        ${u.dark_systems.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td class="mono">${esc(s.solis_station_id)}</td><td>${fmtDate(s.last_daily)}</td><td>${s.days_dark??'∞'}</td><td class="muted">${fmtDate(s.last_row)}</td><td class="wrap" data-helpdesk="${s.system_id}"><span class="muted">checking Odoo…</span></td></tr>`).join('') || '<tr><td colspan=7 class="muted">none</td></tr>'}
         </tbody></table></div>`;
     // One delegated handler: a click anywhere on a row that has a record
     // behind it opens the panel (the Open column was dropped 2026-09-19 as
@@ -1154,7 +1156,7 @@ function loadGuide(){
     <p>Accounts are created automatically every night from Odoo leads that have a valid email and a station id. Unresolved → <i>Nightly onboarding failures</i> lists the leads that were rejected and why (usually two emails in one field, or a placeholder). Those are fixed in Odoo by sales; the account appears the night after.</p>
 
     <h3>6. Dark stations</h3>
-    <p>Unresolved → <i>Active stations dark &gt;3 days</i>. The <b>Helpdesk</b> column lists the customer's Odoo tickets (open first, any team) with a link into Odoo, so you know whether the outage is already being handled before you open another ticket. If the plant is really offline or decommissioned, set its <b>Status</b> in the panel (inactive / decommissioned) with a reason, so it stops counting as a data problem.</p>
+    <p>Unresolved → <i>Active stations dark &gt;3 days</i>. Dark means no day with production above zero in the last 3 days — a 0 kWh row does not count, because the nightly sync keeps writing zero rows for a plant that is offline in Solis. The <b>Helpdesk</b> column lists the customer's Odoo tickets (open first, any team) with a link into Odoo, so you know whether the outage is already being handled before you open another ticket. If the plant is really offline or decommissioned, set its <b>Status</b> in the panel (inactive / decommissioned) with a reason, so it stops counting as a data problem.</p>
 
     <h3>7. Several people must watch one station (SME staff, a family member)</h3>
     <p>Open the station → <b>Who can view this station</b> → <i>Give another login view access</i> → email, name, reason → Grant. If the email has no login yet, one is created and a temporary password is shown once — pass it on privately and have them change it. The viewer sees this station in the portal exactly as the owner does, read-only, without the owner's contact details. Revoke from the same list. Ownership does not move: the Odoo mapping, the syncs and the backfills still follow the owner. Never give the second person a second station row or a second Odoo lead — that is the duplicate pattern Retire cleans up.</p>
