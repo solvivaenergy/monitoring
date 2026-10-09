@@ -162,11 +162,17 @@ async def run_five_minutes(job: Dict[str, Any], sb, solis: SolisCloudClient, sem
     return (_upsert(sb, "energy_readings_five_minutes", rows) if rows else 0), notes
 
 
+# The five-minute slices an hour is the sum of (migration 20; battery energy
+# since migration 24). Must match rollup_hourly() in the database.
+HOUR_SUM_FIELDS = ("production_kwh", "consumption_kwh", "grid_import_kwh", "grid_export_kwh",
+                   "battery_charge_kwh", "battery_discharge_kwh")
+
+
 def _hourly_rows(system: Dict[str, Any], day_data: list) -> List[dict]:
     """Solis stationDay points → one energy_readings_hourly row per Manila hour.
-    Same arithmetic as the live roll-up (migration 20's rollup_hourly): sums of
-    the 5-minute slices, the biggest slice as peak kW, the last SoC, and
-    `points` so a thin hour is visibly thin."""
+    Same arithmetic as the live roll-up (migration 20's rollup_hourly, battery
+    energy since 24): sums of the 5-minute slices, the biggest slice as peak
+    kW, the last SoC, and `points` so a thin hour is visibly thin."""
     by_ts: Dict[int, dict] = {}
     for point in day_data:
         built = _build_row(str(system["user_id"]), str(system["id"]), point)
@@ -178,16 +184,17 @@ def _hourly_rows(system: Dict[str, Any], day_data: list) -> List[dict]:
         h = hours.setdefault(hour, {
             "user_id": row["user_id"], "system_id": row["system_id"], "hour_start": hour.isoformat(),
             "production_kwh": 0.0, "consumption_kwh": 0.0, "grid_import_kwh": 0.0, "grid_export_kwh": 0.0,
+            "battery_charge_kwh": 0.0, "battery_discharge_kwh": 0.0,
             "peak_power_kw": 0.0, "battery_level_end": None, "points": 0, "source": "backfill",
         })
-        for k in ("production_kwh", "consumption_kwh", "grid_import_kwh", "grid_export_kwh"):
+        for k in HOUR_SUM_FIELDS:
             h[k] += float(row[k] or 0)
         h["peak_power_kw"] = max(h["peak_power_kw"], float(row["production_kwh"] or 0) * 12)
         if row.get("battery_level") is not None:
             h["battery_level_end"] = row["battery_level"]
         h["points"] = min(12, h["points"] + 1)
     for h in hours.values():
-        for k in ("production_kwh", "consumption_kwh", "grid_import_kwh", "grid_export_kwh", "peak_power_kw"):
+        for k in HOUR_SUM_FIELDS + ("peak_power_kw",):
             h[k] = round(h[k], 3)
     return list(hours.values())
 

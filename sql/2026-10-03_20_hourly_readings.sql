@@ -79,6 +79,9 @@ end $$;
 -- The roll-up. Hour boundaries are taken in Asia/Manila explicitly, so the
 -- result does not depend on the session's TimeZone setting (Manila is a
 -- whole-hour offset, so the boundaries coincide with UTC hours anyway).
+-- SUPERSEDED by file 24 (2026-10-09), which adds battery_charge_kwh /
+-- battery_discharge_kwh to the sums: re-running THIS definition would drop
+-- battery energy from every hour it rolls up. Apply 24 after 20.
 create or replace function public.rollup_hourly(p_from timestamptz, p_to timestamptz)
 returns integer
 language plpgsql

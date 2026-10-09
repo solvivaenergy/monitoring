@@ -211,6 +211,14 @@ def _build_row(
     if consumption_w <= 0:
         consumption_w = family_load_w
     grid_w = _to_float(point.get("psum"))
+    # Battery power in watts, signed: POSITIVE = charging, NEGATIVE =
+    # discharging (verified 2026-10-09 on three plants: SoC rises while it is
+    # positive at noon and falls while it is negative at night). Until
+    # migration 24 only the sign survived, as battery_status, so the portal's
+    # "Battery" share of today's consumption was always 0 while past days —
+    # the daily table, Solis's own day totals — showed one. batteryPowerFu /
+    # batteryPowerZheng are this same number split by sign, not extra data.
+    battery_w = _to_float(point.get("batteryPower"))
     battery_level_raw = point.get("batteryCapacitySoc")
     battery_level = (
         round(_to_float(battery_level_raw), 1)
@@ -228,6 +236,8 @@ def _build_row(
         "battery_status": _battery_status(point),
         "grid_import_kwh": round(abs(min(grid_w, 0.0)) * (5 / 60) / 1000, 6),
         "grid_export_kwh": round(max(grid_w, 0.0) * (5 / 60) / 1000, 6),
+        "battery_charge_kwh": round(max(battery_w, 0.0) * (5 / 60) / 1000, 6),
+        "battery_discharge_kwh": round(max(-battery_w, 0.0) * (5 / 60) / 1000, 6),
         "daily_earning": 0,
     }
     if lifetime_earning is not None:
@@ -499,6 +509,25 @@ def _has_lifetime_earning_column(sb: Client) -> bool:
         return False
 
 
+BATTERY_ENERGY_KEYS = ("battery_charge_kwh", "battery_discharge_kwh")
+
+
+def _has_battery_energy_columns(sb: Client) -> bool:
+    """Migration 24's columns. Every row of an upsert batch carries the same
+    keys, so if this code ran against a table without them EVERY batch would
+    fail with a PostgREST 400 and the feed would stop — the Render image can
+    land 30–40 minutes after a push, and a rollback of the migration must not
+    take the feed down either. Checked once per run, like lifetime_earning."""
+    try:
+        _execute_with_retry(
+            "check battery energy columns",
+            lambda: sb.table("energy_readings_five_minutes").select("id, " + ", ".join(BATTERY_ENERGY_KEYS)).limit(1),
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def _ensure_active_system(
     sb: Client,
     solis: SolisCloudClient,
@@ -651,6 +680,12 @@ async def sync_once(
             "energy_readings_five_minutes has no lifetime_earning column yet; "
             "5-minute sync will skip writing lifetime earnings until the column is added."
         )
+    has_battery_energy = _has_battery_energy_columns(sb)
+    if not has_battery_energy:
+        log.warning(
+            "energy_readings_five_minutes has no battery_charge_kwh/battery_discharge_kwh columns "
+            "(migration 24 not applied?); 5-minute sync will write rows without battery energy."
+        )
 
     # Every station already carries its system_id, so there is nothing to
     # resolve and nothing to create. _ensure_active_system used to INSERT a
@@ -725,6 +760,9 @@ async def sync_once(
             )
             if built is not None:
                 ts_key, row = built
+                if not has_battery_energy:
+                    for k in BATTERY_ENERGY_KEYS:
+                        row.pop(k, None)
                 # Solis can occasionally repeat a timestamp; keep the latest copy.
                 parsed_by_ts[ts_key] = row
 

@@ -158,7 +158,11 @@ async def _authenticate(authorization: str = Header(...)) -> dict:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
-HOURLY_FIELDS = ("production_kwh", "consumption_kwh", "grid_import_kwh", "grid_export_kwh")
+# The energies an hour is the sum of. Battery energy since migration 24: the
+# portal's "Battery" share of consumption for today and the 1D view was always
+# 0 before, because only the daily table carried it.
+HOURLY_FIELDS = ("production_kwh", "consumption_kwh", "grid_import_kwh", "grid_export_kwh",
+                 "battery_charge_kwh", "battery_discharge_kwh")
 
 
 def _touch_activity(station_id: str) -> None:
@@ -181,7 +185,7 @@ def _touch_activity_later(station_id: str) -> None:
 
 def _empty_hour(day_start: datetime, hour: int) -> dict:
     return {"hour": hour, "hour_start": (day_start + timedelta(hours=hour)).isoformat(),
-            "production_kwh": None, "consumption_kwh": None, "grid_import_kwh": None, "grid_export_kwh": None,
+            **{k: None for k in HOURLY_FIELDS},
             "peak_power_kw": None, "battery_level_end": None, "points": 0, "partial": False}
 
 
@@ -220,7 +224,7 @@ async def get_hourly(day: Optional[str] = Query(None, alias="date", pattern=r"^\
 
     if the_day == today:
         rows = (sb.table("energy_readings_five_minutes")
-                .select("timestamp,production_kwh,consumption_kwh,grid_import_kwh,grid_export_kwh,battery_level")
+                .select("timestamp," + ",".join(HOURLY_FIELDS) + ",battery_level")
                 .eq("system_id", system_id).gte("timestamp", day_start.isoformat()).lt("timestamp", day_end.isoformat())
                 .order("timestamp").limit(2000).execute().data or [])
         for r in rows:
@@ -242,8 +246,7 @@ async def get_hourly(day: Optional[str] = Query(None, alias="date", pattern=r"^\
         source = "live"
     else:
         rows = (sb.table("energy_readings_hourly")
-                .select("hour_start,production_kwh,consumption_kwh,grid_import_kwh,grid_export_kwh,"
-                        "peak_power_kw,battery_level_end,points")
+                .select("hour_start," + ",".join(HOURLY_FIELDS) + ",peak_power_kw,battery_level_end,points")
                 .eq("system_id", system_id).gte("hour_start", day_start.isoformat()).lt("hour_start", day_end.isoformat())
                 .order("hour_start").execute().data or [])
         for r in rows:
@@ -306,11 +309,22 @@ async def get_live_data(authorization: str = Header(...)):
     consumption_kwh = 0.0
     grid_import_kwh = 0.0
     grid_export_kwh = 0.0
+    battery_charge_kwh = 0.0
+    battery_discharge_kwh = 0.0
     today_hourly = []
     today_readings = []
     if day_data and isinstance(day_data, list):
         production_kwh = round(
             sum(float(p.get("power") or 0) for p in day_data) * (5 / 60) / 1000, 4
+        )
+        # batteryPower is signed: positive = charging, negative = discharging
+        # (same arithmetic as the five-minute sync's _build_row). The portal
+        # patches today's bar of the week view from these two.
+        battery_charge_kwh = round(
+            sum(max(float(p.get("batteryPower") or 0), 0) for p in day_data) * (5 / 60) / 1000, 4
+        )
+        battery_discharge_kwh = round(
+            sum(max(-float(p.get("batteryPower") or 0), 0) for p in day_data) * (5 / 60) / 1000, 4
         )
         consumption_kwh = round(
             sum(
@@ -398,6 +412,8 @@ async def get_live_data(authorization: str = Header(...)):
         "today_consumption_kwh": consumption_kwh,
         "today_grid_import_kwh": grid_import_kwh,
         "today_grid_export_kwh": grid_export_kwh,
+        "today_battery_charge_kwh": battery_charge_kwh,
+        "today_battery_discharge_kwh": battery_discharge_kwh,
         # Battery
         "battery_level": battery_level,
         "battery_status": battery_status,
