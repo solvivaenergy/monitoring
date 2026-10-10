@@ -63,6 +63,12 @@ services:
         sync: false
       - key: ODOO_SH_API_KEY
         sync: false
+      # Health tab thresholds for the database tiles — the worker alerts on
+      # the same two values; change both together.
+      - key: INSTANCE_MEM_AVAILABLE_MIN_MB
+        value: "300"
+      - key: INSTANCE_SWAP_USED_MAX_MB
+        value: "300"
 
   # Daily sync cron: Solis → Supabase (2:00 AM PHT via Render cron)
   - type: cron
@@ -221,6 +227,25 @@ services:
         value: "16"
       - key: ONBOARD_BACKFILL_DAYS
         value: "60"
+      # 2026-10-10 fixes (all have the same defaults in code):
+      # Nightly daily readings: today + this many days before it, re-read via
+      # Solis's stationDayEnergyList (8 calls per date for the whole fleet);
+      # the monthly task still settles the whole previous month on the 1st.
+      - key: NIGHTLY_REREAD_DAYS
+        value: "7"
+      # Stations per fetch-and-write chunk of the five-minute pass: bounds the
+      # worker's memory at any fleet size (it buffered the whole fleet before).
+      - key: FIVE_MINUTE_CHUNK_STATIONS
+        value: "200"
+      # Seconds between backfill jobs; 0 drains the queue at full speed.
+      - key: BACKFILL_JOB_PAUSE_SECONDS
+        value: "0"
+      # Database memory-pressure alerts from the Supabase metrics endpoint
+      # (the Health tab shows the same thresholds; keep solviva-api in step).
+      - key: INSTANCE_MEM_AVAILABLE_MIN_MB
+        value: "300"
+      - key: INSTANCE_SWAP_USED_MAX_MB
+        value: "300"
       # Same secrets as solviva-sync + solviva-api; copy them in the dashboard.
       - key: SOLIS_CLOUD_KEY_ID
         sync: false

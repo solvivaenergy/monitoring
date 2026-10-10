@@ -83,3 +83,33 @@ uvicorn api.main:app --port 8000
 | `api/solis_routes.py`         | `/solis/*` REST endpoints               |
 | `render.yaml`                 | Render.com deployment config            |
 | `.github/workflows/pages.yml` | GitHub Pages auto-deploy                |
+
+## Scaling checkpoints (noted 2026-10-10)
+
+Capacity plan for the +2,500-installation target (fleet 710 → ~3,200). The
+2026-10-10 change set shipped the fixes that do not depend on fleet size
+(watermark view, lifetime slices, nightly on `stationDayEnergyList` with a
+7-day window, chunked five-minute pass, memory alerts on the Health tab,
+backfill pause knob). Three more are deliberately deferred — **revisit them
+when the fleet reaches ~1,500 stations**, which is before any of them bites:
+
+1. **Fetch strategy** — a full stationDay pass is Solis-bound at ~3.5 calls/s
+   (6–15 % of calls answered 429 at 700 stations); the 15-minute cadence stops
+   fitting at ~2,000 stations. Plan: full curve pass every 30 min, the hot
+   pass (viewed stations) stays at 5 min, plus the roster heartbeat below if
+   fleet-wide freshness is wanted. Nothing is lost in between — stationDay
+   returns the whole day each time — only freshness slips.
+2. **Roster heartbeat** (product decision) — `userStationList` every 5 min
+   (7 calls today, 32 at 3,200) carries `power`, `dataTimestamp`, `state` and
+   today's cumulative energies: one provisional "latest point" per station,
+   overwritten by the next full pass through the existing upsert. Also gives
+   every station's online state every 5 min (dark-station detection).
+3. **Monitoring Admin per-station stats** — the grid's grouped scans over the
+   reading tables grow with the hourly table; a nightly `station_stats` table
+   makes the grid one small read.
+
+Triggers, visible on the Health tab: fleet pass > 8 min → item 1; database
+free memory < 300 MB or swap > 300 MB → Supabase compute Medium ($60/mo);
+grid > 5 s → item 3; Solis 429 rate > 20 % → ask Solis about quota/keys.
+Measured headroom on 2026-10-10: disk IO ~1 % of the Small tier's baseline;
+RAM is the first database limit, around 1,500–2,000 stations.

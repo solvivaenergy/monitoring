@@ -34,6 +34,7 @@ Rules this file enforces, because nothing else will:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import decimal
 import json
@@ -55,6 +56,7 @@ from pydantic import BaseModel, Field
 from . import db
 from .backfill_history import PHT, parse_month_day
 from .solis_client import SolisCloudClient
+from .supabase_metrics import fetch_instance_metrics, thresholds_from_env
 from .onboard_from_odoo import DEFAULT_FIELD_NAME
 from .validation_routes import _authenticate_staff, _get_roster, _odoo_search_read
 
@@ -210,14 +212,35 @@ async def me(authorization: str = Header(None)):
     return {**staff, "locked_fields": LOCKED_FIELDS}
 
 
+# The database instance's memory/swap/disk for the Health tab, from Supabase's
+# metrics endpoint (a ~600 KB scrape, so cached for a minute). Never raises:
+# the tab must render without it, and says why it is missing.
+_instance_cache: Dict[str, Any] = {"at": 0.0, "data": None, "error": None}
+_instance_lock = threading.Lock()
+
+
+def _instance_metrics() -> Dict[str, Any]:
+    with _instance_lock:
+        if time.time() - _instance_cache["at"] < 60:
+            return {"instance": _instance_cache["data"], "instance_error": _instance_cache["error"]}
+        try:
+            data, err = fetch_instance_metrics(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"]), None
+        except Exception as exc:
+            data, err = None, str(exc)[:160]
+        _instance_cache.update(at=time.time(), data=data, error=err)
+        return {"instance": data, "instance_error": err}
+
+
 @router.get("/api/health")
 async def health(authorization: str = Header(None)):
     """Feed freshness and worker activity for the Health tab (migration 23):
     the newest five-minute point, the last rolled-up hour, the last daily row,
     the last run of each worker task, the backfill queue, stations viewed in
-    the last hour, and the five-minute partitions. Ages are computed by the
-    page from the timestamps."""
+    the last hour, the five-minute partitions, and (2026-10-10) the database
+    instance's free memory, swap and sizes with the worker's alert thresholds.
+    Ages are computed by the page from the timestamps."""
     await _authenticate_staff(authorization)
+    instance = await asyncio.to_thread(_instance_metrics)
     with db.connect(autocommit=True) as conn:
         five = conn.execute(
             "select max(last_ts) as last_ts, count(*) as stations_today, sum(n_rows) as rows_today "
@@ -252,6 +275,8 @@ async def health(authorization: str = Header(None)):
         "queue": {r["status"]: r["n"] for r in queue},
         "hot_stations": hot["n"], "active_stations": active["n"],
         "five_minute_partitions": parts,
+        "instance_thresholds": thresholds_from_env(),
+        **instance,
     })
 
 

@@ -59,13 +59,18 @@ SUPABASE_PAGE_SIZE = 1000
 SOLIS_CONCURRENCY = int(os.getenv("SOLIS_CONCURRENCY", "16"))
 
 # stationAll (lifetime earning) is a second Solis call per station. Rather
-# than all ~650 of them in one run (an 8–9 minute run every hour, measured
+# than all ~700 of them in one run (an 8–9 minute run every hour, measured
 # 2026-09-25), each run refreshes one slice of the fleet and carries the rest
-# forward from the watermark rows, so every station is refreshed once an hour
-# and every run is the same size. The slice is chosen from the minute of the
-# hour, so SYNC_CADENCE_MINUTES must match this cron's schedule in render.yaml
-# (both say 5): with a mismatch some slices would never come up. Stations
-# with no carried value (first run of the day) fetch regardless.
+# forward from the watermark rows, so every run is the same size. There are
+# 60 / SYNC_CADENCE_MINUTES = 12 slices; which one a pass refreshes comes from
+# _lifetime_slice_now: the pass's position in the hour, rotated by the hour,
+# because full-fleet passes only run every FLEET_EVERY_MINUTES (15 since the
+# worker of 2026-10-04). Computed from the minute alone, a 15-minute cadence
+# only ever reached slices 0, 3, 6 and 9 — two thirds of the fleet carried the
+# figure fetched at the first pass after midnight all day (found 2026-10-10).
+# Now every station is refreshed every 3 hours at the 15-minute cadence and
+# hourly at a 5-minute one, with no extra Solis calls. Stations with no
+# carried value (first run of the day) fetch regardless.
 #
 # Not the roster's allIncome: userStationList carries a lifetime income per
 # station in 7 calls, but it runs up to ~1% (₱734 on one station) above the
@@ -73,6 +78,19 @@ SOLIS_CONCURRENCY = int(os.getenv("SOLIS_CONCURRENCY", "16"))
 # customer's number. A decision for the product owner, not a sync detail.
 SYNC_CADENCE_MINUTES = int(os.getenv("SYNC_CADENCE_MINUTES", "5"))
 LIFETIME_REFRESH_EVERY_MINUTES = 60
+# Minutes between full-fleet passes: the worker's FLEET_EVERY_MINUTES (15). The
+# old per-process cron ran a full pass every SYNC_CADENCE_MINUTES, which is
+# the default here so a standalone run keeps its original schedule.
+FLEET_EVERY_MINUTES = int(os.getenv("FLEET_EVERY_MINUTES", str(SYNC_CADENCE_MINUTES)))
+
+# Stations per fetch-and-write chunk of a pass (fix 4, 2026-10-10). The pass
+# used to gather every station's stationDay response before writing a single
+# row: ~250 MB of transient memory at 700 stations (the worker sat at 287 MB
+# median / 327 MB peak on a 512 MB Render Starter), growing with the fleet,
+# and no row landed until the slowest Solis call had answered. Chunks bound
+# the memory at any fleet size and start writing after the first ~200
+# stations. The Solis gate and concurrency are unchanged.
+FIVE_MINUTE_CHUNK_STATIONS = int(os.getenv("FIVE_MINUTE_CHUNK_STATIONS", "200"))
 
 # Purge sizing. PostgREST connects as `authenticator`, whose statement_timeout is
 # 8s, so every DELETE has to fit inside that. Rows go one hour-window at a
@@ -575,6 +593,22 @@ def _lifetime_slice(system_id: str, slices: int) -> int:
     return zlib.crc32(str(system_id).encode("utf-8")) % max(1, slices)
 
 
+def _lifetime_slice_now(now: datetime, slices: int, fleet_every_minutes: int) -> int:
+    """Which lifetime slice this pass refreshes. Pure.
+
+    The pass's index within the hour (minute // fleet_every_minutes) walks
+    passes_per_hour slices an hour; the hour, modulo the number of hours one
+    full cycle takes, offsets it so the next hour continues where this one
+    stopped. With 12 slices and 15-minute passes that is 4 slices an hour over
+    a 3-hour cycle, every slice exactly once. With 5-minute passes it reduces
+    to minute // 5 % 12 — the schedule the cron ran before the worker.
+    """
+    step = max(1, fleet_every_minutes)
+    passes_per_hour = max(1, 60 // step)
+    hours_per_cycle = max(1, -(-max(1, slices) // passes_per_hour))
+    return ((now.minute // step) + passes_per_hour * (now.hour % hours_per_cycle)) % max(1, slices)
+
+
 async def sync_once(
     dry_run: bool = False,
     limit: Optional[int] = None,
@@ -699,7 +733,7 @@ async def sync_once(
     # the same keys, so a station either has a fetched value or a carried one;
     # a station with neither fetches now.
     slices = max(1, LIFETIME_REFRESH_EVERY_MINUTES // max(1, SYNC_CADENCE_MINUTES))
-    this_slice = (datetime.now(PHT).minute // max(1, SYNC_CADENCE_MINUTES)) % slices
+    this_slice = _lifetime_slice_now(datetime.now(PHT), slices, FLEET_EVERY_MINUTES)
 
     def _wants_lifetime(u: dict) -> bool:
         if not has_lifetime_earning:
@@ -719,126 +753,132 @@ async def sync_once(
         fetch_plan.append((user, wants))
 
     fetch_sem = asyncio.Semaphore(SOLIS_CONCURRENCY)
-    fetch_results = await asyncio.gather(*[
-        _fetch_station_day(solis, fetch_sem, user, today_str, with_lifetime=wants)
-        for user, wants in fetch_plan
-    ])
-
     total_written = 0
     hole_fills = 0
-    all_inserts: List[dict] = []
-    all_refreshes: List[dict] = []
+    n_inserts = 0
+    n_refreshes = 0
+    suffix = " [dry-run]" if dry_run else ""
 
-    for user, day_data, lifetime_earning, error in fetch_results:
-        user_id = user["id"]
-        station_id = user["solis_station_id"]
-        system_id = user["system_id"]
-        name = user.get("full_name") or user_id
+    # Fetch, plan and write in chunks of FIVE_MINUTE_CHUNK_STATIONS (see the
+    # constant): a chunk's rows are upserted as soon as its Solis calls are
+    # back, instead of every station's rows once the whole fleet has answered.
+    # The per-station logic below is unchanged.
+    #
+    # One upsert pass per chunk, with retry. Until 2026-09-16 the inserts were
+    # upserted TWICE — a retry-less loop and the retrying loop, identical
+    # batches — and the "latest point" refresh was a separate UPDATE per
+    # station, ~520 sequential round-trips. On a full table (~125k rows) that
+    # write phase took ~11 minutes of a run that has a 15-minute slot. The
+    # refreshed watermark rows go through the same upsert: ON CONFLICT
+    # (system_id, "timestamp") updates them in place. return=minimal: nobody
+    # reads the 500 echoed rows, and PostgREST json_agg()s them otherwise.
+    for chunk in _chunked(fetch_plan, FIVE_MINUTE_CHUNK_STATIONS):
+        fetch_results = await asyncio.gather(*[
+            _fetch_station_day(solis, fetch_sem, user, today_str, with_lifetime=wants)
+            for user, wants in chunk
+        ])
+        chunk_rows: List[dict] = []
 
-        if error:
-            if isinstance(error, SolisCloudError):
-                log.error("Solis API error for %s (station %s): %s", name, station_id, error)
+        for user, day_data, lifetime_earning, error in fetch_results:
+            user_id = user["id"]
+            station_id = user["solis_station_id"]
+            system_id = user["system_id"]
+            name = user.get("full_name") or user_id
+
+            if error:
+                if isinstance(error, SolisCloudError):
+                    log.error("Solis API error for %s (station %s): %s", name, station_id, error)
+                else:
+                    log.error("Sync failed for %s (station %s): %s", name, station_id, error)
+                continue
+
+            if not day_data:
+                log.info("%s: no stationDay data for %s", name, today_str)
+                continue
+
+            watermark = watermarks.get(system_id) if watermarks is not None else None
+            if lifetime_earning is None and watermark is not None:
+                lifetime_earning = watermark.get("lifetime")
+
+            parsed_by_ts: Dict[int, dict] = {}
+            for point in day_data:
+                built = _build_row(
+                    user_id,
+                    system_id,
+                    point,
+                    lifetime_earning=lifetime_earning if has_lifetime_earning else None,
+                )
+                if built is not None:
+                    ts_key, row = built
+                    if not has_battery_energy:
+                        for k in BATTERY_ENERGY_KEYS:
+                            row.pop(k, None)
+                    # Solis can occasionally repeat a timestamp; keep the latest copy.
+                    parsed_by_ts[ts_key] = row
+
+            parsed_rows = sorted(parsed_by_ts.items())
+
+            if not parsed_rows:
+                log.info("%s: Solis returned no parseable 5-minute points", name)
+                continue
+
+            if watermarks is not None:
+                inserts, refreshes, holes = _plan_station(parsed_rows, watermark)
+                if holes and watermark is not None:
+                    held = _load_station_timestamps(sb, system_id, day_start, day_end)
+                    fills = [row for ts, row in parsed_rows
+                             if ts <= watermark["last_ts"] and ts not in held]
+                    if fills:
+                        inserts.extend(fills)
+                        hole_fills += len(fills)
+                        log.info("%s: %d late point(s) filled below the watermark", name, len(fills))
             else:
-                log.error("Sync failed for %s (station %s): %s", name, station_id, error)
-            continue
+                # Pre-17 fallback: compare against THIS STATION's stored points
+                # (not the customer's — a second station must not hide behind the
+                # first) and refresh only the latest one.
+                existing_by_ts = existing_by_system.get(system_id, {})
+                latest_ts = max(ts_key for ts_key, _ in parsed_rows)
+                inserts, refreshes = [], []
+                for ts_key, row in parsed_rows:
+                    if ts_key in existing_by_ts:
+                        if ts_key == latest_ts:
+                            refreshes.append(row)
+                        continue
+                    inserts.append(row)
 
-        if not day_data:
-            log.info("%s: no stationDay data for %s", name, today_str)
-            continue
+            total_written += len(inserts) + len(refreshes)
+            n_inserts += len(inserts)
+            n_refreshes += len(refreshes)
+            chunk_rows.extend(inserts)
+            chunk_rows.extend(refreshes)
 
-        watermark = watermarks.get(system_id) if watermarks is not None else None
-        if lifetime_earning is None and watermark is not None:
-            lifetime_earning = watermark.get("lifetime")
-
-        parsed_by_ts: Dict[int, dict] = {}
-        for point in day_data:
-            built = _build_row(
-                user_id,
-                system_id,
-                point,
-                lifetime_earning=lifetime_earning if has_lifetime_earning else None,
+            log.info(
+                "%s: %d interval(s) parsed, %d new, %d refreshed%s",
+                name,
+                len(parsed_rows),
+                len(inserts),
+                len(refreshes),
+                suffix,
             )
-            if built is not None:
-                ts_key, row = built
-                if not has_battery_energy:
-                    for k in BATTERY_ENERGY_KEYS:
-                        row.pop(k, None)
-                # Solis can occasionally repeat a timestamp; keep the latest copy.
-                parsed_by_ts[ts_key] = row
 
-        parsed_rows = sorted(parsed_by_ts.items())
-
-        if not parsed_rows:
-            log.info("%s: Solis returned no parseable 5-minute points", name)
+        if dry_run or not chunk_rows:
             continue
-
-        if watermarks is not None:
-            inserts, refreshes, holes = _plan_station(parsed_rows, watermark)
-            if holes and watermark is not None:
-                held = _load_station_timestamps(sb, system_id, day_start, day_end)
-                fills = [row for ts, row in parsed_rows
-                         if ts <= watermark["last_ts"] and ts not in held]
-                if fills:
-                    inserts.extend(fills)
-                    hole_fills += len(fills)
-                    log.info("%s: %d late point(s) filled below the watermark", name, len(fills))
-        else:
-            # Pre-17 fallback: compare against THIS STATION's stored points
-            # (not the customer's — a second station must not hide behind the
-            # first) and refresh only the latest one.
-            existing_by_ts = existing_by_system.get(system_id, {})
-            latest_ts = max(ts_key for ts_key, _ in parsed_rows)
-            inserts, refreshes = [], []
-            for ts_key, row in parsed_rows:
-                if ts_key in existing_by_ts:
-                    if ts_key == latest_ts:
-                        refreshes.append(row)
-                    continue
-                inserts.append(row)
-
-        total_written += len(inserts) + len(refreshes)
-        all_inserts.extend(inserts)
-        all_refreshes.extend(refreshes)
-
-        suffix = " [dry-run]" if dry_run else ""
-        log.info(
-            "%s: %d interval(s) parsed, %d new, %d refreshed%s",
-            name,
-            len(parsed_rows),
-            len(inserts),
-            len(refreshes),
-            suffix,
-        )
+        for batch in _chunked(chunk_rows, SUPABASE_BATCH_SIZE):
+            _execute_with_retry(
+                f"upsert batch of {len(batch)} five-minute rows",
+                lambda batch=batch: sb.table("energy_readings_five_minutes").upsert(
+                    batch, on_conflict="system_id,timestamp", returning="minimal"
+                ),
+            )
 
     log.info(
         "Run plan: %d station(s), %d new row(s), %d refresh(es), %d late fill(s), "
         "%d lifetime fetch(es)%s",
-        len(prepared_users), len(all_inserts), len(all_refreshes), hole_fills,
-        lifetime_fetches, " [dry-run]" if dry_run else "",
+        len(prepared_users), n_inserts, n_refreshes, hole_fills, lifetime_fetches, suffix,
     )
 
     if dry_run:
         return total_written
-
-    # One upsert pass, with retry. Until 2026-09-16 the inserts were upserted
-    # TWICE — a retry-less loop here and the retrying loop below, identical
-    # batches — and the "latest point" refresh was a separate UPDATE per
-    # station, ~520 sequential round-trips. On a full table (~125k rows) that
-    # write phase took ~11 minutes of a run that has a 15-minute slot. When a
-    # run overruns, Render skips the next one, and the feed measured on
-    # 2026-09-16 was landing every ~40 minutes instead of every 15.
-    #
-    # The refreshed watermark rows go through the same upsert: ON CONFLICT
-    # (system_id, "timestamp") updates them in place. return=minimal: nobody
-    # reads the 500 echoed rows, and PostgREST json_agg()s them otherwise.
-    all_inserts.extend(all_refreshes)
-    for batch in _chunked(all_inserts, SUPABASE_BATCH_SIZE):
-        _execute_with_retry(
-            f"upsert batch of {len(batch)} five-minute rows",
-            lambda batch=batch: sb.table("energy_readings_five_minutes").upsert(
-                batch, on_conflict="system_id,timestamp", returning="minimal"
-            ),
-        )
 
     # Hourly roll-up (migration 20): the two hours just closed, every run — the
     # second one only to catch late points filled below the watermark. The

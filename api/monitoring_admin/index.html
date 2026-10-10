@@ -993,6 +993,12 @@ async function loadHealth(){
     const tile = (n, l, cls='') => `<div class="card"><div class="n ${cls}">${n}</div><div class="l">${l}</div></div>`;
     const cls = (min, warn, bad) => min == null ? 'bad' : min > bad ? 'bad' : min > warn ? 'warn' : 'ok';
     const q = h.queue || {};
+    // Database instance (Supabase metrics endpoint, via the API). Memory
+    // pressure, not disk traffic, is what preceded the Sept-2026 "Disk IO
+    // Budget" mail; the worker alerts on the same thresholds shown here.
+    const inst = h.instance, th = h.instance_thresholds || {mem_available_min_mb: 300, swap_used_max_mb: 300};
+    const memCls = !inst ? 'warn' : inst.mem_available_mb < th.mem_available_min_mb ? 'bad' : inst.mem_available_mb < th.mem_available_min_mb * 2 ? 'warn' : 'ok';
+    const swapCls = !inst ? 'warn' : inst.swap_used_mb > th.swap_used_max_mb ? 'bad' : inst.swap_used_mb > th.swap_used_max_mb / 2 ? 'warn' : 'ok';
     el.innerHTML = `
       <div class="kpi">
         ${tile(ageText(fiveAge), `five-minute feed · newest point (${h.five_minute.stations_today||0} stations today)`, cls(fiveAge, 20, 45))}
@@ -1001,7 +1007,12 @@ async function loadHealth(){
         ${tile(lastAny ? ageText(ageMin(lastAny, now)) : 'no runs yet', 'worker · last recorded run', lastAny ? cls(ageMin(lastAny, now), 20, 60) : 'warn')}
         ${tile(`${q.queued||0} / ${q.running||0}`, 'backfill jobs · queued / running')}
         ${tile(`${h.hot_stations} / ${h.active_stations}`, 'stations viewed in the last hour / active')}
+        ${tile(inst ? `${inst.mem_available_mb} MB` : 'n/a', `database · free memory of ${inst ? inst.mem_total_mb : '?'} MB (alert under ${th.mem_available_min_mb} MB)`, memCls)}
+        ${tile(inst ? `${inst.swap_used_mb} MB` : 'n/a', `database · swap in use (alert over ${th.swap_used_max_mb} MB)`, swapCls)}
+        ${tile(inst ? `${inst.db_size_mb} MB` : 'n/a', `database · size (WAL ${inst ? inst.wal_size_mb : '?'} MB, data disk ${inst ? inst.data_disk_free_gb : '?'} of ${inst ? inst.data_disk_total_gb : '?'} GB free)`)}
       </div>
+      ${h.instance_error ? `<p class="hint">Database tiles unavailable: ${esc(h.instance_error)}</p>` : ''}
+      <p class="hint">The three <b>database</b> tiles read the Supabase instance itself (memory, swap, disk), cached a minute. Free memory shrinking and swap filling are the early signs that the compute tier is too small — that, not disk traffic, is what triggered Supabase's "Disk IO Budget" mail in September 2026 on the Nano tier. The worker alerts on the same thresholds (webhook + e-mail + a failed <b>health</b> run below); the next step when they trip is Supabase compute Medium.</p>
       <div class="card sect"><h3 style="margin-top:0">Last run of each task</h3>
         <p class="hint"><b>five_minute</b> runs every 5 min (a full fleet pass every 15 min, "hot" stations in between); <b>nightly</b> at 02:00 (onboarding → daily readings → referral codes → identity mirror); <b>monthly</b> on the 1st at 09:00 (previous month re-read for every station); <b>health</b> rows appear only when the five-minute feed goes stale (&gt;30 min) or recovers — those also go out as alerts. Backfill jobs are not listed here; see <i>Backfills</i>. Until the worker is deployed and the crons retired, this table stays empty while the feeds above keep moving.</p>
         <table><thead><tr><th>Task</th><th>Started</th><th>Took</th><th>Status</th><th>Stats</th><th>Error</th><th>Host</th></tr></thead><tbody>

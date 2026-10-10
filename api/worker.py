@@ -29,7 +29,15 @@ Tasks (Manila time):
   jobs         drain public.backfill_jobs continuously (api.backfill_worker).
   health       every 5 minutes: age of the newest five-minute point; alert on
                the webhook/email when it exceeds FEED_STALE_MINUTES, again
-               every 6 h while stale, and once on recovery.
+               every 6 h while stale, and once on recovery. Also (fix 8,
+               2026-10-10) the database instance's free memory and swap from
+               Supabase's metrics endpoint (api/supabase_metrics.py): the
+               same alert cadence when free memory drops under
+               INSTANCE_MEM_AVAILABLE_MIN_MB (300) or swap rises over
+               INSTANCE_SWAP_USED_MAX_MB (300) — memory pressure is what
+               preceded the 2026-09-23 "Disk IO Budget" mail, not disk traffic.
+  jobs         BACKFILL_JOB_PAUSE_SECONDS (0) between jobs lets a big queue
+               be drained gently (fix 9); the Solis side is already paced.
 
 A Postgres advisory lock makes sure only one worker runs. The process never
 exits on a task failure: the failure is logged, recorded in sync_runs, and the
@@ -63,6 +71,7 @@ from api import backfill_worker as bw  # noqa: E402
 from api.enqueue_fleet_backfill import enqueue_fleet, month_bounds  # noqa: E402
 from api.onboard_from_odoo import _send_webhook  # noqa: E402
 from api.solis_client import SolisCloudClient  # noqa: E402
+from api.supabase_metrics import fetch_instance_metrics, pressure_message, thresholds_from_env  # noqa: E402
 from api.sync_five_minutes_to_supabase import sync_once as five_minute_pass  # noqa: E402
 from api.sync_to_supabase import run_nightly  # noqa: E402
 
@@ -74,6 +83,8 @@ CADENCE_MINUTES = int(os.getenv("SYNC_CADENCE_MINUTES", "5"))
 FLEET_EVERY_MINUTES = int(os.getenv("FLEET_EVERY_MINUTES", "15"))
 HOT_STATION_MINUTES = int(os.getenv("HOT_STATION_MINUTES", "60"))
 FEED_STALE_MINUTES = int(os.getenv("FEED_STALE_MINUTES", "30"))
+BACKFILL_JOB_PAUSE_SECONDS = float(os.getenv("BACKFILL_JOB_PAUSE_SECONDS", "0"))
+INSTANCE_THRESHOLDS = thresholds_from_env()
 NIGHTLY_AT = os.getenv("NIGHTLY_AT", "02:00")
 MONTHLY_AT = os.getenv("MONTHLY_AT", "09:00")
 ALL_TASKS = ("five_minute", "nightly", "monthly", "jobs", "health")
@@ -217,6 +228,9 @@ class Worker:
         self._monthly_done: Optional[str] = None
         self._stale_since: Optional[datetime] = None
         self._last_stale_alert: Optional[datetime] = None
+        self._pressure_since: Optional[datetime] = None
+        self._last_pressure_alert: Optional[datetime] = None
+        self._last_instance_log: Optional[datetime] = None
 
     # -- helpers ----------------------------------------------------------
     async def _run(self, task: str, factory: Callable[[], Awaitable[Any]],
@@ -315,6 +329,7 @@ class Worker:
         if slot == self._last_health_slot:
             return
         self._last_health_slot = slot
+        await self._check_instance(now)
         try:
             with db.connect(autocommit=True) as conn:
                 row = conn.execute("select max(last_ts) as last_ts from public.five_minute_watermarks").fetchone()
@@ -345,6 +360,42 @@ class Worker:
             if not self.dry_run:
                 alert("five-minute feed recovered", f"after {down.total_seconds() / 60:.0f} min")
 
+    async def _check_instance(self, now: datetime) -> None:
+        """Database memory pressure, from Supabase's metrics endpoint. One
+        reading every 5 minutes, one INFO line an hour, an alert (webhook +
+        email + a failed `health` run) when a threshold is crossed, again every
+        6 h while it stays crossed, and once on recovery. Never raises: a
+        missing reading is a warning, not a worker failure."""
+        try:
+            m = await asyncio.to_thread(fetch_instance_metrics, _env("SUPABASE_URL"), _env("SUPABASE_SERVICE_KEY"))
+        except Exception as exc:
+            log.warning("instance metrics unavailable: %s", str(exc)[:160])
+            return
+        if self._last_instance_log is None or now - self._last_instance_log >= timedelta(hours=1):
+            self._last_instance_log = now
+            log.info("instance: %s MB free of %s, swap %s MB, load %s, db %s MB, wal %s MB, data disk %s GB free",
+                     m.get("mem_available_mb"), m.get("mem_total_mb"), m.get("swap_used_mb"), m.get("load1"),
+                     m.get("db_size_mb"), m.get("wal_size_mb"), m.get("data_disk_free_gb"))
+        msg = pressure_message(m, INSTANCE_THRESHOLDS["mem_available_min_mb"], INSTANCE_THRESHOLDS["swap_used_max_mb"])
+        reading = {k: v for k, v in m.items() if k != "fetched_at"}
+        if msg:
+            if self._pressure_since is None:
+                self._pressure_since = now
+            if self._last_pressure_alert is None or (now - self._last_pressure_alert) > timedelta(hours=6):
+                self._last_pressure_alert = now
+                self.runs.finish(self.runs.start("health", {"instance": reading}), "failed", None,
+                                 "database memory pressure: " + msg)
+                if not self.dry_run:
+                    alert("database memory pressure", msg + " — the next step is Supabase compute Medium (4 GB)")
+        elif self._pressure_since is not None:
+            down = now - self._pressure_since
+            self._pressure_since = None
+            self._last_pressure_alert = None
+            self.runs.finish(self.runs.start("health", {"instance": reading}), "succeeded",
+                             {"recovered_after_minutes": round(down.total_seconds() / 60)})
+            if not self.dry_run:
+                alert("database memory pressure cleared", f"after {down.total_seconds() / 60:.0f} min")
+
     async def jobs_loop(self) -> None:
         if self.dry_run:
             # Claiming flips a job to 'running'; a dry run must not touch the queue.
@@ -366,6 +417,12 @@ class Worker:
                 await bw.process(job, self.sb, self.solis, self.sem)
             except Exception:
                 log.exception("job %s crashed outside process()", job.get("id"))
+            if BACKFILL_JOB_PAUSE_SECONDS > 0:
+                # Fix 9: a gentle drain for a large queue (a fleet re-read is
+                # ~700 jobs). The Solis side is already paced by the shared
+                # gate; this spaces the database writes. Changeable in the
+                # Render env without a deploy; 0 drains at full speed.
+                await self._sleep(BACKFILL_JOB_PAUSE_SECONDS)
 
     # -- loop ---------------------------------------------------------------
     async def _sleep(self, seconds: float) -> None:
@@ -389,9 +446,10 @@ class Worker:
             await self._sleep(TICK_SECONDS)
 
     async def run(self) -> None:
-        log.info("worker starting on %s: tasks=%s cadence=%d fleet_every=%d hot=%d min stale=%d min nightly=%s monthly=%s",
+        log.info("worker starting on %s: tasks=%s cadence=%d fleet_every=%d hot=%d min stale=%d min nightly=%s monthly=%s "
+                 "job_pause=%ss instance_thresholds=%s",
                  HOST, ",".join(sorted(self.tasks)), CADENCE_MINUTES, FLEET_EVERY_MINUTES, HOT_STATION_MINUTES,
-                 FEED_STALE_MINUTES, NIGHTLY_AT, MONTHLY_AT)
+                 FEED_STALE_MINUTES, NIGHTLY_AT, MONTHLY_AT, BACKFILL_JOB_PAUSE_SECONDS, INSTANCE_THRESHOLDS)
         if not self.dry_run:
             self.runs.close_interrupted()
             if "jobs" in self.tasks:

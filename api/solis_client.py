@@ -248,6 +248,29 @@ class SolisCloudClient:
             "pageSize": page_size,
         })
 
+    async def station_day_energy_list(self, date_str: str, page_no: int = 1, page_size: int = 100) -> Dict:
+        """One record per plant for ONE date, for the whole account —
+        /v1/api/stationDayEnergyList, `pages` calls of up to 100 plants (8 for
+        the 710-plant fleet on 2026-10-10) instead of one stationMonth call per
+        station. Each record carries the same per-day fields as a stationMonth
+        day (energy, consumeEnergy, homeLoadEnergy, gridPurchasedEnergy,
+        gridSellEnergy, batteryChargeEnergy, batteryDischargeEnergy, money,
+        dateStr) with `id` = the station id; verified equal value-for-value on
+        49 station-days and set-for-set against the nightly's output for
+        2026-10-09 (662 plants both ways).
+
+        Page by the response's `pages`, never by the record count: a page holds
+        FEWER than `pageSize` records (plants with no data on that date are
+        dropped from it, as stationMonth drops such days) and `current` always
+        reads 1. The body is exactly what was probed; extra keys (money,
+        timeZone) are not sent.
+        """
+        return await self._request("/v1/api/stationDayEnergyList", {
+            "pageNo": page_no,
+            "pageSize": page_size,
+            "time": date_str,
+        })
+
     async def station_detail(self, station_id: str) -> Dict:
         """Get detailed info for a specific station."""
         return await self._request("/v1/api/stationDetail", {
