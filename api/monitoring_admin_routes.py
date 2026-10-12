@@ -1466,9 +1466,9 @@ async def unresolved(authorization: str = Header(None)):
 # Yesterday's row is a provisional 0 until the 02:00 Manila sync, so 1–2 days
 # without production is normal; 3+ is the alarm. `last_daily` is therefore the
 # last day WITH production (the UI labels it so); `last_row` is the newest row
-# of any kind, for context. Carries the customer's Odoo partner id and emails
-# so the helpdesk lookup below can match. One grouped scan, not a lateral per
-# row (same reasoning as ROWS_SQL).
+# of any kind, for context. Carries the customer's Odoo partner id, emails and
+# names so the helpdesk lookup below can match. One grouped scan, not a lateral
+# per row (same reasoning as ROWS_SQL).
 DARK_SQL = """
     with daily as (
       select system_id,
@@ -1476,7 +1476,7 @@ DARK_SQL = """
              max("timestamp") as last_row
         from public.energy_readings group by system_id)
     select s.id as system_id, s.user_id, s.system_name, s.solis_station_id, p.full_name, s.status,
-           p.odoo_partner_id, p.odoo_email, u.email as login_email,
+           p.odoo_partner_id, p.odoo_email, p.odoo_customer_name, u.email as login_email,
            r.last_daily, r.last_row, (current_date - r.last_daily::date) as days_dark
       from public.solar_systems s
       left join public.user_profiles p on p.id = s.user_id
@@ -1487,14 +1487,77 @@ DARK_SQL = """
      order by r.last_daily nulls first"""
 
 
+def _norm(s: Any) -> str:
+    """Lower-case, whitespace-collapsed text for comparing names and emails."""
+    return " ".join(str(s or "").split()).lower()
+
+
+def _odoo_or(terms: List[List]) -> List:
+    """Odoo prefix-notation OR of N leaf terms ([] for none — callers must
+    not search on an empty domain, which would match every record)."""
+    return ["|"] * (len(terms) - 1) + terms if terms else []
+
+
+def _helpdesk_emails(r: Dict[str, Any]) -> List[str]:
+    return sorted({_norm(e) for e in (r.get("login_email"), r.get("odoo_email")) if _norm(e)})
+
+
+def _helpdesk_names(r: Dict[str, Any]) -> List[str]:
+    """Names worth looking for in ticket titles: the profile name, the Odoo
+    customer name and the system name, when long enough not to be noise (the
+    shortest real ones on 2026-10-12 were 'Ba Loi', 'Eva Paz'; 'B5L8' is a
+    system name, not a customer) and not an email that landed in full_name."""
+    out: List[str] = []
+    for v in (r.get("full_name"), r.get("odoo_customer_name"), r.get("system_name")):
+        n = _norm(v)
+        if len(n) >= 6 and "@" not in n and n not in out:
+            out.append(n)
+    return out
+
+
+def _helpdesk_domain(dark: List[Dict[str, Any]]) -> List:
+    """The Odoo search for every dark row at once. Three ways to find a ticket,
+    because the strict one misses most of engineering's own tickets:
+      - partner id, the proper link;
+      - partner email, compared case-insensitively on the Odoo side: `in` is an
+        exact match, so 'Dencan8@gmail.com' on the ticket never matched the
+        lower-cased 'dencan8@gmail.com' we sent (found 2026-10-12);
+      - the customer's name inside the ticket title. Technical After Sales
+        tickets are mostly created without a customer attached (346 of 847 on
+        2026-10-12, 17 of them open, five of those 'Site Offline' tickets for
+        dark stations), so the title is the only handle on them."""
+    partner_ids = sorted({int(r["odoo_partner_id"]) for r in dark if r.get("odoo_partner_id")})
+    emails = sorted({e for r in dark for e in _helpdesk_emails(r)})
+    names = sorted({n for r in dark for n in _helpdesk_names(r)})
+    return _odoo_or(([["partner_id", "in", partner_ids]] if partner_ids else [])
+                    + [["partner_email", "=ilike", e] for e in emails]
+                    + [["name", "ilike", n] for n in names])
+
+
+def _helpdesk_match(r: Dict[str, Any], t: Dict[str, Any]) -> Optional[str]:
+    """How ticket `t` belongs to dark row `r`: 'partner', 'email', 'name', or
+    None. Strongest first, so the UI can flag the weaker matches."""
+    pid = int(r["odoo_partner_id"]) if r.get("odoo_partner_id") else None
+    t_pid = t["partner_id"][0] if isinstance(t.get("partner_id"), (list, tuple)) else None
+    if pid and t_pid == pid:
+        return "partner"
+    if _norm(t.get("partner_email")) in _helpdesk_emails(r):
+        return "email"
+    title = _norm(t.get("name"))
+    if any(n in title for n in _helpdesk_names(r)):
+        return "name"
+    return None
+
+
 @router.get("/api/unresolved/helpdesk")
 async def dark_helpdesk(authorization: str = Header(None)):
     """Odoo helpdesk tickets for the customers in the dark list, so engineering
     sees whether a dark station is already being handled (asked 2026-10-02).
-    Any helpdesk team. Matched on the partner id the nightly mirror holds, with
-    the login / Odoo email as fallback. Read-only toward Odoo, and separate
-    from /api/unresolved so the page never waits on Odoo (same shape as
-    /api/suspects/suggestions). Also counts the customer's open tickets from
+    Any helpdesk team. Matched on the partner id the nightly mirror holds, then
+    the login / Odoo email, then the customer's name in the ticket title (see
+    _helpdesk_domain); each ticket says which. Read-only toward Odoo, and
+    separate from /api/unresolved so the page never waits on Odoo (same shape
+    as /api/suspects/suggestions). Also counts the customer's open tickets from
     the mobile app (public.support_tickets)."""
     await _authenticate_staff(authorization)
     with db.connect(autocommit=True) as conn:
@@ -1502,11 +1565,9 @@ async def dark_helpdesk(authorization: str = Header(None)):
         app_open = {str(r["user_id"]): r["n"] for r in conn.execute(
             """select user_id, count(*) as n from public.support_tickets
                 where coalesce(status, '') not in ('closed', 'resolved') group by user_id""").fetchall()}
-    if not dark:
+    domain = _helpdesk_domain(dark) if dark else []
+    if not domain:
         return {"helpdesk": {}, "tickets_matched": 0}
-    partner_ids = sorted({int(r["odoo_partner_id"]) for r in dark if r["odoo_partner_id"]})
-    emails = sorted({e.lower() for r in dark for e in (r["login_email"], r["odoo_email"]) if e})
-    domain = ["|", ["partner_id", "in", partner_ids], ["partner_email", "in", emails]]
     fields = ["id", "name", "partner_id", "partner_email", "team_id", "stage_id", "create_date", "close_date", "user_id"]
     try:
         tickets = await _odoo_search_read("helpdesk.ticket", domain, fields, limit=1000)
@@ -1518,22 +1579,19 @@ async def dark_helpdesk(authorization: str = Header(None)):
     def _m2o(v: Any) -> Optional[str]:
         return v[1] if isinstance(v, (list, tuple)) and len(v) > 1 else None
 
-    def _ticket(t: Dict[str, Any]) -> Dict[str, Any]:
+    def _ticket(t: Dict[str, Any], how: str) -> Dict[str, Any]:
         return {"id": t["id"], "name": t.get("name"), "team": _m2o(t.get("team_id")), "stage": _m2o(t.get("stage_id")),
                 "assigned": _m2o(t.get("user_id")), "created": t.get("create_date"), "closed": t.get("close_date") or None,
+                "match": how,
                 "url": f"{base}/web#id={t['id']}&model=helpdesk.ticket&view_type=form" if base else None}
 
     out: Dict[str, Any] = {}
     for r in dark:
-        pid = int(r["odoo_partner_id"]) if r["odoo_partner_id"] else None
-        mine_emails = [e.lower() for e in (r["login_email"], r["odoo_email"]) if e]
-        mine = [t for t in tickets
-                if (pid and isinstance(t.get("partner_id"), (list, tuple)) and t["partner_id"][0] == pid)
-                or any(e in str(t.get("partner_email") or "").lower() for e in mine_emails)]
-        mine.sort(key=lambda t: t.get("create_date") or "", reverse=True)
+        mine = [_ticket(t, how) for t in tickets for how in (_helpdesk_match(r, t),) if how]
+        mine.sort(key=lambda t: t["created"] or "", reverse=True)
         out[str(r["system_id"])] = {
-            "open": [_ticket(t) for t in mine if not t.get("close_date")],
-            "closed_recent": [_ticket(t) for t in mine if t.get("close_date")][:3],
+            "open": [t for t in mine if not t["closed"]],
+            "closed_recent": [t for t in mine if t["closed"]][:3],
             "app_open": app_open.get(str(r["user_id"]), 0),
         }
     return {"helpdesk": out, "tickets_matched": len(tickets)}

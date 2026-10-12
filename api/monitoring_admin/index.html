@@ -938,7 +938,7 @@ async function loadUnresolved(){
         </tbody></table></div>
 
       <div class="card sect"><h3 style="margin-top:0">Active stations dark for more than 3 days <span class="muted">— no day with production above zero in the last 3 days</span></h3>
-        <p class="hint">A 0 kWh day counts as dark: the nightly sync still writes a zero row for a plant that is offline in Solis, so the newest row is not proof of life. Yesterday's row is a placeholder until the 02:00 sync, so 1–2 days is normal. <b>Helpdesk</b> shows the customer's Odoo tickets (any team), open ones first, matched on the Odoo partner id with the login email as fallback — so you can see whether someone is already on it before opening a new one. Tickets are created and worked in Odoo; this is a read-only view.</p>
+        <p class="hint">A 0 kWh day counts as dark: the nightly sync still writes a zero row for a plant that is offline in Solis, so the newest row is not proof of life. Yesterday's row is a placeholder until the 02:00 sync, so 1–2 days is normal. <b>Helpdesk</b> shows the customer's Odoo tickets (any team), open ones first — so you can see whether someone is already on it before opening a new one. Matched on the Odoo partner id, then the email (either case), then the customer's name in the ticket title: most Technical After Sales tickets are created without a customer attached, so a <span class="tag">by name</span> ticket is one where only the title names the customer — set its Customer field in Odoo when you work it. Tickets are created and worked in Odoo; this is a read-only view.</p>
         <table><thead><tr><th>Customer</th><th>System</th><th>Station</th><th title="Newest daily row with production above zero">Last day with production</th><th>Days dark</th><th title="Newest daily row of any kind, including 0 kWh placeholders">Newest row</th><th>Helpdesk (Odoo)</th></tr></thead><tbody>
         ${u.dark_systems.map(s => `<tr data-row-open="${s.system_id}"><td>${esc(s.full_name)}</td><td>${esc(s.system_name)}</td><td class="mono">${esc(s.solis_station_id)}</td><td>${fmtDate(s.last_daily)}</td><td>${s.days_dark??'∞'}</td><td class="muted">${fmtDate(s.last_row)}</td><td class="wrap" data-helpdesk="${s.system_id}"><span class="muted">checking Odoo…</span></td></tr>`).join('') || '<tr><td colspan=7 class="muted">none</td></tr>'}
         </tbody></table></div>`;
@@ -1036,7 +1036,11 @@ async function fillHelpdesk(){
   const cells = $$('#view-unresolved [data-helpdesk]'); if (!cells.length) return;
   try {
     const res = await api('/monitoring-admin/api/unresolved/helpdesk');
-    const line = x => `<div><a href="${esc(x.url||'#')}" target="_blank" rel="noopener">#${x.id}</a> ${esc(String(x.name||'').slice(0,70))} <span class="tag ${x.closed?'':'warn'}">${esc(x.team||'')}${x.stage?' · '+esc(x.stage):''}</span> <span class="muted">${x.closed?'closed '+fmtDate(x.closed):'opened '+fmtDate(x.created)}${x.assigned?' · '+esc(x.assigned):''}</span></div>`;
+    // 'partner' is the proper Odoo link; 'email' and 'name' are fallbacks for
+    // tickets created without a customer attached, so say so on the line.
+    const how = x => x.match==='name' ? ' <span class="tag" title="This ticket has no customer attached in Odoo; it was matched on the customer\'s name in its title. Ask the owner to set the Customer field.">by name</span>'
+                   : x.match==='email' ? ' <span class="tag" title="Matched on the email address, not the Odoo partner id">by email</span>' : '';
+    const line = x => `<div><a href="${esc(x.url||'#')}" target="_blank" rel="noopener">#${x.id}</a> ${esc(String(x.name||'').slice(0,70))} <span class="tag ${x.closed?'':'warn'}">${esc(x.team||'')}${x.stage?' · '+esc(x.stage):''}</span>${how(x)} <span class="muted">${x.closed?'closed '+fmtDate(x.closed):'opened '+fmtDate(x.created)}${x.assigned?' · '+esc(x.assigned):''}</span></div>`;
     cells.forEach(td => {
       const h = res.helpdesk[td.dataset.helpdesk] || {open:[], closed_recent:[], app_open:0};
       td.innerHTML = (h.open.length ? h.open.map(line).join('') : '<span class="muted">no open ticket</span>')
