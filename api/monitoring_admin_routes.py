@@ -268,7 +268,17 @@ async def health(authorization: str = Header(None)):
                 where i.inhparent = 'public.energy_readings_five_minutes'::regclass order by 1""").fetchall()
         active = conn.execute(
             "select count(*) as n from public.solar_systems where status = 'active' and solis_station_id is not null").fetchone()
+        # Solis Real-time Data Forwarding capture (migration 26). The table may
+        # not exist on an older database; the tab must still render.
+        try:
+            forward = dict(conn.execute(
+                """select count(*) as messages_hour, count(distinct collector_sn) as collectors_hour,
+                          max(device_time) as newest_device_time, max(received_at) as newest_received_at
+                     from public.solis_forward_messages where received_at > now() - interval '1 hour'""").fetchone())
+        except Exception as exc:
+            forward = {"error": str(exc)[:120]}
     return _j({
+        "forward": forward,
         "now": dt.datetime.now(dt.timezone.utc),
         "five_minute": dict(five), "hourly": dict(hourly), "daily": dict(daily),
         "last_runs": last_runs, "recent_runs": recent,

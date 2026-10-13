@@ -38,6 +38,11 @@ Tasks (Manila time):
                preceded the 2026-09-23 "Disk IO Budget" mail, not disk traffic.
   jobs         BACKFILL_JOB_PAUSE_SECONDS (0) between jobs lets a big queue
                be drained gently (fix 9); the Solis side is already paced.
+  forward      (2026-10-13) subscribe to our EMQX broker and keep every Solis
+               Real-time Data Forwarding message verbatim in
+               solis_forward_messages (api/solis_forward.py). Disabled, with
+               one log line, until EMQX_HOST / EMQX_WORKER_USER /
+               EMQX_WORKER_PASSWORD are set in the Render env.
 
 A Postgres advisory lock makes sure only one worker runs. The process never
 exits on a task failure: the failure is logged, recorded in sync_runs, and the
@@ -71,6 +76,7 @@ from api import backfill_worker as bw  # noqa: E402
 from api.enqueue_fleet_backfill import enqueue_fleet, month_bounds  # noqa: E402
 from api.onboard_from_odoo import _send_webhook  # noqa: E402
 from api.solis_client import SolisCloudClient  # noqa: E402
+from api.solis_forward import ForwardCapture  # noqa: E402
 from api.supabase_metrics import fetch_instance_metrics, pressure_message, thresholds_from_env  # noqa: E402
 from api.sync_five_minutes_to_supabase import sync_once as five_minute_pass  # noqa: E402
 from api.sync_to_supabase import run_nightly  # noqa: E402
@@ -87,7 +93,7 @@ BACKFILL_JOB_PAUSE_SECONDS = float(os.getenv("BACKFILL_JOB_PAUSE_SECONDS", "0"))
 INSTANCE_THRESHOLDS = thresholds_from_env()
 NIGHTLY_AT = os.getenv("NIGHTLY_AT", "02:00")
 MONTHLY_AT = os.getenv("MONTHLY_AT", "09:00")
-ALL_TASKS = ("five_minute", "nightly", "monthly", "jobs", "health")
+ALL_TASKS = ("five_minute", "nightly", "monthly", "jobs", "health", "forward")
 TICK_SECONDS = 20
 
 
@@ -222,6 +228,7 @@ class Worker:
         self.sb = create_client(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_KEY"))
         self.solis = SolisCloudClient(_env("SOLIS_CLOUD_KEY_ID"), _env("SOLIS_CLOUD_KEY_SECRET"))
         self.sem = asyncio.Semaphore(bw.SOLIS_CONCURRENCY)
+        self.forward = ForwardCapture()
         self._last_five_slot: Optional[datetime] = None
         self._last_health_slot: Optional[datetime] = None
         self._nightly_done: Optional[date] = None
@@ -457,6 +464,8 @@ class Worker:
         coros = [self.ticker()]
         if "jobs" in self.tasks:
             coros.append(self.jobs_loop())
+        if "forward" in self.tasks and not self.dry_run:
+            coros.append(self.forward.run(self.stop))
         try:
             await asyncio.gather(*coros)
         finally:

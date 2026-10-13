@@ -1010,6 +1010,8 @@ async function loadHealth(){
         ${tile(inst ? `${inst.mem_available_mb} MB` : 'n/a', `database · free memory of ${inst ? inst.mem_total_mb : '?'} MB (alert under ${th.mem_available_min_mb} MB)`, memCls)}
         ${tile(inst ? `${inst.swap_used_mb} MB` : 'n/a', `database · swap in use (alert over ${th.swap_used_max_mb} MB)`, swapCls)}
         ${tile(inst ? `${inst.db_size_mb} MB` : 'n/a', `database · size (WAL ${inst ? inst.wal_size_mb : '?'} MB, data disk ${inst ? inst.data_disk_free_gb : '?'} of ${inst ? inst.data_disk_total_gb : '?'} GB free)`)}
+        ${(() => { const f = h.forward || {}; const n = f.messages_hour || 0; const age = ageMin(f.newest_received_at, now);
+                   return tile(f.error ? 'n/a' : `${n} / ${f.collectors_hour || 0}`, `Solis forwarding (test) · messages / loggers in the last hour${f.newest_device_time ? ', newest device time ' + fmtTs(f.newest_device_time) : ''}`, f.error ? 'warn' : n === 0 ? '' : cls(age, 10, 20)); })()}
       </div>
       ${h.instance_error ? `<p class="hint">Database tiles unavailable: ${esc(h.instance_error)}</p>` : ''}
       <p class="hint">The three <b>database</b> tiles read the Supabase instance itself (memory, swap, disk), cached a minute. Free memory shrinking and swap filling are the early signs that the compute tier is too small — that, not disk traffic, is what triggered Supabase's "Disk IO Budget" mail in September 2026 on the Nano tier. The worker alerts on the same thresholds (webhook + e-mail + a failed <b>health</b> run below); the next step when they trip is Supabase compute Medium.</p>

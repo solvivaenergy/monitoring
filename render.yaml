@@ -214,7 +214,7 @@ services:
     dockerfilePath: ./Dockerfile.worker.all
     envVars:
       - key: WORKER_TASKS
-        value: five_minute,nightly,monthly,jobs,health
+        value: five_minute,nightly,monthly,jobs,health,forward
       - key: SYNC_CADENCE_MINUTES
         value: "5"
       - key: FLEET_EVERY_MINUTES
@@ -246,6 +246,17 @@ services:
         value: "300"
       - key: INSTANCE_SWAP_USED_MAX_MB
         value: "300"
+      # Solis Real-time Data Forwarding (2026-10-13): our EMQX Cloud broker and
+      # the worker's subscribe-only login. Set the three secrets in the
+      # dashboard; until then the `forward` task logs one line and stays idle.
+      - key: EMQX_HOST
+        sync: false
+      - key: EMQX_WORKER_USER
+        sync: false
+      - key: EMQX_WORKER_PASSWORD
+        sync: false
+      - key: EMQX_TOPIC
+        value: solviva/solis/#
       # Same secrets as solviva-sync + solviva-api; copy them in the dashboard.
       - key: SOLIS_CLOUD_KEY_ID
         sync: false
