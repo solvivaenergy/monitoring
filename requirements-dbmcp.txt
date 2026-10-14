@@ -1,0 +1,6 @@
+# Self-contained deps for db_mcp.py (the "Solviva Databases" connector). Same
+# reasoning as requirements-mcp.txt: api/requirements.txt pins an older uvicorn
+# than mcp needs, and this server imports nothing from api/.
+mcp[cli]==2.2.0
+psycopg[binary]==3.3.5
+python-dotenv==1.0.0

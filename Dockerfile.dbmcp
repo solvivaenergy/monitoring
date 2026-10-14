@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements-dbmcp.txt .
+RUN pip install --no-cache-dir -r requirements-dbmcp.txt
+COPY mcp_auth.py db_mcp.py ./
+EXPOSE 8082
+CMD ["python", "db_mcp.py", "--http"]

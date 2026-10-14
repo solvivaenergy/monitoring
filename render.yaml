@@ -326,3 +326,30 @@ services:
         sync: false
       - key: ODOO_SH_API_KEY
         sync: false
+
+  # "Solviva Databases" (2026-10-14): read-only SQL over the four Supabase
+  # projects for the whole Claude Teams org — db_mcp.py, one connector, no
+  # per-user Supabase login. Same gate as solviva-mcp (shared token + Anthropic
+  # IP allowlist). The four URLs are Session-pooler strings (port 5432) for the
+  # SELECT-only role db_mcp_ro: sql/2026-10-14_27_db_mcp_role.sql here and
+  # supabase/migrations/20261014_create_db_mcp_ro_role.sql in InternalCalcBackEnd.
+  # Must NOT be plan: free — a cold start blows Claude's connector timeout.
+  - type: web
+    name: solviva-db-mcp
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile.dbmcp
+    healthCheckPath: /healthz
+    envVars:
+      - key: DB_MCP_SERVICE_TOKEN
+        sync: false
+      - key: MCP_PUBLIC_HOST
+        sync: false
+      - key: DB_MCP_MONITORING_URL
+        sync: false
+      - key: DB_MCP_CALC_URL
+        sync: false
+      - key: DB_MCP_CALC_STAGING_URL
+        sync: false
+      - key: DB_MCP_CALC_TESTING_URL
+        sync: false
