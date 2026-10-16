@@ -35,6 +35,7 @@ Rules this file enforces, because nothing else will:
 from __future__ import annotations
 
 import asyncio
+import calendar
 import datetime as dt
 import decimal
 import json
@@ -231,6 +232,163 @@ def _instance_metrics() -> Dict[str, Any]:
         return {"instance": data, "instance_error": err}
 
 
+# ---------------------------------------------------------------------------
+# DU rates — READ-ONLY. electricity_rates / electricity_rate_tiers are filled
+# by the DU-rate scrape (ICSC presyo + the MERALCO bill PDF, outside this repo,
+# monthly, as service_role; migration 28 recorded the DDL). Its replace
+# function deletes-and-reinserts a provider/month, so a hand edit would not
+# survive the next run, and the tables carry no audit trigger; hence nothing
+# here writes them. These helpers show engineering what the customer portal
+# prices savings with (CustomerPortal src/lib/savings.ts), so "why does my app
+# say ₱X" is answered from the drawer, and the Health tab shows when the
+# scrape stops delivering.
+# ---------------------------------------------------------------------------
+
+# The portal prices a station with no provider as MERALCO and marks it "estimated".
+FALLBACK_PROVIDER_ID = 1
+
+RATES_OVERVIEW_SQL = """
+with st as (
+  select electricity_provider_id as provider_id, count(*) as active_stations
+    from public.solar_systems where status = 'active' group by 1),
+latest as (
+  select distinct on (provider_id) provider_id, id, effective_date, rate, source_url, scraped_at
+    from public.electricity_rates where customer_class = 'residential'
+    order by provider_id, effective_date desc),
+tiers as (
+  select rate_id, count(*) as n, min(rate_per_kwh) as lo, max(rate_per_kwh) as hi
+    from public.electricity_rate_tiers group by rate_id),
+hist as (
+  select provider_id, count(*) as months, min(effective_date) as first_month, max(scraped_at) as last_scraped
+    from public.electricity_rates where customer_class = 'residential' group by 1)
+select ep.id as provider_id, ep.code, ep.name,
+       coalesce(st.active_stations, 0) as active_stations,
+       l.effective_date as latest_month, l.rate as latest_rate, l.source_url, l.scraped_at as latest_scraped_at,
+       coalesce(t.n, 0) as tiers, t.lo as tier_min, t.hi as tier_max,
+       coalesce(h.months, 0) as months, h.first_month, h.last_scraped
+  from public.electricity_providers ep
+  left join st on st.provider_id = ep.id
+  left join latest l on l.provider_id = ep.id
+  left join tiers t on t.rate_id = l.id
+  left join hist h on h.provider_id = ep.id
+ order by active_stations desc, ep.code
+"""
+
+NO_PROVIDER_SQL = """
+select s.id as system_id, s.system_name, s.solis_station_id, s.odoo_lead_id, p.full_name
+  from public.solar_systems s left join public.user_profiles p on p.id = s.user_id
+ where s.status = 'active' and s.electricity_provider_id is null
+ order by coalesce(p.full_name, s.system_name)
+"""
+
+STATION_MONTHS_SQL = """
+select date_trunc('month', ("timestamp" at time zone 'Asia/Manila'))::date as month_start,
+       sum(consumption_kwh) as consumption_kwh, sum(production_kwh) as production_kwh, count(*) as days
+  from public.energy_readings
+ where system_id = %s and "timestamp" >= (%s::timestamp at time zone 'Asia/Manila')
+ group by 1 order by 1
+"""
+
+SCHEDULE_SQL = """
+select id, provider_id, effective_date, rate, source_url, scraped_at
+  from public.electricity_rates
+ where provider_id = %s and customer_class = 'residential' and effective_date <= %s
+ order by effective_date desc limit 1
+"""
+FIRST_SCHEDULE_SQL = """
+select id, provider_id, effective_date, rate, source_url, scraped_at
+  from public.electricity_rates
+ where provider_id = %s and customer_class = 'residential'
+ order by effective_date asc limit 1
+"""
+TIERS_SQL = """
+select consumption_kwh, rate_per_kwh from public.electricity_rate_tiers
+ where rate_id = %s order by consumption_kwh
+"""
+
+
+def _manila_months() -> tuple[dt.date, dt.date, dt.date]:
+    """(today, first day of this Manila month, first day of the previous one)."""
+    today = dt.datetime.now(PHT).date()
+    cur = today.replace(day=1)
+    prev = (cur - dt.timedelta(days=1)).replace(day=1)
+    return today, cur, prev
+
+
+def _rates_overview(conn: psycopg.Connection) -> Dict[str, Any]:
+    """Per DU: active stations, the latest schedule and when it was scraped,
+    for the Health tab. Freshness: 'current' = a rate for this Manila month,
+    'previous' = last month's (normal until the scrape runs, around month
+    end), 'stale' = older, 'none' = no rate at all."""
+    today, cur, prev = _manila_months()
+    providers = []
+    for r in conn.execute(RATES_OVERVIEW_SQL).fetchall():
+        r = dict(r)
+        lm = r["latest_month"]
+        r["freshness"] = ("none" if lm is None else "current" if lm >= cur
+                          else "previous" if lm >= prev else "stale")
+        providers.append(r)
+    without = conn.execute(NO_PROVIDER_SQL).fetchall()
+    return {"providers": providers, "without_provider": without,
+            "month_current": cur, "month_previous": prev, "today": today}
+
+
+def _station_rate(conn: psycopg.Connection, provider_id: Optional[int], system_id: uuid.UUID) -> Dict[str, Any]:
+    """The tariff the customer portal prices this station's savings with, for
+    the previous and the current Manila month — the same rule as the portal's
+    savings.ts: the schedule in force (latest effective_date on or before the
+    month; a month before the DU's first schedule uses that first one, marked
+    estimated; a station without a provider, or a DU with no rates at all,
+    uses MERALCO, marked estimated). With tiers, the rate of the smallest
+    level at or above the month's total consumption (production when
+    consumption is unknown), the top level above it; the current month is
+    projected to a full month from the month-to-date figure. Flat otherwise.
+    `savings_php` = production × that rate, what the app shows for the month
+    (the app adds today's live production, so it can be a little higher)."""
+    today, cur, prev = _manila_months()
+    pid = provider_id if provider_id is not None else FALLBACK_PROVIDER_ID
+    fallback = provider_id is None
+    if not fallback and conn.execute(FIRST_SCHEDULE_SQL, (pid,)).fetchone() is None:
+        pid, fallback = FALLBACK_PROVIDER_ID, True
+    months = {r["month_start"]: dict(r) for r in conn.execute(STATION_MONTHS_SQL, (system_id, prev)).fetchall()}
+    out = []
+    for m in (prev, cur):
+        sched = conn.execute(SCHEDULE_SQL, (pid, m)).fetchone()
+        before_first = sched is None
+        if before_first:
+            sched = conn.execute(FIRST_SCHEDULE_SQL, (pid,)).fetchone()
+        data = months.get(m) or {}
+        cons = float(data.get("consumption_kwh") or 0)
+        prod = float(data.get("production_kwh") or 0)
+        basis = cons or prod or 0.0
+        basis_source = "consumption" if cons else "production" if prod else None
+        projected = False
+        if m == cur and basis and today.day < calendar.monthrange(cur.year, cur.month)[1]:
+            basis = basis / today.day * calendar.monthrange(cur.year, cur.month)[1]
+            projected = True
+        entry: Dict[str, Any] = {
+            "month": m, "days": data.get("days") or 0,
+            "consumption_kwh": cons, "production_kwh": prod,
+            "basis_kwh": basis, "basis_source": basis_source, "projected": projected,
+            "schedule": None, "tiers": [], "level_kwh": None, "rate_per_kwh": None,
+            "tiered": False, "before_first_schedule": before_first, "savings_php": None,
+        }
+        if sched is not None:
+            tiers = [dict(t) for t in conn.execute(TIERS_SQL, (sched["id"],)).fetchall()]
+            entry["schedule"] = dict(sched)
+            entry["tiers"] = tiers
+            rate = float(sched["rate"])
+            if tiers and basis > 0:
+                level = next((t for t in tiers if float(t["consumption_kwh"]) >= basis), tiers[-1])
+                rate = float(level["rate_per_kwh"])
+                entry["level_kwh"] = float(level["consumption_kwh"])
+                entry["tiered"] = True
+            entry["rate_per_kwh"] = rate
+            entry["savings_php"] = round(prod * rate, 2)
+        out.append(entry)
+    return {"provider_id": pid, "estimated": fallback, "fallback_provider": fallback, "months": out}
+
+
 @router.get("/api/health")
 async def health(authorization: str = Header(None)):
     """Feed freshness and worker activity for the Health tab (migration 23):
@@ -277,8 +435,15 @@ async def health(authorization: str = Header(None)):
                      from public.solis_forward_messages where received_at > now() - interval '1 hour'""").fetchone())
         except Exception as exc:
             forward = {"error": str(exc)[:120]}
+        # DU rates: what the portal prices savings with, and whether the scrape
+        # still delivers. Read-only (see the DU rates section above).
+        try:
+            rates = _rates_overview(conn)
+        except Exception as exc:
+            rates = {"error": str(exc)[:160]}
     return _j({
         "forward": forward,
+        "rates": rates,
         "now": dt.datetime.now(dt.timezone.utc),
         "five_minute": dict(five), "hourly": dict(hourly), "daily": dict(daily),
         "last_runs": last_runs, "recent_runs": recent,
@@ -395,9 +560,15 @@ async def row_detail(system_id: uuid.UUID, authorization: str = Header(None)):
         # station: the same heuristic the tab uses, for this one row, so the
         # drawer can spell the reasons out next to the plant fields.
         suspect_row = conn.execute(SUSPECT_SQL + " and s.id = %s", (system_id,)).fetchone()
+        # The tariff the portal prices this station with (read-only; the
+        # drawer shows it under the Lead block's Electricity provider).
+        try:
+            rate = _station_rate(conn, row["electricity_provider_id"], system_id)
+        except Exception as exc:
+            rate = {"error": str(exc)[:160]}
     wrong = _wrong_station_signals(suspect_row) if suspect_row else None
     return {"row": _j(row), "other_systems": _j(siblings), "audit": _j(audit), "jobs": _j(jobs),
-            "wrong_station": wrong}
+            "wrong_station": wrong, "rate": _j(rate)}
 
 
 # ---------------------------------------------------------------------------

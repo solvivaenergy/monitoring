@@ -433,6 +433,33 @@ async function refreshFrom(src, boxId, r){
     if (keys.length) loadRows(true);
   } catch (e) { box.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
 }
+// The DU tariff the customer app prices this station's savings with, for last
+// month and this month (GET /api/rows/{id} → rate). Read-only: the DU-rate
+// scrape owns electricity_rates / electricity_rate_tiers; the app's rule is
+// in CustomerPortal src/lib/savings.ts and the server mirrors it.
+const kwh = (n, d=1) => { if (n == null) return '—'; const v = Number(n); if (v > 0 && v < 10) d = 2; return v.toLocaleString('en-PH', {maximumFractionDigits:d, minimumFractionDigits:d}); };
+const php = (n, d=2) => n == null ? '—' : '₱' + Number(n).toLocaleString('en-PH', {maximumFractionDigits:d, minimumFractionDigits:d});
+const monthName = (ym) => new Date(ym + 'T00:00:00').toLocaleDateString('en-PH', {month:'long', year:'numeric'});
+function rateBlock(x, r){
+  if (!x) return '<span class="muted">—</span>';
+  if (x.error) return `<span class="tag warn">unavailable</span> ${esc(x.error)}`;
+  const du = r.electricity_provider_code || 'MERALCO';
+  const lines = (x.months||[]).map(m => {
+    const s = m.schedule;
+    if (!s) return `<div><b>${esc(monthName(m.month))}</b> — <span class="tag bad">no schedule</span> no rate stored for ${esc(du)}; the app shows ₱0 for this month.</div>`;
+    const src = s.source_url ? (/^https?:/.test(s.source_url) ? `<a href="${esc(s.source_url)}" target="_blank" rel="noopener">source</a>` : esc(s.source_url)) : 'source not recorded';
+    const basis = m.basis_source
+      ? `${kwh(m.basis_kwh)} kWh ${m.basis_source}${m.projected ? ' (month to date projected to a full month)' : ''}`
+      : 'no consumption or production stored yet';
+    const price = m.tiered
+      ? `tiered — basis ${basis} → level ${kwh(m.level_kwh, 0)} kWh → <b>${php(m.rate_per_kwh, 4)}/kWh</b>`
+      : `flat <b>${php(m.rate_per_kwh, 4)}/kWh</b>${m.tiers && m.tiers.length ? ' (tiered schedule, but no consumption or production stored for the month yet, so the flat rate applies)' : ''}`;
+    const est = m.before_first_schedule ? ` <span class="tag warn" title="This month is before the DU's first stored schedule; the app uses the first one and marks it estimated">before first schedule</span>` : '';
+    return `<div><b>${esc(monthName(m.month))}</b> — schedule of ${esc(monthName(s.effective_date))}, scraped ${fmtDate(s.scraped_at)}, ${src}: ${price}${est}<br><span class="muted">production ${kwh(m.production_kwh)} kWh over ${m.days} day${m.days===1?'':'s'} ≈ <b>${php(m.savings_php, 0)}</b> savings in the app${m.month===x.months[x.months.length-1].month ? ' so far (the app adds today\'s live production)' : ''}</span></div>`;
+  }).join('');
+  const fb = x.fallback_provider ? `<div class="hint" style="margin-top:4px"><span class="tag warn">estimated</span> ${r.electricity_provider_code ? `${esc(r.electricity_provider_code)} has no rates stored, so` : 'No provider on this station, so'} the app prices it as MERALCO and labels the figure “estimated”. ${r.electricity_provider_code ? 'The DU-rate scrape needs this DU added.' : 'Sales sets the Electricity Provider on the Odoo lead; the nightly sync copies it.'}</div>` : '';
+  return lines + fb + `<div class="hint" style="margin-top:4px">Read-only. The DU-rate scrape fills <span class="mono">electricity_rates</span> (one residential ₱/kWh per DU and month) and <span class="mono">electricity_rate_tiers</span> (MERALCO's consumption levels) monthly; a wrong rate is fixed there, not per station. Every stored rate is residential — SME customers are priced at residential rates for now. Fleet view: <b>Health</b> → <i>DU rates</i>.</div>`;
+}
 // Why (if at all) this record is listed under Unresolved → Possible wrong
 // station: the server sends the same signals the tab shows, for this one row.
 function wrongStationBox(r, w){
@@ -509,6 +536,7 @@ async function openPanel(systemId, opts={}){
       ${field('Lead email','odoo_lead_email',r.odoo_lead_email,'email','form="f-system"','Odoo')}
       ${field('Stage','odoo_stage',r.odoo_stage,'text','form="f-system"','Odoo')}
       <div class="ro"><label>Electricity provider<span class="src odoo">Odoo</span></label><div class="val" title="The utility whose tariff this plant offsets — per station, from the lead's Electricity Provider field. The monthly performance views price this station with it. Blank = the lead has no provider; sales fills it in Odoo and the nightly sync (or Refresh from Odoo now) copies it.">${r.electricity_provider_code ? `${esc(r.electricity_provider_code)} <span class="muted">— ${esc(r.electricity_provider_name||'')}</span>` : '<span class="muted">— none on the lead yet</span>'}</div></div>
+      <div class="ro" style="grid-column:1/-1"><label>Tariff the customer app prices savings with<span class="src supabase">Supabase</span></label><div class="val" style="white-space:normal">${rateBlock(d.rate, r)}</div></div>
     </div>
     <div class="row" style="margin-top:8px">
       <button class="btn sm" data-validate="lead" ${r.odoo_lead_id?'':'disabled'}>Validate Odoo lead</button>
@@ -1012,7 +1040,13 @@ async function loadHealth(){
         ${tile(inst ? `${inst.db_size_mb} MB` : 'n/a', `database · size (WAL ${inst ? inst.wal_size_mb : '?'} MB, data disk ${inst ? inst.data_disk_free_gb : '?'} of ${inst ? inst.data_disk_total_gb : '?'} GB free)`)}
         ${(() => { const f = h.forward || {}; const n = f.messages_hour || 0; const age = ageMin(f.newest_received_at, now);
                    return tile(f.error ? 'n/a' : `${n} / ${f.collectors_hour || 0}`, `Solis forwarding (test) · messages / loggers in the last hour${f.newest_device_time ? ', newest device time ' + fmtTs(f.newest_device_time) : ''}`, f.error ? 'warn' : n === 0 ? '' : cls(age, 10, 20)); })()}
+        ${(() => { const x = h.rates || {}; if (x.error) return tile('n/a', 'DU rates · unavailable', 'warn');
+                   const ps = x.providers || [], used = ps.filter(p => p.active_stations > 0);
+                   const stale = used.filter(p => p.freshness === 'stale' || p.freshness === 'none').length;
+                   const fresh = used.filter(p => p.freshness === 'current').length;
+                   return tile(`${used.length - stale} / ${used.length}`, `DU rates · DUs in use with this or last month's rate (${fresh} already have ${monthName(x.month_current)}; ${(x.without_provider||[]).length} stations without a DU)`, stale ? 'bad' : ''); })()}
       </div>
+      ${ratesPanel(h.rates)}
       ${h.instance_error ? `<p class="hint">Database tiles unavailable: ${esc(h.instance_error)}</p>` : ''}
       <p class="hint">The three <b>database</b> tiles read the Supabase instance itself (memory, swap, disk), cached a minute. Free memory shrinking and swap filling are the early signs that the compute tier is too small — that, not disk traffic, is what triggered Supabase's "Disk IO Budget" mail in September 2026 on the Nano tier. The worker alerts on the same thresholds (webhook + e-mail + a failed <b>health</b> run below); the next step when they trip is Supabase compute Medium.</p>
       <div class="card sect"><h3 style="margin-top:0">Last run of each task</h3>
@@ -1029,9 +1063,27 @@ async function loadHealth(){
         <table><thead><tr><th>Partition</th><th>Size</th></tr></thead><tbody>
         ${(h.five_minute_partitions||[]).map(p => `<tr><td class="mono">${esc(p.relname)}</td><td>${esc(p.size)}</td></tr>`).join('')}
         </tbody></table></div>`;
+    $$('#view-health [data-open]').forEach(a => a.onclick = e => { e.preventDefault(); openPanel(a.dataset.open); });
   } catch (e) { el.innerHTML = `<p class="tag bad">${esc(e.message)}</p>`; }
 }
 
+// Health → DU rates: per DU the latest schedule the scrape delivered and the
+// stations it prices; read-only (the scrape owns the tables, see rateBlock).
+function ratesPanel(x){
+  if (!x) return '';
+  if (x.error) return `<div class="card sect"><h3 style="margin-top:0">DU rates</h3><p class="tag warn">unavailable</p> <span class="muted">${esc(x.error)}</span></div>`;
+  const chip = p => p.freshness === 'current' ? `<span class="tag ok">this month</span>`
+    : p.freshness === 'previous' ? `<span class="tag" title="Normal until the scrape runs for this month (around month end; MERALCO's bill PDF appears about the 10th)">last month</span>`
+    : p.freshness === 'stale' ? `<span class="tag bad">stale</span>` : `<span class="tag bad">no rates</span>`;
+  const src = p => !p.source_url ? '<span class="muted">not recorded</span>' : /^https?:/.test(p.source_url) ? `<a href="${esc(p.source_url)}" target="_blank" rel="noopener">${esc(p.source_url.replace(/^https?:\/\/([^/]+).*$/, '$1'))}</a>` : esc(p.source_url);
+  const rows = (x.providers||[]).map(p => `<tr><td><b>${esc(p.code)}</b> <span class="muted">${esc(p.name||'')}</span></td><td>${p.active_stations}</td><td>${p.latest_month ? monthName(p.latest_month) : '—'} ${chip(p)}</td><td>${p.latest_rate != null ? php(p.latest_rate, 4) : '—'}</td><td>${p.tiers ? `${p.tiers} levels, ${php(p.tier_min, 4)}–${php(p.tier_max, 4)}` : '<span class="muted">flat</span>'}</td><td class="wrap">${src(p)}</td><td>${p.latest_scraped_at ? fmtTs(p.latest_scraped_at) : '—'}</td><td>${p.months}${p.first_month ? ` <span class="muted">since ${monthName(p.first_month)}</span>` : ''}</td></tr>`).join('');
+  const w = x.without_provider || [];
+  return `<div class="card sect"><h3 style="margin-top:0">DU rates <span class="muted">— what the customer app prices savings with</span></h3>
+    <p class="hint">One residential ₱/kWh per DU and month from the DU-rate scrape (ICSC presyo for the cooperatives, MERALCO's residential bill PDF with its 15 consumption levels), written outside this admin. A month's rate normally lands around month end, so <i>last month</i> is fine until then; <b>stale</b> or <b>no rates</b> means the scrape missed a DU and the app keeps pricing with the old schedule. Every row is residential — there is no SME schedule yet. The per-station figure is in each record under Lead → <i>Tariff the customer app prices savings with</i>.</p>
+    <table><thead><tr><th>DU</th><th>Active stations</th><th>Latest month</th><th>₱/kWh</th><th>Tiers</th><th>Source</th><th>Scraped</th><th>Months stored</th></tr></thead><tbody>${rows || '<tr><td colspan=8 class="muted">no providers</td></tr>'}</tbody></table>
+    <p class="hint" style="margin-top:8px"><b>${w.length} active station${w.length===1?'':'s'} without a DU</b>${w.length ? ' — priced as MERALCO and labelled “estimated” in the app until sales sets the Electricity Provider on the Odoo lead: ' + w.map(s => `<a href="#" data-open="${esc(s.system_id)}">${esc(s.full_name || s.system_name || s.solis_station_id || '?')}</a>${s.odoo_lead_id ? ` <span class="muted">(lead ${s.odoo_lead_id})</span>` : ' <span class="muted">(no lead)</span>'}`).join(', ') : '.'}</p>
+  </div>`;
+}
 // Odoo helpdesk tickets for the dark list — filled after the page renders so
 // an Odoo hiccup never blanks the Unresolved tab (same shape as fillSuggestions).
 async function fillHelpdesk(){
@@ -1180,6 +1232,9 @@ function loadGuide(){
 
     <h3>8. Is the data flowing? (Health tab)</h3>
     <p>The <b>Health</b> tab shows how old the newest five-minute point is (green under 20 minutes), the last hour rolled up, the newest daily row, the backfill queue, and the last run of every worker task with its outcome. One always-on worker runs all the pipelines (five-minute loop, nightly chain at 02:00, monthly re-read on the 1st, backfill jobs); when the five-minute feed is more than 30 minutes stale it alerts the team by webhook/email and again when it recovers. Red tile = look at the worker's logs in Render first, then at Solis Cloud's own status.</p>
+
+    <h3>9. "Why does my app say ₱X savings?" (DU rates)</h3>
+    <p>Open the station → Lead block → <b>Tariff the customer app prices savings with</b>. It shows, for last month and this month, the DU schedule in force (month, when it was scraped, source), the ₱/kWh the app applies and how it got there — for MERALCO the month's total consumption picks one of 15 consumption levels and that level's rate prices every kWh of the month, the way MERALCO bills; the other DUs are flat — and the month's production × that rate, which is the savings figure in the app. The current month is projected to a full month from the month-to-date consumption so the level does not reset to the cheapest on the 1st. A station without a provider is priced as MERALCO and labelled "estimated" in the app; sales fixes that on the Odoo lead. The rates themselves are <b>read-only here</b>: the DU-rate scrape fills them monthly from ICSC presyo and MERALCO's bill PDF, and the <b>Health</b> tab's <i>DU rates</i> table shows whether every DU has a recent schedule — <b>stale</b> or <b>no rates</b> means the scrape missed that DU and the app is pricing with an old month. Every stored rate is residential; SME customers get residential rates until an SME schedule exists.</p>
 
     <h3>Roles</h3>
     <p><b>readonly</b> sees everything; <b>engineer</b> can edit, remap, add stations and queue backfills; <b>admin</b> also manages staff. Admins add colleagues in <b>Staff</b> — a solvivaenergy.com Google account signs in directly once added.</p>
