@@ -263,6 +263,7 @@ hist as (
     from public.electricity_rates where customer_class = 'residential' group by 1)
 select ep.id as provider_id, ep.code, ep.name,
        coalesce(st.active_stations, 0) as active_stations,
+       l.id as latest_rate_id,
        l.effective_date as latest_month, l.rate as latest_rate, l.source_url, l.scraped_at as latest_scraped_at,
        coalesce(t.n, 0) as tiers, t.lo as tier_min, t.hi as tier_max,
        coalesce(h.months, 0) as months, h.first_month, h.last_scraped
@@ -327,6 +328,10 @@ def _rates_overview(conn: psycopg.Connection) -> Dict[str, Any]:
         lm = r["latest_month"]
         r["freshness"] = ("none" if lm is None else "current" if lm >= cur
                           else "previous" if lm >= prev else "stale")
+        # The latest schedule's levels (MERALCO's 15), so the tab can show the
+        # whole tiering, not just its range.
+        r["tier_list"] = ([dict(t) for t in conn.execute(TIERS_SQL, (r["latest_rate_id"],)).fetchall()]
+                          if r["tiers"] else [])
         providers.append(r)
     without = conn.execute(NO_PROVIDER_SQL).fetchall()
     return {"providers": providers, "without_provider": without,
