@@ -440,9 +440,10 @@ async function refreshFrom(src, boxId, r){
 const kwh = (n, d=1) => { if (n == null) return '—'; const v = Number(n); if (v > 0 && v < 10) d = 2; return v.toLocaleString('en-PH', {maximumFractionDigits:d, minimumFractionDigits:d}); };
 const php = (n, d=2) => n == null ? '—' : '₱' + Number(n).toLocaleString('en-PH', {maximumFractionDigits:d, minimumFractionDigits:d});
 const monthName = (ym) => new Date(ym + 'T00:00:00').toLocaleDateString('en-PH', {month:'long', year:'numeric'});
-// "≤50 kWh ₱15.1033 · ≤100 kWh ₱15.0973 · …", the chosen level in bold.
-const tierList = (tiers, chosen) => (tiers||[]).map(t => { const hit = chosen != null && Number(t.consumption_kwh) === Number(chosen);
-  return `${hit?'<b>':''}≤${kwh(t.consumption_kwh, 0)} kWh ${php(t.rate_per_kwh, 4)}${hit?'</b>':''}`; }).join(' · ');
+// One level per line, kWh right-aligned against the rate; the chosen level in bold.
+const tierList = (tiers, chosen) => `<div style="display:inline-grid;grid-template-columns:auto auto;column-gap:12px;row-gap:2px">${(tiers||[]).map(t => {
+  const hit = chosen != null && Number(t.consumption_kwh) === Number(chosen), w = s => hit ? `<b>${s}</b>` : s;
+  return `<span style="text-align:right;white-space:nowrap">${w('≤ ' + kwh(t.consumption_kwh, 0) + ' kWh')}</span><span style="white-space:nowrap">${w(php(t.rate_per_kwh, 4))}</span>`; }).join('')}</div>`;
 function rateBlock(x, r){
   if (!x) return '<span class="muted">—</span>';
   if (x.error) return `<span class="tag warn">unavailable</span> ${esc(x.error)}`;
