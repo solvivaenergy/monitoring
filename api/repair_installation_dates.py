@@ -10,14 +10,20 @@ stations began later than Solis, 7,110 station-days missing, 13 stations by
 more than 90 days (Cabrales 375). Solis still serves those months (Manalo's
 April 2026 = 477 kWh), so the history is recoverable.
 
-For every active station with a Solis id whose installation_date is LATER than
+For every active station with a Solis id whose installation_date differs from
 Solis's first-generation day:
-  * installation_date := Solis's day (never moved later — a date an engineer
-    set earlier on purpose stays), and
-  * when the station's oldest stored day is after that day, one DAILY backfill
-    job for [Solis's day, oldest stored day − 1] (stationMonth per month, the
-    ordinary backfill worker drains it; a station with a daily job already
-    active is skipped, not failed).
+  * LATER than Solis's day (the history was clipped): installation_date :=
+    Solis's day, and when the station's oldest stored day is after that day,
+    one DAILY backfill job for [Solis's day, oldest stored day − 1]
+    (stationMonth per month, the ordinary backfill worker drains it; a station
+    with a daily job already active is skipped, not failed).
+  * EARLIER than Solis's day (the placeholder landed before the plant existed,
+    e.g. Maria Cecilia Hufana: 2026-07-18 vs Solis 2026-09-14): installation_date
+    := Solis's day only when no stored reading precedes Solis's day, so a date
+    that a reading backs — or that an engineer set — is never overwritten.
+    Nothing to queue.
+Re-runnable: each pass recomputes from the stored data and queues only what is
+still missing (e.g. a month Solis answered with a 502 inside a "succeeded" job).
 
 Reads: the Solis roster (8 calls) and one DB query. Writes: through db.audited,
 source 'fleet_script', one request id for the batch.
@@ -51,7 +57,10 @@ select s.id as system_id, s.solis_station_id, s.system_name, s.installation_date
        min((r."timestamp" at time zone 'Asia/Manila')::date) as first_day,
        exists (select 1 from public.backfill_jobs j
                 where j.system_id = s.id and j.granularity = 'daily'
-                  and j.status in ('queued', 'running')) as busy
+                  and j.status in ('queued', 'running')) as busy,
+       (select j.error from public.backfill_jobs j
+         where j.system_id = s.id and j.granularity = 'daily' and j.status in ('succeeded', 'failed')
+         order by j.finished_at desc nulls last limit 1) as last_job_error
   from public.solar_systems s
   left join public.energy_readings r on r.system_id = s.id
  where s.status = 'active' and s.solis_station_id is not null
@@ -103,14 +112,31 @@ async def plan() -> Dict:
             no_solis_date += 1
             continue
         current = r["installation_date"]
-        if current is not None and current <= solis_first:
-            continue  # already at or before Solis's day: leave it
-        moves.append({"system_id": r["system_id"], "name": r["system_name"], "station_id": r["solis_station_id"],
-                      "from": current, "to": solis_first})
         first_day = r["first_day"]
+        direction = None
+        if current is None or current > solis_first:
+            direction = "earlier"
+        elif current < solis_first:
+            # Earlier than Solis's first generation. A placeholder in this
+            # direction costs no data, so it is moved only when nothing backs
+            # it: no stored day before Solis's day (67 stations on 2026-10-16,
+            # every one exactly onboarding − 60 days). The 248 stations that
+            # hold zero-production rows from before Solis's day are left alone.
+            if first_day is None or first_day >= solis_first:
+                direction = "later"
+        if direction:
+            moves.append({"system_id": r["system_id"], "name": r["system_name"], "station_id": r["solis_station_id"],
+                          "from": current, "to": solis_first, "direction": direction})
+        # History before the first stored day: when the date moves earlier (the
+        # clipped case), or when the station's last daily job left a note (a
+        # month Solis answered with a 502/timeout inside a "succeeded" job, or
+        # a failed job) — that is what a re-run picks up. A station whose
+        # history simply starts after Solis's day with no such note had those
+        # days fetched already and Solis had nothing: not re-fetched.
+        wants_job = direction == "earlier" or r["last_job_error"] is not None
         job_from, job_to = solis_first, (first_day - timedelta(days=1)) if first_day else yesterday
-        if job_to < job_from:
-            continue  # history already reaches back to Solis's day
+        if not wants_job or job_to < job_from:
+            continue
         if r["busy"]:
             busy += 1
             continue
@@ -130,7 +156,13 @@ def main() -> None:
     p = asyncio.run(plan())
     moves, jobs = p["moves"], p["jobs"]
     print(f"active stations with a Solis id: {p['stations']}  (not in roster: {p['not_in_roster']}, no Solis first-generation date: {p['no_solis_date']})")
-    print(f"installation_date to move earlier: {len(moves)}")
+    earlier = sum(1 for m in moves if m["direction"] == "earlier")
+    print(f"installation_date to move: {len(moves)}  (earlier: {earlier}, later: {len(moves) - earlier})")
+    later = [m for m in moves if m["direction"] == "later"]
+    if later:
+        print("later, examples:")
+        for m in sorted(later, key=lambda m: m["from"])[:5]:
+            print(f"  {str(m['name'])[:40]:40} {m['from']} → {m['to']}")
     print(f"daily history jobs to queue: {len(jobs)}  (skipped, daily job already active: {p['busy']})")
     print(f"station-days to fetch: {sum(j['days'] for j in jobs)}  stationMonth calls: {sum(j['months'] for j in jobs)}")
     if jobs:
@@ -143,7 +175,7 @@ def main() -> None:
 
     request_id = str(uuid.uuid4())
     reason = ("installation date moved to Solis's first-generation day (fisGenerateTime); onboarding had stored "
-              "'onboarding night minus 60 days' and started the history there — repair 2026-10-16")
+              "'onboarding night minus 60 days' (earlier or later than the plant's first generation) — repair 2026-10-16")
     with db.audited(None, None, reason, source="fleet_script", request_id=request_id) as conn:
         with conn.cursor() as cur:
             cur.executemany(

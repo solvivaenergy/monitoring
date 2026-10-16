@@ -249,6 +249,21 @@ def _queue_missing_history(sb: Client, system_id: str, station_id: str, first_ge
         log.warning("history job for station %s not queued: %s", station_id, str(exc)[:120])
 
 
+def _no_reading_before(sb: Client, system_id: str, day: date) -> bool:
+    """True when the station has no daily row before Manila midnight of `day`
+    (rows sit at noon Manila = 04:00Z, so "before day" is < day-1 16:00Z).
+    On a query error, False: never move a date on a guess."""
+    try:
+        before = (
+            sb.table("energy_readings").select("timestamp").eq("system_id", system_id)
+            .lt("timestamp", f"{(day - timedelta(days=1)).isoformat()}T16:00:00+00:00").limit(1).execute()
+        ).data
+        return not before
+    except Exception as exc:
+        log.warning("oldest-reading check for %s failed: %s", system_id, str(exc)[:120])
+        return False
+
+
 def _reread_dates(now: datetime, days: int) -> List[str]:
     """Today and the `days` days before it, newest first, as YYYY-MM-DD.
 
@@ -424,15 +439,20 @@ async def sync_once(solis: SolisCloudClient, sb: Client, dry_run: bool = False) 
                 # stations began up to 375 days after Solis's first generation.
                 # Now the date moves EARLIER to Solis's day whenever ours is
                 # later, and the days before the first stored one are queued as
-                # a daily backfill, so a gap heals by itself. Never moved later:
-                # a date an engineer set earlier on purpose stays. Weekly for
-                # everyone, nightly for new stations (see _wants_metadata).
+                # a daily backfill, so a gap heals by itself. A date EARLIER
+                # than Solis's day (the same placeholder, for a plant energised
+                # after it — 67 stations on 2026-10-16) moves later only when no
+                # stored reading precedes Solis's day, so a date that a reading
+                # backs, or that an engineer set, is never overwritten. Weekly
+                # for everyone, nightly for new stations (see _wants_metadata).
                 current_install = str(station_row.get("installation_date") or "")[:10]
                 first_gen = first_generation_date(station)
                 if first_gen and (not current_install or current_install > first_gen.isoformat()):
                     update_payload["installation_date"] = first_gen.isoformat()
                     if not dry_run:
                         _queue_missing_history(sb, system_id, station_id, first_gen)
+                elif first_gen and current_install < first_gen.isoformat() and _no_reading_before(sb, system_id, first_gen):
+                    update_payload["installation_date"] = first_gen.isoformat()
                 elif not first_gen and current_install and current_install >= (now - timedelta(days=30)).strftime("%Y-%m-%d"):
                     # No Solis date: a placeholder set within the last month
                     # falls back to this STATION's own oldest reading (keyed on
