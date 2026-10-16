@@ -38,6 +38,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List
@@ -58,15 +59,36 @@ select s.id as system_id, s.solis_station_id, s.system_name, s.installation_date
        exists (select 1 from public.backfill_jobs j
                 where j.system_id = s.id and j.granularity = 'daily'
                   and j.status in ('queued', 'running')) as busy,
-       (select j.error from public.backfill_jobs j
-         where j.system_id = s.id and j.granularity = 'daily' and j.status in ('succeeded', 'failed')
-         order by j.finished_at desc nulls last limit 1) as last_job_error
+       lj.error as last_job_error, lj.date_from as last_job_from, lj.date_to as last_job_to
   from public.solar_systems s
+  left join lateral (
+       select j.error, j.date_from, j.date_to from public.backfill_jobs j
+        where j.system_id = s.id and j.granularity = 'daily' and j.status in ('succeeded', 'failed')
+        order by j.finished_at desc nulls last limit 1) lj on true
   left join public.energy_readings r on r.system_id = s.id
  where s.status = 'active' and s.solis_station_id is not null
- group by 1, 2, 3, 4
+ group by 1, 2, 3, 4, lj.error, lj.date_from, lj.date_to
  order by s.system_name
 """
+
+MONTH_NOTE = re.compile(r"(\d{4})-(\d{2}):")
+
+
+def noted_months_range(error: str | None, job_from: date | None, job_to: date | None):
+    """The span of the months a daily job's note names ("2026-04: 502; 2026-05: ")
+    — the months Solis did not answer — clipped to that job's own range. None
+    when the note names no month."""
+    if not error or not job_from or not job_to:
+        return None
+    months = sorted({(int(y), int(m)) for y, m in MONTH_NOTE.findall(error)})
+    if not months:
+        return None
+    y0, m0 = months[0]
+    y1, m1 = months[-1]
+    first = date(y0, m0, 1)
+    last = (date(y1 + 1, 1, 1) if m1 == 12 else date(y1, m1 + 1, 1)) - timedelta(days=1)
+    lo, hi = max(first, job_from), min(last, job_to)
+    return (lo, hi) if lo <= hi else None
 
 
 async def fetch_roster(solis: SolisCloudClient) -> Dict[str, dict]:
@@ -127,16 +149,26 @@ async def plan() -> Dict:
         if direction:
             moves.append({"system_id": r["system_id"], "name": r["system_name"], "station_id": r["solis_station_id"],
                           "from": current, "to": solis_first, "direction": direction})
-        # History before the first stored day: when the date moves earlier (the
-        # clipped case), or when the station's last daily job left a note (a
-        # month Solis answered with a 502/timeout inside a "succeeded" job, or
-        # a failed job) — that is what a re-run picks up. A station whose
-        # history simply starts after Solis's day with no such note had those
-        # days fetched already and Solis had nothing: not re-fetched.
-        wants_job = direction == "earlier" or r["last_job_error"] is not None
-        job_from, job_to = solis_first, (first_day - timedelta(days=1)) if first_day else yesterday
-        if not wants_job or job_to < job_from:
+        # What to fetch: the history before the first stored day when the date
+        # moves earlier (the clipped case), and/or the months the station's
+        # last daily job could not get (Solis 502/timeout inside a "succeeded"
+        # job, or a failed job — the note names them, and they may sit in the
+        # middle of the history). That is what a re-run picks up. A station
+        # whose history simply starts after Solis's day with no such note had
+        # those days fetched already and Solis had nothing: not re-fetched.
+        ranges = []
+        if direction == "earlier":
+            ranges.append((solis_first, (first_day - timedelta(days=1)) if first_day else yesterday))
+        noted = noted_months_range(r["last_job_error"], r["last_job_from"], r["last_job_to"])
+        if noted:
+            ranges.append(noted)
+        elif r["last_job_error"] is not None and direction != "earlier":
+            # a note without a month (e.g. "system has no Solis station id"): fetch before the first day
+            ranges.append((solis_first, (first_day - timedelta(days=1)) if first_day else yesterday))
+        ranges = [(lo, min(hi, yesterday)) for lo, hi in ranges if lo <= min(hi, yesterday)]
+        if not ranges:
             continue
+        job_from, job_to = min(lo for lo, _ in ranges), max(hi for _, hi in ranges)
         if r["busy"]:
             busy += 1
             continue
@@ -169,7 +201,7 @@ def main() -> None:
         print("\nlargest 15:")
         for j in sorted(jobs, key=lambda j: -j["days"])[:15]:
             print(f"  {str(j['name'])[:40]:40} {j['date_from']} → {j['date_to']}  {j['days']:>4} day(s), {j['months']:>2} call(s)")
-    if args.dry_run or not moves:
+    if args.dry_run or not (moves or jobs):
         print("\ndry run — nothing written" if args.dry_run else "\nnothing to do")
         return
 
