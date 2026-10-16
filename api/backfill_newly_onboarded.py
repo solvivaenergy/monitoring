@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 from supabase import Client, create_client
 
 from api.backfill_history import parse_month_day, sb_batch_upsert
-from api.solis_client import SolisCloudClient, SolisCloudError
+from api.solis_client import SolisCloudClient, SolisCloudError, first_generation_date
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -151,7 +151,15 @@ async def backfill_station_ids(
     apply: bool = False,
     skip_users_with_readings: bool = True,
 ) -> Dict[str, int]:
-    """Backfill up to `days` of daily history for the given station IDs.
+    """Backfill the daily history of the given station IDs, from the day Solis
+    says each plant first generated (stationDetail's fisGenerateTime).
+
+    `days` is only the FALLBACK window, used when Solis has no first-generation
+    date. Until 2026-10-16 it was the start for everyone, and the row's
+    installation_date was set to "tonight minus `days`": 194 stations began
+    their history on that placeholder, up to 375 days after Solis's first
+    generation (7,110 station-days missing). A row that already exists with a
+    later installation_date is moved to Solis's date here as well.
 
     Targets only user_profiles mapped to those stations; by default skips users
     that already have any energy_readings. Reuses the same parse/consumption
@@ -219,7 +227,7 @@ async def backfill_station_ids(
     counters["users"] = len(target_users)
     solis_sem = asyncio.Semaphore(SOLIS_CONCURRENCY)
     today = datetime.now(PHT).date()
-    start_date = today - timedelta(days=days)
+    fallback_start = today - timedelta(days=days)
 
     for user in target_users:
         uid = str(user["id"])
@@ -228,15 +236,31 @@ async def backfill_station_ids(
         system = sys_by_station.get(station_id)
         system_id = system.get("id") if system else None
 
-        if not system_id:
+        # One stationDetail per station: its name and capacity for a new row,
+        # and fisGenerateTime, the day the plant first generated, which is
+        # where its history starts.
+        try:
+            detail = await solis.station_detail(station_id)
+        except Exception as exc:
+            detail = None
+            log.warning("backfill: station detail failed for %s: %s", name, exc)
+        counters["api_calls"] += 1
+        first_gen = first_generation_date(detail)
+        current_install = None
+        if system and system.get("installation_date"):
             try:
-                detail = await solis.station_detail(station_id)
-                station_name = detail.get("stationName") or station_id
-                capacity = float(detail.get("capacity") or 0)
-            except Exception as exc:
-                log.error("backfill: station detail failed for %s: %s", name, exc)
+                current_install = datetime.fromisoformat(str(system["installation_date"])[:10]).date()
+            except ValueError:
+                current_install = None
+        start_date = first_gen or current_install or fallback_start
+
+        if not system_id:
+            if not isinstance(detail, dict) or not detail:
+                log.error("backfill: no station detail for %s — cannot create its solar_systems row", name)
                 counters["errors"] += 1
                 continue
+            station_name = detail.get("stationName") or station_id
+            capacity = float(detail.get("capacity") or 0)
             if not apply:
                 system_id = "DRY-RUN"
             else:
@@ -263,6 +287,12 @@ async def backfill_station_ids(
                     .execute()
                 )
                 system_id = ins.data[0]["id"]
+        elif first_gen and current_install and current_install > first_gen:
+            # An existing row with a later date (an old placeholder): move it to
+            # Solis's day, never later — an engineer's deliberate earlier date stays.
+            log.info("backfill: %s: installation_date %s → %s (Solis first generation)", name, current_install, first_gen)
+            if apply:
+                sb.table("solar_systems").update({"installation_date": first_gen.isoformat()}).eq("id", system_id).execute()
 
         months = list(month_iter(start_date, today - timedelta(days=1)))
         month_results = await asyncio.gather(
@@ -299,7 +329,8 @@ async def backfill_station_ids(
                 continue
 
         counters["rows"] += len(rows)
-        log.info("backfill: %s: %d row(s) over %d day(s)", name, len(rows), days)
+        log.info("backfill: %s: %d row(s) from %s (%s)", name, len(rows), start_date,
+                 "Solis first generation" if first_gen else f"fallback window of {days} day(s)")
 
     return counters
 

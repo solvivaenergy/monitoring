@@ -56,7 +56,7 @@ from pydantic import BaseModel, Field
 
 from . import db
 from .backfill_history import PHT, parse_month_day
-from .solis_client import SolisCloudClient
+from .solis_client import SolisCloudClient, first_generation_date
 from .supabase_metrics import fetch_instance_metrics, thresholds_from_env
 from .onboard_from_odoo import DEFAULT_FIELD_NAME
 from .validation_routes import _authenticate_staff, _get_roster, _odoo_search_read
@@ -778,19 +778,29 @@ async def add_station(body: AddStationRequest, authorization: str = Header(None)
         raise HTTPException(400, "Solis station id must be 15–20 digits")
 
     name, capacity = body.system_name, body.capacity_kwp
-    if not name or capacity is None:
+    detail = None
+    # stationDetail for the name/capacity when they were not supplied, and for
+    # fisGenerateTime (the day the plant first generated) when no installation
+    # date was.
+    if not name or capacity is None or body.installation_date is None:
         key_id, key_secret = os.getenv("SOLIS_CLOUD_KEY_ID", ""), os.getenv("SOLIS_CLOUD_KEY_SECRET", "")
-        detail = None
         if key_id and key_secret:
             try:
                 detail = await SolisCloudClient(key_id, key_secret).station_detail(sid)
             except Exception as exc:
                 log.warning("stationDetail for %s failed: %s", sid, exc)
-        if not detail:
+        if not detail and (not name or capacity is None):
             raise HTTPException(
                 400, "Solis returned no detail for that station; supply system_name and capacity_kwp explicitly.")
-        name = name or detail.get("stationName") or sid
-        capacity = capacity if capacity is not None else float(detail.get("capacity") or 0)
+        name = name or (detail or {}).get("stationName") or sid
+        capacity = capacity if capacity is not None else float((detail or {}).get("capacity") or 0)
+
+    today = dt.datetime.now(PHT).date()
+    window_days = body.backfill.days if body.backfill else 60
+    # Installation date: the engineer's, else Solis's first-generation day, else
+    # the backfill window. Until 2026-10-16 the window was the default and the
+    # history started there, clipping stations energised earlier.
+    install = body.installation_date or first_generation_date(detail) or (today - dt.timedelta(days=window_days))
 
     request_id = str(uuid.uuid4())
     try:
@@ -804,10 +814,16 @@ async def add_station(body: AddStationRequest, authorization: str = Header(None)
                       solis_station_id, solis_plant_name, is_primary)
                    values (%s, %s, %s, %s, '—', 'active', %s, %s, false)
                    returning id""",
-                (body.user_id, name, capacity,
-                 body.installation_date or (dt.date.today() - dt.timedelta(days=body.backfill.days if body.backfill else 60)),
-                 sid, name)).fetchone()
-            job = _enqueue(conn, row["id"], sid, body.backfill, staff, reason, request_id) if body.backfill else None
+                (body.user_id, name, capacity, install, sid, name)).fetchone()
+            # History from the installation date, or from the requested window
+            # when that reaches further back; nothing yet for a plant energised today.
+            job = None
+            if body.backfill:
+                date_from = min(install, today - dt.timedelta(days=window_days))
+                yesterday = today - dt.timedelta(days=1)
+                if date_from <= yesterday:
+                    job = _enqueue_range(conn, row["id"], sid, body.backfill.granularity, date_from, yesterday,
+                                         staff, reason, request_id)
             # Hourly history for the new station as well, under the same request id.
             hourly_job = (_enqueue(conn, row["id"], sid, BackfillSpec(granularity="hourly", days=HOURLY_HISTORY_DAYS),
                                    staff, reason, request_id) if body.backfill else None)

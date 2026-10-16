@@ -36,14 +36,14 @@ import os
 import sys
 import logging
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from api.solis_client import SolisCloudClient, SolisCloudError
+from api.solis_client import SolisCloudClient, SolisCloudError, first_generation_date
 # The one stationMonth-day → energy_readings row parser, shared with the
 # backfill worker and the history backfill so all three write the same shape.
 from api.backfill_history import parse_month_day
@@ -223,6 +223,32 @@ async def _fetch_battery_capacity_kwh(
     return None
 
 
+def _queue_missing_history(sb: Client, system_id: str, station_id: str, first_gen: date) -> None:
+    """One daily backfill job for the days between Solis's first generation and
+    this station's oldest stored day — nothing when the history already reaches
+    back that far. Written through PostgREST like enqueue_hourly_jobs; a station
+    with a daily job already queued or running is skipped by the partial unique
+    index, and nothing here may stop the sync."""
+    try:
+        oldest = (
+            sb.table("energy_readings").select("timestamp").eq("system_id", system_id)
+            .order("timestamp", desc=False).limit(1).execute()
+        ).data
+        first_day = date.fromisoformat(oldest[0]["timestamp"][:10]) if oldest else datetime.now(PHT).date()
+        if first_day <= first_gen:
+            return
+        sb.table("backfill_jobs").insert({
+            "system_id": system_id, "solis_station_id": station_id, "granularity": "daily",
+            "date_from": first_gen.isoformat(), "date_to": (first_day - timedelta(days=1)).isoformat(),
+            "requested_reason": (f"installation date moved to Solis's first generation ({first_gen}); "
+                                 f"history before the first stored day ({first_day})"),
+        }).execute()
+        log.info("Queued daily history %s..%s for station %s (installation date corrected).",
+                 first_gen, first_day - timedelta(days=1), station_id)
+    except Exception as exc:
+        log.warning("history job for station %s not queued: %s", station_id, str(exc)[:120])
+
+
 def _reread_dates(now: datetime, days: int) -> List[str]:
     """Today and the `days` days before it, newest first, as YYYY-MM-DD.
 
@@ -390,14 +416,28 @@ async def sync_once(solis: SolisCloudClient, sb: Client, dry_run: bool = False) 
                 if battery_capacity_kwh is not None:
                     update_payload["battery_capacity_kwh"] = battery_capacity_kwh
 
-                # Correct a placeholder installation_date using this STATION's
-                # own oldest reading. Keyed on system_id: for a multi-station
-                # customer, the user's oldest reading may belong to a different
-                # station and would backdate this one to before it was
-                # installed. The current value rides on the stations query
-                # above (one round trip per station saved).
-                current_install = station_row.get("installation_date")
-                if current_install and current_install >= (now - timedelta(days=30)).strftime("%Y-%m-%d"):
+                # installation_date = the day Solis says the plant first
+                # generated (fisGenerateTime). Onboarding used to store
+                # "tonight minus 60 days" and start the history there, and the
+                # correction that lived here only moved the date to the oldest
+                # reading, i.e. to that same clipped start: on 2026-10-16, 194
+                # stations began up to 375 days after Solis's first generation.
+                # Now the date moves EARLIER to Solis's day whenever ours is
+                # later, and the days before the first stored one are queued as
+                # a daily backfill, so a gap heals by itself. Never moved later:
+                # a date an engineer set earlier on purpose stays. Weekly for
+                # everyone, nightly for new stations (see _wants_metadata).
+                current_install = str(station_row.get("installation_date") or "")[:10]
+                first_gen = first_generation_date(station)
+                if first_gen and (not current_install or current_install > first_gen.isoformat()):
+                    update_payload["installation_date"] = first_gen.isoformat()
+                    if not dry_run:
+                        _queue_missing_history(sb, system_id, station_id, first_gen)
+                elif not first_gen and current_install and current_install >= (now - timedelta(days=30)).strftime("%Y-%m-%d"):
+                    # No Solis date: a placeholder set within the last month
+                    # falls back to this STATION's own oldest reading (keyed on
+                    # system_id — a multi-station customer's oldest reading may
+                    # belong to another plant).
                     oldest = (
                         sb.table("energy_readings")
                         .select("timestamp")

@@ -20,7 +20,7 @@ import base64
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -28,6 +28,44 @@ import httpx
 log = logging.getLogger("solis_client")
 
 SOLIS_BASE_URL = "https://www.soliscloud.com:13333"
+MANILA = timezone(timedelta(hours=8))
+
+
+def solis_date(value: Any) -> Optional[date]:
+    """A Solis date field as a Manila calendar date, or None when empty.
+
+    Solis sends epoch milliseconds on most date fields (createDate,
+    fisGenerateTime, dataTimestamp) and 'YYYY-MM-DD HH:MM:SS' on their *Str
+    twins; both forms are accepted."""
+    if value in (None, "", 0, "0"):
+        return None
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
+        secs = float(value)
+        if secs > 1e11:  # milliseconds
+            secs /= 1000.0
+        try:
+            return datetime.fromtimestamp(secs, tz=MANILA).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def first_generation_date(record: Optional[Dict]) -> Optional[date]:
+    """The day a plant first generated, per Solis: `fisGenerateTime` (present on
+    every userStationList row and on stationDetail), else `fisPowerTime`.
+
+    This is the right start for a station's history and the value
+    solar_systems.installation_date should hold. NOT `createDate` (a plant is
+    created in Solis days or weeks before it is energised, so that would give
+    empty days) and NOT a window counted back from the onboarding night: that
+    was how installation_date used to be filled, and on 2026-10-16 it had
+    clipped 194 stations' history by up to 375 days (7,110 station-days)."""
+    if not isinstance(record, dict):
+        return None
+    return solis_date(record.get("fisGenerateTime")) or solis_date(record.get("fisPowerTime"))
 
 
 class SolisCloudError(Exception):

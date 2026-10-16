@@ -245,10 +245,13 @@ async def onboard(
     if candidates:
         counts, results = run_onboarding(sb, candidates, apply)
 
-    # Backfill recent daily history for freshly onboarded stations (apply only).
-    # Scoped to a short, env-configurable window (default 2 months) so the daily
-    # cron stays fast. Idempotent (upsert-by-date) and only touches users with
-    # zero existing readings.
+    # Backfill the daily history of freshly onboarded stations (apply only),
+    # from the day Solis says each plant first generated (fisGenerateTime, read
+    # in backfill_station_ids). ONBOARD_BACKFILL_DAYS is only the fallback
+    # window for a plant without that date. Until 2026-10-16 the window WAS the
+    # start, and installation_date was "tonight minus 60 days": 194 stations
+    # lost up to 375 days of history that way. Idempotent (upsert-by-date) and
+    # only touches users with zero existing readings.
     backfill_days = int(os.getenv("ONBOARD_BACKFILL_DAYS", "60"))
     backfill: Dict[str, int] = {"users": 0, "api_calls": 0, "rows": 0, "errors": 0}
     if apply and candidates and backfill_days > 0:
